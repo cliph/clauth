@@ -689,28 +689,42 @@ pub(super) fn wrap_words(text: &str, width: usize) -> Vec<String> {
 /// the reason renders `faint`; continuation lines indent under the text so the
 /// hint reads as one block instead of clipping off the pane edge.
 pub(super) fn help_tooltip_lines(text: &str, width: usize) -> Vec<Line<'static>> {
-    tooltip_lines(text, width, theme::line(), theme::faint())
+    tooltip_lines(text, width, 1, theme::line(), theme::faint())
+}
+
+/// [`help_tooltip_lines`] with the `└` leader at `lead_indent` (the column the
+/// `└` opens at): a caller whose line explains a label at col 2 passes 2, so
+/// the `└` sits under the text it explains.
+pub(super) fn help_tooltip_lines_at(
+    text: &str,
+    width: usize,
+    lead_indent: usize,
+) -> Vec<Line<'static>> {
+    tooltip_lines(text, width, lead_indent, theme::line(), theme::faint())
 }
 
 /// Invalid-input twin of [`help_tooltip_lines`]: both the leader and the
 /// reason render in `DANGER`.
 pub(super) fn invalid_tooltip_lines(text: &str, width: usize) -> Vec<Line<'static>> {
-    tooltip_lines(text, width, theme::danger(), theme::danger())
+    tooltip_lines(text, width, 1, theme::danger(), theme::danger())
 }
 
 fn tooltip_lines(
     text: &str,
     width: usize,
+    lead_indent: usize,
     leader_style: Style,
     text_style: Style,
 ) -> Vec<Line<'static>> {
-    const LEAD_W: usize = 3; // " └ " and the matching continuation indent
-    prose::wrap(text, width.saturating_sub(LEAD_W).max(8), text_style)
+    let lead_w = lead_indent + 2; // the `└ ` and its indent
+    let lead = format!("{}└ ", " ".repeat(lead_indent));
+    let cont = " ".repeat(lead_w);
+    prose::wrap(text, width.saturating_sub(lead_w).max(8), text_style)
         .into_iter()
         .enumerate()
-        .map(|(i, seg)| {
-            let lead = if i == 0 { " └ " } else { "   " };
-            let mut spans = vec![Span::styled(lead, leader_style)];
+        .map(move |(i, seg)| {
+            let leader = if i == 0 { lead.clone() } else { cont.clone() };
+            let mut spans = vec![Span::styled(leader, leader_style)];
             spans.extend(seg);
             Line::from(spans)
         })

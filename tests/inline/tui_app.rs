@@ -5317,7 +5317,7 @@ fn start_shunt_on_an_absent_gateway_jumps_to_the_adopt_line() {
     assert_eq!(app.services.cursor, shunt_idx, "the shunt row selected");
     assert_eq!(app.services.focus, ServicesFocus::Detail, "descended");
     assert_eq!(
-        app.services.shunt_focus.get(),
+        app.services.shunt_focus_kind(),
         Some(ShuntFocusLine::Adopt),
         "the adopt line focused"
     );
@@ -5340,7 +5340,7 @@ fn start_shunt_on_an_absent_gateway_jumps_to_the_adopt_line() {
     assert_eq!(app.tab, Tab::Services);
     assert_eq!(app.services.focus, ServicesFocus::Detail, "still descended");
     assert_eq!(
-        app.services.shunt_focus.get(),
+        app.services.shunt_focus_kind(),
         None,
         "no adopt line: the descend rule leaves focus none"
     );
@@ -5366,7 +5366,7 @@ fn start_shunt_on_a_disabled_gateway_jumps_to_the_enabled_row_without_flipping_i
     assert_eq!(app.services.cursor, shunt_idx, "the shunt row selected");
     assert_eq!(app.services.focus, ServicesFocus::Detail, "descended");
     assert_eq!(
-        app.services.shunt_focus.get(),
+        app.services.shunt_focus_kind(),
         Some(ShuntFocusLine::Enabled),
         "the enabled row focused"
     );
@@ -5572,7 +5572,7 @@ fn a_shunt_pick_acts_on_the_state_at_pick_time() {
     dispatch_action_menu_action(&mut app, ActionMenuAction::StartShunt);
     assert_eq!(app.services.focus, ServicesFocus::Detail);
     assert_eq!(
-        app.services.shunt_focus.get(),
+        app.services.shunt_focus_kind(),
         Some(ShuntFocusLine::Enabled),
         "the jump the new state names"
     );
@@ -19916,8 +19916,7 @@ fn space_on_the_enabled_row_flips_disabled_on_disk() {
     // actionable line).
     app.services.focus = super::ServicesFocus::Detail;
     app.services
-        .shunt_focus
-        .set(Some(super::ShuntFocusLine::Enabled));
+        .set_shunt_focus(Some(super::ShuntFocusLine::Enabled));
     super::handle_services_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
     assert!(
         !crate::gateway::GatewayRecord::load()
@@ -20227,8 +20226,7 @@ fn the_check_output_line_opens_a_masked_modal() {
     // ↵ on the focused `check output` line opens the masked modal.
     app.services.focus = super::ServicesFocus::Detail;
     app.services
-        .shunt_focus
-        .set(Some(super::ShuntFocusLine::CheckOutput));
+        .set_shunt_focus(Some(super::ShuntFocusLine::CheckOutput));
     super::handle_services_key(&mut app, crate::testutil::key(KeyCode::Enter));
     let super::Modal::CheckOutput(body) = app.modals.last().expect("a modal opened") else {
         panic!("the check output modal opened, got {:?}", app.modals.last());
@@ -20312,8 +20310,7 @@ fn the_held_output_is_masked_against_the_checks_env_not_the_open_env() {
 
     app.services.focus = super::ServicesFocus::Detail;
     app.services
-        .shunt_focus
-        .set(Some(super::ShuntFocusLine::CheckOutput));
+        .set_shunt_focus(Some(super::ShuntFocusLine::CheckOutput));
     super::handle_services_key(&mut app, crate::testutil::key(KeyCode::Enter));
     let super::Modal::CheckOutput(body) = app.modals.last().expect("a modal opened") else {
         panic!("the check output modal opened, got {:?}", app.modals.last());
@@ -20608,8 +20605,7 @@ fn multi_line_stderr_with_sgr_renders_as_separate_rows() {
 
     app.services.focus = super::ServicesFocus::Detail;
     app.services
-        .shunt_focus
-        .set(Some(super::ShuntFocusLine::CheckOutput));
+        .set_shunt_focus(Some(super::ShuntFocusLine::CheckOutput));
     super::handle_services_key(&mut app, crate::testutil::key(KeyCode::Enter));
     let super::Modal::CheckOutput(body) = app.modals.last().expect("a modal opened") else {
         panic!("the check output modal opened, got {:?}", app.modals.last());
@@ -21591,8 +21587,7 @@ fn enter_toggles_the_enabled_row() {
     super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     app.services.focus = super::ServicesFocus::Detail;
     app.services
-        .shunt_focus
-        .set(Some(super::ShuntFocusLine::Enabled));
+        .set_shunt_focus(Some(super::ShuntFocusLine::Enabled));
     super::handle_services_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert!(
         !crate::gateway::GatewayRecord::load()
@@ -21631,8 +21626,7 @@ fn a_failed_toggle_toasts_save_failed() {
     super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     app.services.focus = super::ServicesFocus::Detail;
     app.services
-        .shunt_focus
-        .set(Some(super::ShuntFocusLine::Enabled));
+        .set_shunt_focus(Some(super::ShuntFocusLine::Enabled));
     super::handle_services_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
     assert!(
         app.toasts
@@ -21740,10 +21734,10 @@ fn a_landed_add_admin_key_re_settles_focus_to_the_enabled_row() {
     // The drain's recompute rebuilt the card without the admin line (focus
     // none); the next frame re-settles the none focus to `enabled` and the
     // footer offers the re-settled line's verb.
-    assert_eq!(app.services.shunt_focus.get(), None);
+    assert_eq!(app.services.shunt_focus_kind(), None);
     let footer = footer_row(&app, 120, 24);
     assert_eq!(
-        app.services.shunt_focus.get(),
+        app.services.shunt_focus_kind(),
         Some(super::ShuntFocusLine::Enabled)
     );
     assert!(
@@ -21813,10 +21807,10 @@ fn a_landed_move_re_settles_focus_to_the_enabled_row() {
     // The drain's recompute rebuilt the card without the MOVE PLAN (focus
     // none); the next frame re-settles the none focus to `enabled` and the
     // footer offers the re-settled line's verb.
-    assert_eq!(app.services.shunt_focus.get(), None);
+    assert_eq!(app.services.shunt_focus_kind(), None);
     let footer = footer_row(&app, 120, 24);
     assert_eq!(
-        app.services.shunt_focus.get(),
+        app.services.shunt_focus_kind(),
         Some(super::ShuntFocusLine::Enabled)
     );
     assert!(
@@ -22663,5 +22657,174 @@ fn a_chain_toggle_never_rewinds_a_pair_another_process_landed() {
         stored.refresh_token(),
         Some("rt-2"),
         "a settings edit saves config.toml only"
+    );
+}
+
+/// The config read failure maps to the card's reason words: an io failure reads
+/// `unreadable`, a TOML parse failure `does not parse`; a shape refusal
+/// (`EditRefusal`) carries the refusal's sentence (rendered as
+/// `config  not editable`).
+#[test]
+fn the_config_read_failure_maps_to_the_card_reason_words() {
+    use super::{ShuntConfigRead, UnreadConfig, classify_shunt_config_read};
+
+    let io = anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::NotFound, "boom"));
+    assert!(matches!(
+        classify_shunt_config_read(&io),
+        ShuntConfigRead::Unread(UnreadConfig::Unreadable)
+    ));
+
+    let parse = anyhow::anyhow!("the shunt config does not parse as TOML (line 3)");
+    assert!(matches!(
+        classify_shunt_config_read(&parse),
+        ShuntConfigRead::Unread(UnreadConfig::Unparsed)
+    ));
+
+    let refusal = anyhow::Error::new(crate::gateway_edit::EditRefusal::BindReference);
+    assert!(matches!(
+        classify_shunt_config_read(&refusal),
+        ShuntConfigRead::Refused(sentence) if sentence == crate::gateway_edit::EditRefusal::BindReference.to_string()
+    ));
+}
+
+/// The production wiring: a gateway record + TOML config on disk through the
+/// real Services recompute renders the groups after the action section (blank
+/// rows kept), and a `↓` walk from `enabled` reaches the first entry row.
+#[test]
+fn the_production_recompute_renders_the_config_groups_and_walks_onto_them() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        "[server]\nbind = \"127.0.0.1:3001\"\ndefault_provider = \"anthropic\"\n\n[[upstreams]]\nname = \"anthropic\"\nauth = \"claude_oauth\"\n",
+    )
+    .unwrap();
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(crate::gateway::GatewayRecord::new(config).unwrap());
+        Ok(())
+    })
+    .unwrap();
+
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let mut detail: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.split("││").nth(1))
+        .map(|r| {
+            let r = r.trim_matches('│');
+            let r = r.strip_prefix(' ').unwrap_or(r);
+            r.trim_end().to_string()
+        })
+        .collect();
+    while detail.last().is_some_and(String::is_empty) {
+        detail.pop();
+    }
+    // The config path is the canonicalized sandbox tempdir path, which varies
+    // per box (and middle-truncates on a long one): pin its stable ends, then
+    // normalize it so the rest of the card pins by equality.
+    let config_idx = detail
+        .iter()
+        .position(|r| r.starts_with("config  "))
+        .expect("config line");
+    assert!(
+        detail[config_idx].ends_with("/etc/shunt.toml"),
+        "config line keeps the leaf: {}",
+        detail[config_idx]
+    );
+    detail[config_idx] = "config  <path>".to_string();
+    assert_eq!(
+        detail,
+        vec![
+            "binary  shunt".to_string(),
+            "config  <path>".to_string(),
+            "state   unobserved".to_string(),
+            "the daemon runs the gateway".to_string(),
+            String::new(),
+            "  enabled  ─●".to_string(),
+            "admin  no [server.admin] table".to_string(),
+            "  f  add admin table".to_string(),
+            String::new(),
+            "SERVER".to_string(),
+            "  bind              127.0.0.1:3001".to_string(),
+            "  default_provider  anthropic".to_string(),
+            "UPSTREAMS".to_string(),
+            "  ▶ anthropic       claude_oauth".to_string(),
+            "MODELS".to_string(),
+            "ROUTES".to_string(),
+        ],
+        "production card rows:\n{}",
+        rows.join("\n")
+    );
+
+    // The walk from `enabled` reaches the first entry row (the config stops
+    // joined the walk).
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert!(
+        matches!(
+            app.services.focused_shunt_focus(),
+            Some(super::ShuntFocus::Entry {
+                key: super::ShuntEntryKey::Upstream { name, .. }
+            }) if name == "anthropic"
+        ),
+        "the walk reaches the first entry row"
+    );
+}
+
+/// A failed read keeps the expanded set; the recompute prunes only over a read
+/// view (a failed read says nothing about the entries). Once the file is fixed
+/// the row is still expanded, so a transient break never collapses an entry.
+#[test]
+fn the_recompute_keeps_the_expanded_set_across_a_failed_read_and_a_repair() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let text = "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"anthropic\"\nauth = \"claude_oauth\"\n";
+    std::fs::write(&config, text).unwrap();
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(crate::gateway::GatewayRecord::new(config.clone()).unwrap());
+        Ok(())
+    })
+    .unwrap();
+
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    // Expand the first entry, then break the config on disk: the read fails,
+    // and a failed read must keep the set.
+    let key = super::ShuntEntryKey::Upstream {
+        name: "anthropic".into(),
+        occurrence: 0,
+    };
+    app.services.shunt_expanded.insert(key.clone());
+    std::fs::write(&config, "not toml [").unwrap();
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    assert!(
+        app.services.shunt_expanded.contains(&key),
+        "a failed read keeps the expanded set"
+    );
+
+    // Fix the file: the entry returns and the row is still expanded.
+    std::fs::write(&config, text).unwrap();
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    assert!(
+        app.services.shunt_expanded.contains(&key),
+        "the repaired read keeps the row expanded"
     );
 }

@@ -1776,24 +1776,32 @@ pub(crate) enum ShuntFocus {
     /// The `check output` line at this detail index (a held failed-check
     /// stderr; ↵/space opens its modal).
     CheckOutput { line: usize },
+    /// A config-section entry row (an upstream, model or route), whose `↵`/
+    /// `space` toggles it expanded. Not a `Check::detail` line: the render
+    /// draws the config section after the detail lines.
+    Entry { key: ShuntEntryKey },
 }
 
 impl ShuntFocus {
-    /// The detail-line index the focusable sits on.
-    pub(crate) fn line(&self) -> usize {
+    /// The detail-line index the focusable sits on; `None` on a config entry
+    /// row, which has no `Check::detail` line.
+    pub(crate) fn line(&self) -> Option<usize> {
         match self {
             ShuntFocus::Fix { line, .. }
             | ShuntFocus::Enabled { line }
-            | ShuntFocus::CheckOutput { line } => *line,
+            | ShuntFocus::CheckOutput { line } => Some(*line),
+            ShuntFocus::Entry { .. } => None,
         }
     }
 
-    /// The fix this line applies, `None` on the `enabled` and `check output`
-    /// rows.
+    /// The fix this line applies, `None` on the `enabled`, `check output` and
+    /// config entry rows.
     pub(crate) fn fix(&self) -> Option<&ServiceFix> {
         match self {
             ShuntFocus::Fix { fix, .. } => Some(fix),
-            ShuntFocus::Enabled { .. } | ShuntFocus::CheckOutput { .. } => None,
+            ShuntFocus::Enabled { .. }
+            | ShuntFocus::CheckOutput { .. }
+            | ShuntFocus::Entry { .. } => None,
         }
     }
 
@@ -1802,6 +1810,7 @@ impl ShuntFocus {
         match self {
             ShuntFocus::Enabled { .. } => ShuntFocusLine::Enabled,
             ShuntFocus::CheckOutput { .. } => ShuntFocusLine::CheckOutput,
+            ShuntFocus::Entry { key } => ShuntFocusLine::Entry(key.clone()),
             ShuntFocus::Fix {
                 fix: ServiceFix::AdoptConfig(_),
                 ..
@@ -1826,7 +1835,7 @@ impl ShuntFocus {
 /// resize or a card change keeps focus on the same line while that kind still
 /// exists, so the line index ([`ShuntFocus::line`]) is deliberately not part
 /// of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ShuntFocusLine {
     /// The `enabled` toggle row.
     Enabled,
@@ -1838,6 +1847,41 @@ pub(crate) enum ShuntFocusLine {
     Move,
     /// The `check output` line (a held failed-check stderr).
     CheckOutput,
+    /// A config-section entry row, by its identity.
+    Entry(ShuntEntryKey),
+}
+
+/// A config-section entry's identity: the group (the variant) plus the
+/// name-or-id and its occurrence index among entries of that kind sharing that
+/// name-or-id (shunt keeps duplicate upstream names and duplicate map-less
+/// model ids valid, so the name alone would trap the walk between two of
+/// them), or the route's 1-based position. This is what focus keeps across a
+/// recompute or resize, and what the expanded set is keyed by — never a line
+/// index, which a reorder would land on another entry.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ShuntEntryKey {
+    Upstream {
+        name: String,
+        occurrence: usize,
+    },
+    /// `(id, occurrence index)` among models sharing that id.
+    Model {
+        id: String,
+        occurrence: usize,
+    },
+    Route(usize),
+}
+
+/// The adopted config read through [`crate::gateway_edit::read_view`] on the
+/// recompute. The render draws the card's config section from it.
+#[derive(Debug, Clone)]
+pub(crate) enum ShuntConfigRead {
+    Ok(Box<crate::gateway_edit::ConfigView>),
+    /// The config's own read/parse failed with one of the card's reason words.
+    Unread(UnreadConfig),
+    /// The config reads but the editor's view refuses its shape: the card
+    /// renders `config  not editable` and the refusal's own sentence.
+    Refused(String),
 }
 
 /// A computed service row. `fix` is the list-focus `f` (the first fixable
@@ -2212,6 +2256,14 @@ pub(crate) struct ServicesState {
     /// read). `None` = no record, or one that cannot load. Every shunt-card
     /// action and the `enabled` row read this, never the file per frame.
     pub(crate) shunt_record: Option<crate::gateway::GatewayRecord>,
+    /// The adopted config's editor view, read through
+    /// [`crate::gateway_edit::read_view`] on the recompute while a record
+    /// exists. `None` = no record (no config section). The render draws the
+    /// card's config groups from it.
+    pub(crate) shunt_config: Option<ShuntConfigRead>,
+    /// Which config entry rows are expanded, keyed by the entry's identity.
+    /// Dropped keys whose entry left the config are pruned on the recompute.
+    pub(crate) shunt_expanded: HashSet<ShuntEntryKey>,
     /// The cached standalone-store move plan (`None` = not yet planned). The
     /// plan runs on a worker — it spawns `ps`/`powershell` on macOS/Windows —
     /// on tab entry, on `r`, and after any shunt-card action lands.
@@ -2241,7 +2293,7 @@ pub(crate) struct ServicesState {
     /// key handler and the recompute; the render reads it to draw the caret,
     /// and re-settles it (the descend rule) where it publishes the geometry
     /// when a resize or a card change pushed the held line out of view.
-    pub(crate) shunt_focus: std::cell::Cell<Option<ShuntFocusLine>>,
+    pub(crate) shunt_focus: std::cell::RefCell<Option<ShuntFocusLine>>,
     /// The rendered line index of each [`Check::shunt_focus`] stop (parallel to
     /// that list), published by the last render so the key handler can tell
     /// which stops are in view. A stop's rendered row is what the in-view test
@@ -2320,6 +2372,8 @@ impl Default for ServicesState {
             standalone_probe: ProbeWorker::new(standalone_probe),
             last_standalone_recheck: Instant::now(),
             shunt_record: None,
+            shunt_config: None,
+            shunt_expanded: HashSet::new(),
             move_plan: None,
             move_plan_probe: ProbeWorker::new(move_plan_probe),
             admin_need: None,
@@ -2327,7 +2381,7 @@ impl Default for ServicesState {
             pool: None,
             pool_probe: ProbeWorker::new(pool_probe),
             shunt_action: ShuntActionWorker::new(run_shunt_action),
-            shunt_focus: std::cell::Cell::new(None),
+            shunt_focus: std::cell::RefCell::new(None),
             shunt_stop_rows: std::cell::RefCell::new(Vec::new()),
             shunt_viewport: std::cell::Cell::new(0),
             last_plan_env_source: None,
@@ -2391,7 +2445,7 @@ impl ServicesState {
     /// descend rule) where the render publishes the geometry, so this only
     /// reads `None` when no actionable line is in view.
     pub(crate) fn focused_shunt_focus(&self) -> Option<&ShuntFocus> {
-        let kind = self.shunt_focus.get()?;
+        let kind = self.shunt_focus_kind()?;
         let stops = &self.selected_check()?.shunt_focus;
         let i = stops.iter().position(|s| s.kind() == kind)?;
         let rows = self.shunt_stop_rows.borrow();
@@ -2404,6 +2458,16 @@ impl ServicesState {
         }
         let scroll = self.detail_scroll.min(self.detail_max_scroll.get());
         shunt_in_view(scroll, self.shunt_viewport.get() as usize, rows[i]).then_some(&stops[i])
+    }
+
+    /// The held focus identity, cloned out of the interior-mutability cell.
+    pub(crate) fn shunt_focus_kind(&self) -> Option<ShuntFocusLine> {
+        self.shunt_focus.borrow().clone()
+    }
+
+    /// Set the held focus identity.
+    pub(crate) fn set_shunt_focus(&self, kind: Option<ShuntFocusLine>) {
+        self.shunt_focus.replace(kind);
     }
 
     /// The descend rule applied where the geometry is published: the render
@@ -2420,19 +2484,19 @@ impl ServicesState {
         scroll: u16,
         viewport: usize,
     ) {
-        if let Some(kind) = self.shunt_focus.get() {
+        if let Some(kind) = self.shunt_focus_kind() {
             if stops
                 .iter()
                 .position(|s| s.kind() == kind)
-                .is_some_and(|i| shunt_in_view(scroll, viewport, rows[i]))
+                .and_then(|i| rows.get(i))
+                .is_some_and(|&r| shunt_in_view(scroll, viewport, r))
             {
                 return;
             }
         } else if self.focus != ServicesFocus::Detail {
             return;
         }
-        self.shunt_focus
-            .set(shunt_first_in_view(stops, rows, scroll, viewport));
+        self.set_shunt_focus(shunt_first_in_view(stops, rows, scroll, viewport));
     }
 }
 
@@ -5447,6 +5511,10 @@ fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
         KeyCode::Enter | KeyCode::Char(' ') => match app.services.focused_shunt_focus() {
             Some(ShuntFocus::Enabled { .. }) => toggle_shunt_enabled(app),
             Some(ShuntFocus::CheckOutput { .. }) => open_check_output_modal(app),
+            Some(ShuntFocus::Entry { key }) => {
+                let key = key.clone();
+                toggle_shunt_entry(app, &key);
+            }
             Some(ShuntFocus::Fix { .. }) | None => {}
         },
         _ => {}
@@ -5493,14 +5561,16 @@ fn shunt_step(app: &mut App, down: bool) {
     // here: `↓`/`↑` from none start from the target rule itself (the first
     // stop at/after the top of the view going down, the last before the bottom
     // going up), so the first visible line is never skipped.
-    let focus = app.services.shunt_focus.get().and_then(|kind| {
+    let focus = app.services.shunt_focus_kind().and_then(|kind| {
         stops
             .iter()
             .position(|s| s.kind() == kind)
             .filter(|&i| shunt_in_view(scroll, viewport, rows[i]))
             .map(|i| stops[i].kind())
     });
-    let cur = focus.and_then(|kind| stops.iter().position(|s| s.kind() == kind));
+    let cur = focus
+        .clone()
+        .and_then(|kind| stops.iter().position(|s| s.kind() == kind));
 
     // The target stop: the one after/before the focused line, or (with no
     // focus) the first at/after the top of the view going down, the last
@@ -5520,18 +5590,20 @@ fn shunt_step(app: &mut App, down: bool) {
     };
 
     // The current focus kept while its line is still in view after a scroll.
-    let keep_focus = |scroll: u16| {
-        focus.filter(|&kind| {
-            stops
+    let stops_ref = &stops;
+    let rows_ref = &rows;
+    let keep_focus = move |scroll: u16| {
+        focus.filter(|kind| {
+            stops_ref
                 .iter()
-                .position(|s| s.kind() == kind)
-                .is_some_and(|i| shunt_in_view(scroll, viewport, rows[i]))
+                .position(|s| s.kind() == kind.clone())
+                .is_some_and(|i| shunt_in_view(scroll, viewport, rows_ref[i]))
         })
     };
 
     match target {
         Some(t) if shunt_in_view(scroll, viewport, rows[t]) => {
-            app.services.shunt_focus.set(Some(stops[t].kind()));
+            app.services.set_shunt_focus(Some(stops[t].kind()));
         }
         Some(_) => {
             // The target is out of view: scroll one line toward it, then take
@@ -5546,8 +5618,7 @@ fn shunt_step(app: &mut App, down: bool) {
                 .filter(|&t| shunt_in_view(scroll, viewport, rows[t]))
                 .map(|t| stops[t].kind());
             app.services
-                .shunt_focus
-                .set(target_taken.or_else(|| keep_focus(scroll)));
+                .set_shunt_focus(target_taken.or_else(|| keep_focus(scroll)));
         }
         None => {
             // No further actionable line: scroll one line while there is text
@@ -5557,7 +5628,7 @@ fn shunt_step(app: &mut App, down: bool) {
             } else {
                 scroll = scroll.saturating_sub(1);
             }
-            app.services.shunt_focus.set(keep_focus(scroll));
+            app.services.set_shunt_focus(keep_focus(scroll));
         }
     }
     app.services.detail_scroll = scroll;
@@ -5599,8 +5670,7 @@ fn shunt_page(app: &mut App, down: bool) {
         return;
     }
     app.services
-        .shunt_focus
-        .set(shunt_first_in_view(&stops, &rows, paged, viewport));
+        .set_shunt_focus(shunt_first_in_view(&stops, &rows, paged, viewport));
 }
 
 /// The shunt card's descend rule: the first actionable line in view, else
@@ -5632,7 +5702,7 @@ fn settle_shunt_focus(app: &mut App) {
         .services
         .detail_scroll
         .min(app.services.detail_max_scroll.get());
-    let held = app.services.shunt_focus.get().and_then(|kind| {
+    let held = app.services.shunt_focus_kind().and_then(|kind| {
         stops
             .iter()
             .position(|s| s.kind() == kind)
@@ -5640,8 +5710,7 @@ fn settle_shunt_focus(app: &mut App) {
             .map(|i| stops[i].kind())
     });
     app.services
-        .shunt_focus
-        .set(held.or_else(|| shunt_first_in_view(&stops, &rows, scroll, viewport)));
+        .set_shunt_focus(held.or_else(|| shunt_first_in_view(&stops, &rows, scroll, viewport)));
 }
 
 /// Flip the record's `disabled` flag at once, reading and writing the value
@@ -5668,6 +5737,16 @@ fn toggle_shunt_enabled(app: &mut App) {
         }
     }
     recompute_services_checks(app, false, ShuntRefresh::Restart);
+}
+
+/// Toggle one config entry row expanded/collapsed (the cloudy-tui disclosure
+/// contract: `space` and `↵` both activate, independently per entry). The
+/// recompute prunes an expanded key whose entry left the config, so a key
+/// re-appearing after an edit arrives collapsed.
+fn toggle_shunt_entry(app: &mut App, key: &ShuntEntryKey) {
+    if !app.services.shunt_expanded.remove(key) {
+        app.services.shunt_expanded.insert(key.clone());
+    }
 }
 
 /// Open the read-only `check output` modal over the held failed-check stderr,
@@ -6384,6 +6463,23 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool, shunt: ShuntR
         app.services.check_output = None;
     }
     app.services.shunt_record = record;
+    // The adopted config's editor view: a cheap local read on the recompute,
+    // like the record and the admin need. `None` while no record exists (the
+    // absent card shows no config section); a config read/parse failure keeps
+    // the groups off and renders one `config  not read (<reason>)` line, a
+    // shape refusal `config  not editable` with its sentence. An env file the
+    // view cannot read still reads the config (the view carries it). The
+    // expanded set drops keys whose entry left the config, only over a read
+    // view — a failed read says nothing about the entries.
+    app.services.shunt_config = app.services.shunt_record.as_ref().map(|record| {
+        match crate::gateway_edit::read_view(record) {
+            Ok(view) => ShuntConfigRead::Ok(Box::new(view)),
+            Err(e) => classify_shunt_config_read(&e),
+        }
+    });
+    if let Some(ShuntConfigRead::Ok(view)) = &app.services.shunt_config {
+        prune_shunt_expanded(view, &mut app.services.shunt_expanded);
+    }
     app.services.admin_need = app
         .services
         .shunt_record
@@ -6432,7 +6528,7 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool, shunt: ShuntR
         app.services.pool = None;
     }
 
-    let shunt = shunt_card(
+    let mut shunt = shunt_card(
         &gateway_slot,
         gateway_supervised,
         app.daemon_health == crate::daemon::DaemonHealth::Absent,
@@ -6443,6 +6539,12 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool, shunt: ShuntR
         app.services.pool.as_ref(),
         app.services.check_output.is_some(),
     );
+    // The config entry rows join the focus walk after the action section, in
+    // card order (upstreams, models, routes); the render draws them in the
+    // same order, so the published geometry stays parallel to this list.
+    if let Some(ShuntConfigRead::Ok(view)) = &app.services.shunt_config {
+        shunt.shunt_focus.extend(config_entry_stops(view));
+    }
     checks.push(shunt);
 
     // The delegates detail names the profiles whose delegate traffic is
@@ -6536,13 +6638,13 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool, shunt: ShuntR
     // exists (a landed action can drop the line that held it); the render
     // re-settles it (the descend rule) on the next frame when a change pushed
     // the line out of view, over the freshly rendered geometry.
-    if let Some(kind) = app.services.shunt_focus.get()
+    if let Some(kind) = app.services.shunt_focus_kind()
         && !app
             .services
             .selected_check()
             .is_some_and(|c| c.shunt_focus.iter().any(|s| s.kind() == kind))
     {
-        app.services.shunt_focus.set(None);
+        app.services.set_shunt_focus(None);
     }
 }
 
@@ -6791,7 +6893,7 @@ pub(crate) enum UnreadConfig {
 }
 
 impl UnreadConfig {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             UnreadConfig::Yaml => "yaml",
             UnreadConfig::Unreadable => "unreadable",
@@ -7263,6 +7365,89 @@ pub(crate) fn shunt_card(
     // The list-focus `f` is the card's first fix, never the `enabled` row.
     check.fix = check.shunt_focus.iter().find_map(ShuntFocus::fix).cloned();
     check
+}
+
+/// A `read_view` failure as the card's reason words: the config's own read
+/// failure reads `unreadable`, a TOML parse failure `does not parse`; an
+/// `EditRefusal` (a shape the editor does not read) carries the refusal's
+/// sentence, rendered as `config  not editable` under it. The `yaml` word never
+/// arises here: a loaded record's config was checked not to be YAML at adopt.
+/// An env file failure never reaches this: the view carries it typed.
+pub(crate) fn classify_shunt_config_read(e: &anyhow::Error) -> ShuntConfigRead {
+    if e.is::<std::io::Error>() {
+        return ShuntConfigRead::Unread(UnreadConfig::Unreadable);
+    }
+    if let Some(refusal) = e.downcast_ref::<crate::gateway_edit::EditRefusal>() {
+        return ShuntConfigRead::Refused(refusal.to_string());
+    }
+    ShuntConfigRead::Unread(UnreadConfig::Unparsed)
+}
+
+/// The config section's entry rows in render order — the one row model both the
+/// render and the focus walk derive from, so they cannot disagree for any view:
+/// under `ProviderForm::Legacy` there are no upstream entries, to either. An
+/// upstream and a model are each keyed by their name-or-id plus the occurrence
+/// index among entries of that kind sharing it (shunt keeps duplicate upstream
+/// names and duplicate map-less ids valid), so two same-name upstreams or
+/// same-id models are distinct rows.
+pub(crate) fn config_entry_keys(view: &crate::gateway_edit::ConfigView) -> Vec<ShuntEntryKey> {
+    let mut keys = Vec::new();
+    if let crate::gateway_edit::ProviderForm::Upstreams = view.form {
+        for (i, u) in view.upstreams.iter().enumerate() {
+            let name = entry_name(u.name.as_ref());
+            let occurrence = view
+                .upstreams
+                .iter()
+                .take(i)
+                .filter(|earlier| entry_name(earlier.name.as_ref()) == name)
+                .count();
+            keys.push(ShuntEntryKey::Upstream { name, occurrence });
+        }
+    }
+    for (i, m) in view.models.iter().enumerate() {
+        let id = entry_name(m.id.as_ref());
+        let occurrence = view
+            .models
+            .iter()
+            .take(i)
+            .filter(|earlier| entry_name(earlier.id.as_ref()) == id)
+            .count();
+        keys.push(ShuntEntryKey::Model { id, occurrence });
+    }
+    keys.extend(view.routes.iter().map(|r| ShuntEntryKey::Route(r.position)));
+    keys
+}
+
+/// The config entry rows as focus stops, in card order.
+pub(crate) fn config_entry_stops(view: &crate::gateway_edit::ConfigView) -> Vec<ShuntFocus> {
+    config_entry_keys(view)
+        .into_iter()
+        .map(|key| ShuntFocus::Entry { key })
+        .collect()
+}
+
+/// Drop every expanded key whose entry is not in `view` (an entry that left the
+/// config). Only a read view prunes — a failed read keeps the set.
+pub(crate) fn prune_shunt_expanded(
+    view: &crate::gateway_edit::ConfigView,
+    expanded: &mut HashSet<ShuntEntryKey>,
+) {
+    let live: HashSet<ShuntEntryKey> = config_entry_keys(view).into_iter().collect();
+    expanded.retain(|key| live.contains(key));
+}
+
+/// The name/id an entry is keyed by: the value as it renders, the raw TOML
+/// text when it is not a plain string, empty when the key is absent (a shape
+/// shunt itself would refuse).
+pub(crate) fn entry_name(w: Option<&crate::gateway_edit::Written>) -> String {
+    written_text(w).unwrap_or_default()
+}
+
+/// A `Written` as it renders: the decoded string when it is one, else the
+/// file's own text (a `${…}` reference stays unresolved, a number keeps its
+/// spelling).
+fn written_text(w: Option<&crate::gateway_edit::Written>) -> Option<String> {
+    w.map(|w| w.value.clone().unwrap_or_else(|| w.raw.clone()))
 }
 
 /// A path rendered inside a verbatim card line (a MOVE PLAN row): control and
@@ -10799,7 +10984,7 @@ fn jump_to_shunt_card(app: &mut App, focus: ShuntFocusLine) {
     }
     app.services.focus = ServicesFocus::Detail;
     app.services.detail_scroll = 0;
-    app.services.shunt_focus.set(
+    app.services.set_shunt_focus(
         app.services
             .selected_check()
             .is_some_and(|c| c.shunt_focus.iter().any(|s| s.kind() == focus))

@@ -25,7 +25,7 @@
     not(test),
     expect(
         dead_code,
-        reason = "the Services card's config section, the next slice, is this engine's only caller"
+        reason = "the edit path (the field enums and every Edit variant but RequireClientTokens) awaits its C2/C3 caller; read_view and apply_edit are live"
     )
 )]
 
@@ -66,10 +66,44 @@ pub(crate) struct ConfigView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServerView {
     pub(crate) bind: Option<Written>,
-    /// The variable, as the gateway's spawn env spells it, that overrides
-    /// `bind`: the row is read-only while it is set.
-    pub(crate) bind_override: Option<String>,
+    /// How the gateway's env layer overrides `bind`, three-state so an env
+    /// file the view cannot read keeps the groups and says why.
+    pub(crate) bind_override: BindOverride,
     pub(crate) default_provider: Option<Written>,
+}
+
+/// How the gateway's env layer overrides `bind`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BindOverride {
+    /// No override: the config's own `bind` stands.
+    None,
+    /// The gateway's env sets this variable, which overrides `bind`; the row
+    /// is read-only while it is set.
+    Set(String),
+    /// The env file could not be read, so whether it overrides `bind` is
+    /// unknown; the row reads `env file not read`.
+    Unknown(EnvFileFailure),
+}
+
+/// Why the env file could not be read, as the card's reason words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnvFileFailure {
+    /// The env file does not exist.
+    Missing,
+    /// Any other read error.
+    Unreadable,
+    /// A NUL byte or a refused file (not UTF-8).
+    DoesNotParse,
+}
+
+impl EnvFileFailure {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            EnvFileFailure::Missing => "missing",
+            EnvFileFailure::Unreadable => "unreadable",
+            EnvFileFailure::DoesNotParse => "does not parse",
+        }
+    }
 }
 
 /// How the config declares its providers.
@@ -165,25 +199,69 @@ impl RouteView {
     }
 }
 
-/// The adopted config's view, `bind`'s override read from the gateway's env
-/// file over the env the gateway inherits: a running daemon's record matched
-/// by pid as the display reads take it ([`recorded_env_for_holder_pid`]), so
-/// no process is spawned and no missing record refuses the read; with no
-/// daemon, this process's own env as `start daemon` would pass it. Only a
-/// `bind` edit reads the daemon's env strictly.
+/// The adopted config's view. `bind`'s override is read from the env file over
+/// the env the gateway inherits, read without ever spawning a process: a
+/// running daemon's recorded env matched by pid alone
+/// ([`recorded_env_for_holder_pid`]), or — with no daemon — this process's own
+/// `BIND_ENV` matched the way figment reads it (any case, last match wins) over
+/// the full process env, never the exact spelling alone (never through
+/// `inherited_env`, whose holder probe can spawn `ps` / `powershell.exe` when a
+/// daemon takes the singleton between probes). The env file's failure carries
+/// as a typed value on the view (the config still reads); only a `bind` edit
+/// reads the daemon's env strictly.
 pub(crate) fn read_view(record: &GatewayRecord) -> Result<ConfigView> {
     let (_, text) = read_config_for_edit(record.config())?;
-    let env = file_env(record)?;
     let inherited = match crate::daemon::singleton_held() {
-        Ok(false) => inherited_env().map(|(pairs, _)| pairs).unwrap_or_default(),
+        Ok(false) => {
+            // This process's own env, matched the way figment reads it (any
+            // case, last match wins) over the full env, so a case variant the
+            // TUI's env holds is not missed; the winning pair alone is what
+            // `spawned_env_var` below lays the env file over.
+            let own = std::env::vars_os().collect::<Vec<_>>();
+            spawned_env_var(&crate::gateway::GatewayEnv::default(), BIND_ENV, own)
+                .map(|(name, value)| vec![(name, value)])
+                .unwrap_or_default()
+        }
         Ok(true) | Err(_) => recorded_env_for_holder_pid().unwrap_or_default(),
     };
-    let bind_override = spawned_env_var(&env, BIND_ENV, inherited)
-        .map(|(name, _)| name.to_string_lossy().into_owned());
+    let bind_override = match env_file_for(record) {
+        Ok(env) => spawned_env_var(&env, BIND_ENV, inherited)
+            .map(|(name, _)| BindOverride::Set(name.to_string_lossy().into_owned()))
+            .unwrap_or(BindOverride::None),
+        Err(e) => BindOverride::Unknown(classify_env_file_failure(&e)),
+    };
     view_of(&text, bind_override)
 }
 
-fn view_of(text: &str, bind_override: Option<String>) -> Result<ConfigView> {
+/// The record's env file as the view reads it. The store env [`file_env`]
+/// pins is irrelevant to `bind`, and pinning it would let a store-root failure
+/// read as the env file's, so the view reads the env file alone.
+fn env_file_for(record: &GatewayRecord) -> anyhow::Result<crate::gateway::GatewayEnv> {
+    match &record.env_file {
+        Some(path) => crate::gateway::read_env_file(path),
+        None => Ok(crate::gateway::GatewayEnv::default()),
+    }
+}
+
+/// An env file read failure as the card's reason words: not-found reads
+/// `missing`, any other read error `unreadable`, a refused file (a NUL byte or
+/// non-UTF-8) `does not parse`. Typed at the boundary, so the card never
+/// re-classifies an error chain.
+fn classify_env_file_failure(e: &anyhow::Error) -> EnvFileFailure {
+    if let Some(io) = e.downcast_ref::<std::io::Error>() {
+        return if io.kind() == std::io::ErrorKind::NotFound {
+            EnvFileFailure::Missing
+        } else {
+            EnvFileFailure::Unreadable
+        };
+    }
+    if e.downcast_ref::<crate::gateway::EnvFileError>().is_some() {
+        return EnvFileFailure::DoesNotParse;
+    }
+    EnvFileFailure::Unreadable
+}
+
+fn view_of(text: &str, bind_override: BindOverride) -> Result<ConfigView> {
     let ctx = Ctx::new(text, "cannot read the shunt config for editing".to_string())?;
     Ok(ctx.view(bind_override)?)
 }
@@ -1466,7 +1544,7 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn view(&self, bind_override: Option<String>) -> Result<ConfigView, EditRefusal> {
+    fn view(&self, bind_override: BindOverride) -> Result<ConfigView, EditRefusal> {
         let server = match self.server()? {
             None => ServerView {
                 bind: None,

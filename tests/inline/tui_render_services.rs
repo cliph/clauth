@@ -500,8 +500,7 @@ fn a_shunt_action_running_drops_the_footer_fix_hints() {
     // Detail focus: the focused `f add admin key` drops its hint too.
     app.services.focus = ServicesFocus::Detail;
     app.services
-        .shunt_focus
-        .set(Some(crate::tui::app::ShuntFocusLine::Admin));
+        .set_shunt_focus(Some(crate::tui::app::ShuntFocusLine::Admin));
     let hints = super::super::footer::services_hints(&app);
     assert!(
         !hints.iter().any(|(k, _)| *k == "f"),
@@ -688,8 +687,7 @@ fn shunt_card_pages_by_viewport_minus_one_and_resettles_focus() {
     // keeps the held focus instead of re-picking the first action line.
     app.services.detail_scroll = app.services.detail_max_scroll.get();
     app.services
-        .shunt_focus
-        .set(Some(crate::tui::app::ShuntFocusLine::Move));
+        .set_shunt_focus(Some(crate::tui::app::ShuntFocusLine::Move));
     handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
     assert_eq!(
         app.services.detail_scroll,
@@ -697,7 +695,7 @@ fn shunt_card_pages_by_viewport_minus_one_and_resettles_focus() {
         "the card is already at the bottom"
     );
     assert_eq!(
-        app.services.shunt_focus.get(),
+        app.services.shunt_focus_kind(),
         Some(crate::tui::app::ShuntFocusLine::Move),
         "the held focus stays when the page did not move"
     );
@@ -735,7 +733,7 @@ fn shunt_page_keeps_held_focus_when_a_resize_fits_the_card() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     term.draw(|f| super::super::draw(f, &app)).unwrap();
     assert_eq!(
-        app.services.shunt_focus.get(),
+        app.services.shunt_focus_kind(),
         Some(crate::tui::app::ShuntFocusLine::Enabled),
         "two ↓ land on the enabled row"
     );
@@ -755,7 +753,7 @@ fn shunt_page_keeps_held_focus_when_a_resize_fits_the_card() {
         .min(app.services.detail_max_scroll.get());
     handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
     assert_eq!(
-        app.services.shunt_focus.get(),
+        app.services.shunt_focus_kind(),
         Some(crate::tui::app::ShuntFocusLine::Enabled),
         "a page that moves nothing keeps the held focus"
     );
@@ -769,7 +767,7 @@ fn shunt_page_keeps_held_focus_when_a_resize_fits_the_card() {
     // PageUp twin: still nothing moves.
     handle_key(&mut app, crate::testutil::key(KeyCode::PageUp));
     assert_eq!(
-        app.services.shunt_focus.get(),
+        app.services.shunt_focus_kind(),
         Some(crate::tui::app::ShuntFocusLine::Enabled),
         "the PageUp twin keeps the held focus too"
     );
@@ -3083,7 +3081,7 @@ fn a_card_change_pushing_every_stop_off_screen_resettles_to_none() {
     // (no actionable line is in view).
     let _ = draw_frame(&app, 120, 14);
     assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), None);
-    assert_eq!(app.services.shunt_focus.get(), None);
+    assert_eq!(app.services.shunt_focus_kind(), None);
     let hints = super::super::footer::services_hints(&app);
     assert!(
         hints.iter().all(|(k, _)| *k != "f" && *k != "space/↵"),
@@ -3241,7 +3239,7 @@ fn bringing_the_stops_back_into_view_resettles_the_none_focus_then_walks_from_it
     )];
     let _ = draw_frame(&app, 120, 14);
     assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), None);
-    assert_eq!(app.services.shunt_focus.get(), None);
+    assert_eq!(app.services.shunt_focus_kind(), None);
 
     // The reason clears (the worker landed): the stops come back into view and
     // the none focus re-settles to the first stop in view — `enabled` — with
@@ -3294,12 +3292,12 @@ fn down_from_none_lands_on_the_first_stop_in_view() {
 
     // Clear the focus with no draw in between: the next ↓ starts from none and
     // lands on the first stop in view, never skipping it.
-    app.services.shunt_focus.set(None);
+    app.services.set_shunt_focus(None);
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     assert_eq!(caret_stop(&draw_frame(&app, 120, 24)), Some("enabled"));
 
     // ↑ from none lands on the last stop in view.
-    app.services.shunt_focus.set(None);
+    app.services.set_shunt_focus(None);
     handle_key(&mut app, crate::testutil::key(KeyCode::Up));
     assert_eq!(caret_stop(&draw_frame(&app, 120, 24)), Some("move"));
 }
@@ -3354,7 +3352,7 @@ fn scrolling_past_the_last_stop_leaves_focus_none_until_a_stop_returns_to_view()
         }
     }
     assert!(saw_none, "focus leaves once the enabled row scrolls out");
-    assert_eq!(app.services.shunt_focus.get(), None);
+    assert_eq!(app.services.shunt_focus_kind(), None);
     let hints = super::super::footer::services_hints(&app);
     assert!(
         hints.iter().all(|(k, _)| *k != "space/↵" && *k != "f"),
@@ -3497,4 +3495,1397 @@ fn services_generic_detail_pages_by_hand_pinned_offset() {
         app.services.detail_scroll, 7,
         "generic detail pages by viewport - 1"
     );
+}
+
+// ── shunt config section render pins ─────────────────────────────────────────
+
+use crate::gateway_edit::{
+    AccountView, AuthForm, AuthView, BindOverride, ConfigView, EnvFileFailure, ModelView,
+    ProviderForm, RouteView, ServerView, UpstreamView, Written,
+};
+use crate::tui::app::{ShuntConfigRead, ShuntEntryKey};
+
+/// A `Written` holding a plain string value (its TOML text irrelevant to the
+/// render, which reads `value` first).
+fn w(v: &str) -> Written {
+    Written {
+        raw: v.to_string(),
+        value: Some(v.to_string()),
+    }
+}
+
+/// A `${…}` reference value, as the engine spells it: `value` is the string
+/// content, `raw` the quoted file text.
+fn wref(v: &str) -> Written {
+    Written {
+        raw: format!("\"{v}\""),
+        value: Some(v.to_string()),
+    }
+}
+
+/// A shorthand-auth upstream (`auth = "<mode>"`), no other field set.
+fn shorthand_up(name: &str, mode: &str) -> UpstreamView {
+    UpstreamView {
+        name: Some(w(name)),
+        provider: None,
+        kind: None,
+        base_url: None,
+        auth: Some(AuthView {
+            form: AuthForm::Shorthand,
+            mode: Some(w(mode)),
+            account: None,
+            accounts: None,
+            env: None,
+            header: None,
+        }),
+        effort: None,
+        service_tier: None,
+    }
+}
+
+/// A shorthand-auth upstream with no `name` key (a shape shunt itself would
+/// refuse, but `read_view` reads): keyed by the empty name plus its occurrence.
+fn nameless_up(mode: &str) -> UpstreamView {
+    UpstreamView {
+        name: None,
+        ..shorthand_up("unused", mode)
+    }
+}
+
+/// A `ConfigView` with a set bind + default provider and no entries.
+fn base_view() -> ConfigView {
+    ConfigView {
+        server: ServerView {
+            bind: Some(w("127.0.0.1:3001")),
+            bind_override: BindOverride::None,
+            default_provider: Some(w("anthropic")),
+        },
+        form: ProviderForm::Upstreams,
+        upstreams: Vec::new(),
+        models: Vec::new(),
+        routes: Vec::new(),
+    }
+}
+
+/// An app whose shunt card is the full slot plus `view` as its config section.
+fn config_view_app(view: ConfigView, expanded: std::collections::HashSet<ShuntEntryKey>) -> App {
+    let mut card = crate::tui::app::shunt_check(&shunt_slot_full(), true, None);
+    card.shunt_focus
+        .extend(crate::tui::app::config_entry_stops(&view));
+    let mut app = app_with(card);
+    app.services.shunt_config = Some(ShuntConfigRead::Ok(Box::new(view)));
+    app.services.shunt_expanded = expanded;
+    app
+}
+
+/// The detail pane's content rows keeping the card's own indentation: the
+/// `││` split drops both panes' borders, then exactly the one-cell pane
+/// padding is dropped from the left and the right padding is trimmed — the
+/// card's leading gutter (the entry rows' caret slot, the expanded fields'
+/// indent) stays, where [`detail_rows`]'s `.trim()` would strip it. Blank
+/// rows stay (the one blank line before `SERVER` is pinned), trailing pane
+/// padding trimmed.
+fn config_detail_rows(rows: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.split("││").nth(1))
+        .map(|r| {
+            let r = r.trim_matches('│');
+            let r = r.strip_prefix(' ').unwrap_or(r);
+            r.trim_end().to_string()
+        })
+        .collect();
+    while out.last().is_some_and(String::is_empty) {
+        out.pop();
+    }
+    out
+}
+
+/// Render the config section over the full slot at a tall viewport (so the
+/// config rows never overflow into a scrollbar) and pin the detail rows.
+fn assert_config_detail(
+    view: ConfigView,
+    expanded: std::collections::HashSet<ShuntEntryKey>,
+    expected: &[&str],
+) {
+    let app = config_view_app(view, expanded);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 40)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert_eq!(
+        config_detail_rows(&rows),
+        expected,
+        "config detail rows:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// Render the config section at terminal `width` and return its rows from the
+/// `SERVER` eyebrow on, for the narrow-width `…` and duplicate-identity pins.
+fn render_config_section(
+    view: ConfigView,
+    expanded: std::collections::HashSet<ShuntEntryKey>,
+    width: u16,
+) -> Vec<String> {
+    let app = config_view_app(view, expanded);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 40)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let detail = config_detail_rows(&rows);
+    let at = detail.iter().position(|r| r == "SERVER").expect("SERVER");
+    detail[at..].to_vec()
+}
+
+/// The groups follow the card's lines under `SERVER` / `UPSTREAMS` / `MODELS` /
+/// `ROUTES` eyebrows, each upstream a `▶` row with its name padded to the key
+/// column and a dim summary; an empty group still shows its eyebrow.
+#[test]
+fn the_shunt_config_renders_upstreams_collapsed() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![
+        shorthand_up("anthropic", "claude_oauth"),
+        shorthand_up("openai", "api_key"),
+    ];
+    assert_config_detail(
+        view,
+        std::collections::HashSet::new(),
+        &[
+            "binary     /usr/local/bin/shunt",
+            "config     /home/u/.clauth/gateway.toml",
+            "version    0.49.1",
+            "state      healthy",
+            "reason     port busy",
+            "pid        4242",
+            "port       3001",
+            "restarts   2",
+            "last exit  exit 1",
+            "",
+            "SERVER",
+            "  bind              127.0.0.1:3001",
+            "  default_provider  anthropic",
+            "UPSTREAMS",
+            "  ▶ anthropic       claude_oauth",
+            "  ▶ openai          api_key",
+            "MODELS",
+            "ROUTES",
+        ],
+    );
+}
+
+/// An expanded upstream lists its fields indented under it, in the brief's
+/// order: a `claude_oauth` (pool OAuth) auth renders `accounts` alone — no
+/// `account` (unset), no `auth env`/`auth header` — and absent keys read `—`.
+#[test]
+fn the_shunt_config_renders_one_upstream_expanded_with_accounts() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.server.default_provider = None;
+    view.upstreams = vec![UpstreamView {
+        name: Some(w("anthropic")),
+        provider: None,
+        kind: None,
+        base_url: None,
+        auth: Some(AuthView {
+            form: AuthForm::Inline,
+            mode: Some(w("claude_oauth")),
+            account: None,
+            accounts: Some(vec![
+                AccountView::Name(w("alice")),
+                AccountView::Name(w("bob")),
+            ]),
+            env: None,
+            header: None,
+        }),
+        effort: None,
+        service_tier: None,
+    }];
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Upstream {
+        name: "anthropic".into(),
+        occurrence: 0,
+    }]);
+    assert_config_detail(
+        view,
+        expanded,
+        &[
+            "binary     /usr/local/bin/shunt",
+            "config     /home/u/.clauth/gateway.toml",
+            "version    0.49.1",
+            "state      healthy",
+            "reason     port busy",
+            "pid        4242",
+            "port       3001",
+            "restarts   2",
+            "last exit  exit 1",
+            "",
+            "SERVER",
+            "  bind              127.0.0.1:3001",
+            "  default_provider  —",
+            "UPSTREAMS",
+            "  ▼ anthropic       claude_oauth · 2 accounts",
+            "    name            anthropic",
+            "    provider        —",
+            "    kind            —",
+            "    base_url        —",
+            "    auth mode       claude_oauth",
+            "    accounts        alice, bob",
+            "    effort          —",
+            "    service_tier    —",
+            "MODELS",
+            "ROUTES",
+        ],
+    );
+}
+
+/// A `[providers.*]` config renders its names as one `providers` row and the
+/// convert-by-hand note under it; the model, route and server rows still render.
+#[test]
+fn the_shunt_config_renders_the_legacy_form() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.form = ProviderForm::Legacy {
+        providers: vec!["anthropic".to_string(), "openai".to_string()],
+    };
+    assert_config_detail(
+        view,
+        std::collections::HashSet::new(),
+        &[
+            "binary     /usr/local/bin/shunt",
+            "config     /home/u/.clauth/gateway.toml",
+            "version    0.49.1",
+            "state      healthy",
+            "reason     port busy",
+            "pid        4242",
+            "port       3001",
+            "restarts   2",
+            "last exit  exit 1",
+            "",
+            "SERVER",
+            "  bind              127.0.0.1:3001",
+            "  default_provider  anthropic",
+            "UPSTREAMS",
+            "  providers         anthropic, openai",
+            "  └ [providers.*] form; convert to [[upstreams]] by hand to edit",
+            "MODELS",
+            "ROUTES",
+        ],
+    );
+}
+
+/// While the bind override holds, the bind row names the variable (the view's
+/// spelling), the suffix dim, the row still read-only.
+#[test]
+fn the_shunt_config_renders_the_bind_override_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.server.bind_override = BindOverride::Set("SHUNT_SERVER__BIND".to_string());
+    assert_config_detail(
+        view,
+        std::collections::HashSet::new(),
+        &[
+            "binary     /usr/local/bin/shunt",
+            "config     /home/u/.clauth/gateway.toml",
+            "version    0.49.1",
+            "state      healthy",
+            "reason     port busy",
+            "pid        4242",
+            "port       3001",
+            "restarts   2",
+            "last exit  exit 1",
+            "",
+            "SERVER",
+            "  bind              127.0.0.1:3001  set by SHUNT_SERVER__BIND",
+            "  default_provider  anthropic",
+            "UPSTREAMS",
+            "MODELS",
+            "ROUTES",
+        ],
+    );
+}
+
+/// A `${…}` value renders as written, never resolved.
+#[test]
+fn the_shunt_config_renders_a_reference_value_as_written() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.routes = vec![RouteView {
+        position: 1,
+        model: Some(w("opus")),
+        provider: Some(w("anthropic")),
+        upstream_model: Some(wref("${MODEL}")),
+        effort: None,
+        service_tier: None,
+    }];
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Route(1)]);
+    assert_config_detail(
+        view,
+        expanded,
+        &[
+            "binary     /usr/local/bin/shunt",
+            "config     /home/u/.clauth/gateway.toml",
+            "version    0.49.1",
+            "state      healthy",
+            "reason     port busy",
+            "pid        4242",
+            "port       3001",
+            "restarts   2",
+            "last exit  exit 1",
+            "",
+            "SERVER",
+            "  bind              127.0.0.1:3001",
+            "  default_provider  anthropic",
+            "UPSTREAMS",
+            "MODELS",
+            "ROUTES",
+            "  ▼ 1  opus → anthropic",
+            "    model           opus",
+            "    provider        anthropic",
+            "    upstream_model  ${MODEL}",
+            "    effort          —",
+            "    service_tier    —",
+        ],
+    );
+}
+
+/// An absent key reads `—`, never shunt's default: a route with no model or
+/// provider shows both sides faint in its label.
+#[test]
+fn the_shunt_config_renders_an_absent_key_as_em_dash() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.routes = vec![RouteView {
+        position: 1,
+        model: None,
+        provider: None,
+        upstream_model: None,
+        effort: None,
+        service_tier: None,
+    }];
+    assert_config_detail(
+        view,
+        std::collections::HashSet::new(),
+        &[
+            "binary     /usr/local/bin/shunt",
+            "config     /home/u/.clauth/gateway.toml",
+            "version    0.49.1",
+            "state      healthy",
+            "reason     port busy",
+            "pid        4242",
+            "port       3001",
+            "restarts   2",
+            "last exit  exit 1",
+            "",
+            "SERVER",
+            "  bind              127.0.0.1:3001",
+            "  default_provider  anthropic",
+            "UPSTREAMS",
+            "MODELS",
+            "ROUTES",
+            "  ▶ 1  — → —",
+        ],
+    );
+}
+
+/// An expanded model lists `id`, `display_name`, then one row per
+/// `upstream_model` entry labelled by its provider key; the collapsed summary
+/// counts the upstreams.
+#[test]
+fn the_shunt_config_renders_a_model_with_two_upstreams_expanded() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.models = vec![ModelView {
+        id: Some(w("opus")),
+        display_name: Some(w("Opus")),
+        upstream_model: Some(vec![
+            ("anthropic".to_string(), w("claude-opus")),
+            ("openai".to_string(), w("gpt-5")),
+        ]),
+    }];
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Model {
+        id: "opus".into(),
+        occurrence: 0,
+    }]);
+    assert_config_detail(
+        view,
+        expanded,
+        &[
+            "binary     /usr/local/bin/shunt",
+            "config     /home/u/.clauth/gateway.toml",
+            "version    0.49.1",
+            "state      healthy",
+            "reason     port busy",
+            "pid        4242",
+            "port       3001",
+            "restarts   2",
+            "last exit  exit 1",
+            "",
+            "SERVER",
+            "  bind              127.0.0.1:3001",
+            "  default_provider  anthropic",
+            "UPSTREAMS",
+            "MODELS",
+            "  ▼ opus            2 upstreams",
+            "    id              opus",
+            "    display_name    Opus",
+            "    anthropic       claude-opus",
+            "    openai          gpt-5",
+            "ROUTES",
+        ],
+    );
+}
+
+/// A collapsed route row labels `<position>  <model> → <provider>` with no
+/// summary.
+#[test]
+fn the_shunt_config_renders_a_route_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.routes = vec![RouteView {
+        position: 3,
+        model: Some(w("opus")),
+        provider: Some(w("anthropic")),
+        upstream_model: None,
+        effort: None,
+        service_tier: None,
+    }];
+    assert_config_detail(
+        view,
+        std::collections::HashSet::new(),
+        &[
+            "binary     /usr/local/bin/shunt",
+            "config     /home/u/.clauth/gateway.toml",
+            "version    0.49.1",
+            "state      healthy",
+            "reason     port busy",
+            "pid        4242",
+            "port       3001",
+            "restarts   2",
+            "last exit  exit 1",
+            "",
+            "SERVER",
+            "  bind              127.0.0.1:3001",
+            "  default_provider  anthropic",
+            "UPSTREAMS",
+            "MODELS",
+            "ROUTES",
+            "  ▶ 3  opus → anthropic",
+        ],
+    );
+}
+
+// ── shunt config section key handling ────────────────────────────────────────
+
+use crate::tui::app::{ShuntFocusLine, handle_key};
+use ratatui::crossterm::event::KeyCode;
+
+/// Render the full frame at a tall viewport so every config entry is in view
+/// (the key handler walks over the geometry this render publishes).
+fn render_tall(app: &App) {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+}
+
+/// `↵` expands a focused entry and `space` collapses it, the cloudy-tui
+/// disclosure contract (both keys activate, independently per entry).
+#[test]
+fn a_config_entry_enter_expands_and_space_collapses() {
+    use crate::tui::app::ShuntFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![shorthand_up("anthropic", "claude_oauth")];
+    let mut app = config_view_app(view, std::collections::HashSet::new());
+    render_tall(&app);
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        matches!(
+            app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Entry {
+                key: ShuntEntryKey::Upstream { name, .. }
+            }) if name == "anthropic"
+        ),
+        "descend lands on the first entry"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        app.services
+            .shunt_expanded
+            .contains(&ShuntEntryKey::Upstream {
+                name: "anthropic".into(),
+                occurrence: 0
+            }),
+        "enter expands the entry"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        !app.services
+            .shunt_expanded
+            .contains(&ShuntEntryKey::Upstream {
+                name: "anthropic".into(),
+                occurrence: 0
+            }),
+        "space collapses the entry"
+    );
+}
+
+/// `↑↓` walks the entry rows and skips the field rows of an expanded entry —
+/// field rows are read-only in this commit and never take focus.
+#[test]
+fn the_config_focus_walk_reaches_entries_and_skips_field_rows() {
+    use crate::tui::app::ShuntFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![
+        shorthand_up("anthropic", "claude_oauth"),
+        shorthand_up("openai", "api_key"),
+    ];
+    let mut app = config_view_app(
+        view,
+        std::collections::HashSet::from([ShuntEntryKey::Upstream {
+            name: "anthropic".into(),
+            occurrence: 0,
+        }]),
+    );
+    render_tall(&app);
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert!(
+        matches!(
+            app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Entry {
+                key: ShuntEntryKey::Upstream { name, .. }
+            }) if name == "openai"
+        ),
+        "one step lands on the next entry, not on anthropic's field rows"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert!(
+        matches!(
+            app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Entry {
+                key: ShuntEntryKey::Upstream { name, .. }
+            }) if name == "anthropic"
+        ),
+        "one step back returns to the first entry"
+    );
+}
+
+/// Focus is held by the entry's identity, never a line index: a recompute that
+/// reorders the upstreams keeps focus on the same entry.
+#[test]
+fn config_focus_identity_holds_across_a_reorder() {
+    use crate::tui::app::ShuntFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![
+        shorthand_up("anthropic", "claude_oauth"),
+        shorthand_up("openai", "api_key"),
+    ];
+    let mut app = config_view_app(view.clone(), std::collections::HashSet::new());
+    render_tall(&app);
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.services.shunt_focus_kind(),
+        Some(ShuntFocusLine::Entry(ShuntEntryKey::Upstream {
+            name: "openai".into(),
+            occurrence: 0,
+        })),
+        "focus holds on openai before the reorder"
+    );
+
+    // A recompute that reorders the upstreams: openai now first. The held
+    // identity stays, so focus re-resolves to openai at its new position.
+    view.upstreams.reverse();
+    let mut card = crate::tui::app::shunt_check(&shunt_slot_full(), true, None);
+    card.shunt_focus
+        .extend(crate::tui::app::config_entry_stops(&view));
+    app.services.checks = vec![card];
+    app.services.shunt_config = Some(ShuntConfigRead::Ok(Box::new(view)));
+    render_tall(&app);
+
+    assert!(
+        matches!(
+            app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Entry {
+                key: ShuntEntryKey::Upstream { name, .. }
+            }) if name == "openai"
+        ),
+        "focus follows the entry by identity across the reorder"
+    );
+}
+
+/// The expanded set drops a key whose entry left the config, and keeps the
+/// surviving entries' keys. A failed read never reaches the prune (the
+/// recompute prunes only over a read view), so it keeps the set.
+#[test]
+fn the_config_expanded_set_drops_a_removed_entry() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![shorthand_up("kept", "api_key")];
+    let mut expanded = std::collections::HashSet::from([
+        ShuntEntryKey::Upstream {
+            name: "kept".into(),
+            occurrence: 0,
+        },
+        ShuntEntryKey::Upstream {
+            name: "gone".into(),
+            occurrence: 0,
+        },
+    ]);
+    crate::tui::app::prune_shunt_expanded(&view, &mut expanded);
+    assert_eq!(
+        expanded,
+        std::collections::HashSet::from([ShuntEntryKey::Upstream {
+            name: "kept".into(),
+            occurrence: 0
+        }]),
+        "the removed entry's key drops, the surviving key stays"
+    );
+}
+
+/// The footer advertises `space/↵ expand` on a collapsed focused entry and
+/// `space/↵ collapse` once it is expanded, derived from the focused stop —
+/// pinned by equality on the whole hint vec.
+#[test]
+fn the_config_footer_hints_expand_then_collapse() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![shorthand_up("anthropic", "claude_oauth")];
+    let mut app = config_view_app(view, std::collections::HashSet::new());
+    render_tall(&app);
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        super::super::footer::services_hints(&app),
+        vec![
+            ("r", "refresh"),
+            ("space/↵", "expand"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "a collapsed focused entry advertises expand"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        super::super::footer::services_hints(&app),
+        vec![
+            ("r", "refresh"),
+            ("space/↵", "collapse"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "an expanded focused entry advertises collapse"
+    );
+}
+
+/// A config read failure renders no groups and one `config  not read (<reason>)`
+/// line after the card's lines; a shape refusal renders `config  not editable`
+/// and its sentence on a faint `└` line.
+#[test]
+fn the_shunt_config_read_failure_names_the_reason_or_the_refusal() {
+    use crate::tui::app::UnreadConfig;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut card = crate::tui::app::shunt_check(&shunt_slot_full(), true, None);
+    card.shunt_focus = Vec::new();
+    let mut app = app_with(card);
+    app.services.shunt_config = Some(ShuntConfigRead::Unread(UnreadConfig::Unparsed));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 40)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert_eq!(
+        config_detail_rows(&rows),
+        vec![
+            "binary     /usr/local/bin/shunt",
+            "config     /home/u/.clauth/gateway.toml",
+            "version    0.49.1",
+            "state      healthy",
+            "reason     port busy",
+            "pid        4242",
+            "port       3001",
+            "restarts   2",
+            "last exit  exit 1",
+            "",
+            "config  not read (does not parse)",
+        ],
+        "an unparsed config renders the reason line: {}",
+        rows.join("\n")
+    );
+
+    let mut card = crate::tui::app::shunt_check(&shunt_slot_full(), true, None);
+    card.shunt_focus = Vec::new();
+    let mut app = app_with(card);
+    app.services.shunt_config = Some(ShuntConfigRead::Refused(
+        "a shape clauth does not edit".to_string(),
+    ));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 40)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert_eq!(
+        config_detail_rows(&rows),
+        vec![
+            "binary     /usr/local/bin/shunt",
+            "config     /home/u/.clauth/gateway.toml",
+            "version    0.49.1",
+            "state      healthy",
+            "reason     port busy",
+            "pid        4242",
+            "port       3001",
+            "restarts   2",
+            "last exit  exit 1",
+            "",
+            "config  not editable",
+            "  └ a shape clauth does not edit",
+        ],
+        "a shape refusal renders the not-editable line and its sentence: {}",
+        rows.join("\n")
+    );
+}
+
+/// An env file the view cannot read keeps the groups: one `env file  not read
+/// (<reason>)` line above them, and the bind row reads `env file not read`.
+#[test]
+fn the_shunt_config_renders_the_env_file_failure_line() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.server.bind_override = BindOverride::Unknown(EnvFileFailure::Missing);
+    assert_config_detail(
+        view,
+        std::collections::HashSet::new(),
+        &[
+            "binary     /usr/local/bin/shunt",
+            "config     /home/u/.clauth/gateway.toml",
+            "version    0.49.1",
+            "state      healthy",
+            "reason     port busy",
+            "pid        4242",
+            "port       3001",
+            "restarts   2",
+            "last exit  exit 1",
+            "",
+            "env file  not read (missing)",
+            "SERVER",
+            "  bind              127.0.0.1:3001  env file not read",
+            "  default_provider  anthropic",
+            "UPSTREAMS",
+            "MODELS",
+            "ROUTES",
+        ],
+    );
+}
+
+/// Two models sharing one id render as distinct rows: expanding the second
+/// shows the second's fields, never the first's.
+#[test]
+fn the_shunt_config_renders_two_same_id_models_distinctly() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.models = vec![
+        ModelView {
+            id: Some(w("m")),
+            display_name: Some(w("First")),
+            upstream_model: None,
+        },
+        ModelView {
+            id: Some(w("m")),
+            display_name: Some(w("Second")),
+            upstream_model: None,
+        },
+    ];
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Model {
+        id: "m".into(),
+        occurrence: 1,
+    }]);
+    assert_config_detail(
+        view,
+        expanded,
+        &[
+            "binary     /usr/local/bin/shunt",
+            "config     /home/u/.clauth/gateway.toml",
+            "version    0.49.1",
+            "state      healthy",
+            "reason     port busy",
+            "pid        4242",
+            "port       3001",
+            "restarts   2",
+            "last exit  exit 1",
+            "",
+            "SERVER",
+            "  bind              127.0.0.1:3001",
+            "  default_provider  anthropic",
+            "UPSTREAMS",
+            "MODELS",
+            "  ▶ m",
+            "  ▼ m",
+            "    id              m",
+            "    display_name    Second",
+            "ROUTES",
+        ],
+    );
+}
+
+/// Two models sharing one id are distinct rows: `↓` moves between them and
+/// `↵` expands only the focused one.
+#[test]
+fn the_config_focus_walk_reaches_two_same_id_models() {
+    use crate::tui::app::ShuntFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.models = vec![
+        ModelView {
+            id: Some(w("m")),
+            display_name: None,
+            upstream_model: None,
+        },
+        ModelView {
+            id: Some(w("m")),
+            display_name: None,
+            upstream_model: None,
+        },
+    ];
+    let mut app = config_view_app(view, std::collections::HashSet::new());
+    render_tall(&app);
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert!(
+        matches!(
+            app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Entry {
+                key: ShuntEntryKey::Model { id, occurrence: 1 }
+            }) if id == "m"
+        ),
+        "one step lands on the second same-id model"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        app.services.shunt_expanded.contains(&ShuntEntryKey::Model {
+            id: "m".into(),
+            occurrence: 1
+        }),
+        "enter expands only the focused model"
+    );
+    assert!(
+        !app.services.shunt_expanded.contains(&ShuntEntryKey::Model {
+            id: "m".into(),
+            occurrence: 0
+        }),
+        "the first same-id model stays collapsed"
+    );
+}
+
+/// Two upstreams sharing a name are distinct rows: expanding the second shows
+/// the second's summary and fields, never the first's.
+#[test]
+fn the_shunt_config_renders_two_same_name_upstreams_distinctly() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![
+        shorthand_up("a", "api_key"),
+        shorthand_up("a", "claude_oauth"),
+    ];
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 1,
+    }]);
+    assert_eq!(
+        render_config_section(view, expanded, W),
+        vec![
+            "SERVER".to_string(),
+            "  bind              127.0.0.1:3001".to_string(),
+            "  default_provider  anthropic".to_string(),
+            "UPSTREAMS".to_string(),
+            format!("  ▶ a{}api_key", " ".repeat(15)),
+            format!("  ▼ a{}claude_oauth", " ".repeat(15)),
+            "    name            a".to_string(),
+            "    provider        —".to_string(),
+            "    kind            —".to_string(),
+            "    base_url        —".to_string(),
+            "    auth mode       claude_oauth".to_string(),
+            "    accounts        —".to_string(),
+            "    effort          —".to_string(),
+            "    service_tier    —".to_string(),
+            "MODELS".to_string(),
+            "ROUTES".to_string(),
+        ],
+        "the second same-name upstream draws its own summary and fields"
+    );
+}
+
+/// Two nameless upstreams (keyed by the empty name plus occurrence) are
+/// distinct rows too: expanding the second shows the second's fields.
+#[test]
+fn the_shunt_config_renders_two_nameless_upstreams_distinctly() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![nameless_up("api_key"), nameless_up("claude_oauth")];
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Upstream {
+        name: String::new(),
+        occurrence: 1,
+    }]);
+    // The empty name pads to the key column (14 + 2 gutter), so the entry rows
+    // open their summary at the shared value column, col 20.
+    assert_eq!(
+        render_config_section(view, expanded, W),
+        vec![
+            "SERVER".to_string(),
+            "  bind              127.0.0.1:3001".to_string(),
+            "  default_provider  anthropic".to_string(),
+            "UPSTREAMS".to_string(),
+            format!("  ▶ {}api_key", " ".repeat(16)),
+            format!("  ▼ {}claude_oauth", " ".repeat(16)),
+            "    name            —".to_string(),
+            "    provider        —".to_string(),
+            "    kind            —".to_string(),
+            "    base_url        —".to_string(),
+            "    auth mode       claude_oauth".to_string(),
+            "    accounts        —".to_string(),
+            "    effort          —".to_string(),
+            "    service_tier    —".to_string(),
+            "MODELS".to_string(),
+            "ROUTES".to_string(),
+        ],
+        "the second nameless upstream draws its own fields"
+    );
+}
+
+/// Two upstreams sharing a name are distinct stops: `↓` moves between them and
+/// `↵` expands only the focused one.
+#[test]
+fn the_config_focus_walk_reaches_two_same_name_upstreams() {
+    use crate::tui::app::ShuntFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![
+        shorthand_up("a", "api_key"),
+        shorthand_up("a", "claude_oauth"),
+    ];
+    let mut app = config_view_app(view, std::collections::HashSet::new());
+    render_tall(&app);
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert!(
+        matches!(
+            app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Entry {
+                key: ShuntEntryKey::Upstream { name, occurrence: 1 }
+            }) if name == "a"
+        ),
+        "one step lands on the second same-name upstream"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        app.services
+            .shunt_expanded
+            .contains(&ShuntEntryKey::Upstream {
+                name: "a".into(),
+                occurrence: 1
+            }),
+        "enter expands only the focused upstream"
+    );
+    assert!(
+        !app.services
+            .shunt_expanded
+            .contains(&ShuntEntryKey::Upstream {
+                name: "a".into(),
+                occurrence: 0
+            }),
+        "the first same-name upstream stays collapsed"
+    );
+}
+
+/// Two nameless upstreams are distinct stops: `↓` moves between them and `↵`
+/// expands only the focused one.
+#[test]
+fn the_config_focus_walk_reaches_two_nameless_upstreams() {
+    use crate::tui::app::ShuntFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![nameless_up("api_key"), nameless_up("claude_oauth")];
+    let mut app = config_view_app(view, std::collections::HashSet::new());
+    render_tall(&app);
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert!(
+        matches!(
+            app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Entry {
+                key: ShuntEntryKey::Upstream { name, occurrence: 1 }
+            }) if name.is_empty()
+        ),
+        "one step lands on the second nameless upstream"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        app.services
+            .shunt_expanded
+            .contains(&ShuntEntryKey::Upstream {
+                name: String::new(),
+                occurrence: 1
+            }),
+        "enter expands only the focused nameless upstream"
+    );
+    assert!(
+        !app.services
+            .shunt_expanded
+            .contains(&ShuntEntryKey::Upstream {
+                name: String::new(),
+                occurrence: 0
+            }),
+        "the first nameless upstream stays collapsed"
+    );
+}
+
+/// At a narrow width a long upstream name, summary and route model each
+/// trail-ellipsize at their slot (`…`), never clip at the pane edge.
+#[test]
+fn the_shunt_config_ellipsizes_long_names_summaries_and_route_labels() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![UpstreamView {
+        name: Some(w("abcdefghijklmnopqrstuvwxyz")),
+        provider: None,
+        kind: None,
+        base_url: None,
+        auth: Some(AuthView {
+            form: AuthForm::Inline,
+            mode: Some(w("antigravity_oauth")),
+            account: None,
+            accounts: Some(vec![
+                AccountView::Name(w("alice")),
+                AccountView::Name(w("bob")),
+            ]),
+            env: None,
+            header: None,
+        }),
+        effort: None,
+        service_tier: None,
+    }];
+    view.routes = vec![RouteView {
+        position: 1,
+        model: Some(w(
+            "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        )),
+        provider: Some(w("anthropic")),
+        upstream_model: None,
+        effort: None,
+        service_tier: None,
+    }];
+    // 60 cols is still desktop (the horizontal split), the detail pane 36 wide:
+    // the name slot (14) ellipsizes the 26-char name, the value room (16) the
+    // 30-char summary, the route label room (32) the model slug alone while the
+    // arrow and provider stay whole.
+    assert_eq!(
+        render_config_section(view, std::collections::HashSet::new(), 60),
+        vec![
+            "SERVER".to_string(),
+            "  bind              127.0.0.1:3001".to_string(),
+            "  default_provider  anthropic".to_string(),
+            "UPSTREAMS".to_string(),
+            "  ▶ abcdefghijklm…  antigravity_oau…".to_string(),
+            "MODELS".to_string(),
+            "ROUTES".to_string(),
+            "  ▶ 1  0123456789abcdef… → anthropic".to_string(),
+        ],
+        "long names, summaries and route labels ellipsize at their slot"
+    );
+}
+
+/// A collapsed route row keeps the position, the arrow and the provider whole
+/// and shrinks the model slug alone with a trailing `…` — the arrow and the
+/// provider never drop off the pane edge.
+#[test]
+fn the_shunt_config_keeps_the_route_provider_when_the_model_shrinks() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.routes = vec![RouteView {
+        position: 2,
+        model: Some(w("a-really-long-model-slug-for-truncation-checks")),
+        provider: Some(w("openai")),
+        upstream_model: None,
+        effort: None,
+        service_tier: None,
+    }];
+    assert_eq!(
+        render_config_section(view, std::collections::HashSet::new(), 80),
+        vec![
+            "SERVER".to_string(),
+            "  bind              127.0.0.1:3001".to_string(),
+            "  default_provider  anthropic".to_string(),
+            "UPSTREAMS".to_string(),
+            "MODELS".to_string(),
+            "ROUTES".to_string(),
+            "  ▶ 2  a-really-long-model-slug-for-trunca… → openai".to_string(),
+        ],
+        "the route label shrinks the model, keeping the arrow and provider"
+    );
+}
+
+/// A provider that leaves the model no room keeps a `…` in the model's slot
+/// and gives up one more cell itself, so the row never reads as a route with
+/// no model.
+#[test]
+fn the_shunt_config_marks_a_crowded_out_route_model_with_an_ellipsis() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.routes = vec![RouteView {
+        position: 2,
+        model: Some(w("opus")),
+        provider: Some(w("abcdefghijklmnopqrstuvwxyz0123456789ABCDEF")),
+        upstream_model: None,
+        effort: None,
+        service_tier: None,
+    }];
+    assert_eq!(
+        render_config_section(view, std::collections::HashSet::new(), 80),
+        vec![
+            "SERVER".to_string(),
+            "  bind              127.0.0.1:3001".to_string(),
+            "  default_provider  anthropic".to_string(),
+            "UPSTREAMS".to_string(),
+            "MODELS".to_string(),
+            "ROUTES".to_string(),
+            "  ▶ 2  … → abcdefghijklmnopqrstuvwxyz0123456789ABCD…".to_string(),
+        ],
+        "the crowded-out model keeps a `…` and the provider shrinks by one more cell"
+    );
+}
+
+/// An absent model crowded out by the provider still reads `—`, never the `…`
+/// of a cut slug.
+#[test]
+fn the_shunt_config_marks_an_absent_crowded_route_model_with_an_em_dash() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.routes = vec![RouteView {
+        position: 2,
+        model: None,
+        provider: Some(w("abcdefghijklmnopqrstuvwxyz0123456789ABCDEF")),
+        upstream_model: None,
+        effort: None,
+        service_tier: None,
+    }];
+    assert_eq!(
+        render_config_section(view, std::collections::HashSet::new(), 80),
+        vec![
+            "SERVER".to_string(),
+            "  bind              127.0.0.1:3001".to_string(),
+            "  default_provider  anthropic".to_string(),
+            "UPSTREAMS".to_string(),
+            "MODELS".to_string(),
+            "ROUTES".to_string(),
+            "  ▶ 2  — → abcdefghijklmnopqrstuvwxyz0123456789ABCD…".to_string(),
+        ],
+        "an absent model keeps its `—` when the provider crowds it out"
+    );
+}
+
+/// At a narrow pane the bind row's dim suffix (`set by <variable>` / `env file
+/// not read`) trail-ellipsizes in the room left after the value and its 2-space
+/// gap, never clipping past the pane edge; when the value itself overflows, it
+/// ellipsizes and the suffix drops whole.
+#[test]
+fn the_shunt_config_ellipsizes_the_bind_suffix_at_a_narrow_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut set = base_view();
+    set.server.bind_override = BindOverride::Set("SHUNT_SERVER__BIND".to_string());
+    assert_eq!(
+        render_config_section(set, std::collections::HashSet::new(), 80),
+        vec![
+            "SERVER".to_string(),
+            "  bind              127.0.0.1:3001  set by SHUNT_SE…".to_string(),
+            "  default_provider  anthropic".to_string(),
+            "UPSTREAMS".to_string(),
+            "MODELS".to_string(),
+            "ROUTES".to_string(),
+        ],
+        "the set-by suffix ellipsizes within the pane"
+    );
+    let mut unread = base_view();
+    unread.server.bind_override = BindOverride::Unknown(EnvFileFailure::Missing);
+    assert_eq!(
+        render_config_section(unread, std::collections::HashSet::new(), 80),
+        vec![
+            "SERVER".to_string(),
+            "  bind              127.0.0.1:3001  env file not re…".to_string(),
+            "  default_provider  anthropic".to_string(),
+            "UPSTREAMS".to_string(),
+            "MODELS".to_string(),
+            "ROUTES".to_string(),
+        ],
+        "the env-file suffix ellipsizes within the pane"
+    );
+    let mut overflow = base_view();
+    overflow.server.bind = Some(w("0123456789abcdef0123456789abcdef0"));
+    overflow.server.bind_override = BindOverride::Set("SHUNT_SERVER__BIND".to_string());
+    assert_eq!(
+        render_config_section(overflow, std::collections::HashSet::new(), 80),
+        vec![
+            "SERVER".to_string(),
+            "  bind              0123456789abcdef0123456789abcde…".to_string(),
+            "  default_provider  anthropic".to_string(),
+            "UPSTREAMS".to_string(),
+            "MODELS".to_string(),
+            "ROUTES".to_string(),
+        ],
+        "an overflowing value ellipsizes and the suffix drops whole"
+    );
+}
+
+/// Style pins: a collapsed-blurred entry renders its glyph and summary dim and
+/// its label dim (no bold); an expanded-focused entry renders its glyph accent
+/// and its label `TEXT + bold`; the focused group's eyebrow is dim bold
+/// underlined; field values accent and `—` faint.
+#[test]
+fn the_shunt_config_entry_styles_follow_the_design_contract() {
+    use crate::tui::app::{ServicesFocus, ShuntFocusLine};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![
+        shorthand_up("anthropic", "claude_oauth"),
+        shorthand_up("openai", "api_key"),
+    ];
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Upstream {
+        name: "openai".into(),
+        occurrence: 0,
+    }]);
+    let mut app = config_view_app(view, expanded);
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Entry(ShuntEntryKey::Upstream {
+            name: "openai".into(),
+            occurrence: 0,
+        })));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let buf = term.backend().buffer().clone();
+
+    // Collapsed-blurred entry: glyph dim, label dim (no bold), summary dim.
+    let collapsed = crate::testutil::needle_cells(&buf, "▶ anthropic").expect("collapsed row");
+    assert_eq!(
+        collapsed[0].fg,
+        super::theme::text_dim_color(),
+        "collapsed glyph dim"
+    );
+    assert_eq!(
+        collapsed[2].fg,
+        super::theme::text_dim_color(),
+        "blurred label dim"
+    );
+    assert!(
+        !collapsed[2]
+            .modifier
+            .contains(ratatui::style::Modifier::BOLD),
+        "blurred label not bold"
+    );
+    let summary = crate::testutil::needle_cells(&buf, "claude_oauth").expect("summary");
+    assert_eq!(summary[0].fg, super::theme::text_dim_color(), "summary dim");
+
+    // Expanded-focused entry: glyph accent, label TEXT + bold.
+    let expanded_row = crate::testutil::needle_cells(&buf, "▼ openai").expect("expanded row");
+    assert_eq!(
+        expanded_row[0].fg,
+        super::theme::accent_color(),
+        "expanded glyph accent"
+    );
+    assert_eq!(
+        expanded_row[2].fg,
+        super::theme::text_color(),
+        "focused label text"
+    );
+    assert!(
+        expanded_row[2]
+            .modifier
+            .contains(ratatui::style::Modifier::BOLD),
+        "focused label bold"
+    );
+
+    // A field value ACCENT (the SERVER default_provider), `—` faint.
+    let value = crate::testutil::needle_cells(&buf, "anthropic").expect("value");
+    assert_eq!(value[0].fg, super::theme::accent_color(), "value accent");
+    let dash = crate::testutil::needle_cells(&buf, "provider        —").expect("absent value");
+    assert_eq!(
+        dash[dash.len() - 1].fg,
+        super::theme::text_faint_color(),
+        "— faint"
+    );
+
+    // The focused group's eyebrow: dim + bold + underline.
+    let eyebrow = crate::testutil::needle_cells(&buf, "UPSTREAMS").expect("eyebrow");
+    for cell in &eyebrow {
+        assert_eq!(cell.fg, super::theme::text_dim_color(), "eyebrow dim");
+        assert!(
+            cell.modifier.contains(ratatui::style::Modifier::BOLD),
+            "eyebrow bold"
+        );
+        assert!(
+            cell.modifier.contains(ratatui::style::Modifier::UNDERLINED),
+            "eyebrow underlined"
+        );
+    }
+}
+
+/// A config holding both `[providers.*]` and `[[upstreams]]` (the mid-way state
+/// of the by-hand conversion) renders the legacy providers row and note only —
+/// no upstream rows, and no upstream focus stops, so the walk cannot land on a
+/// row the render does not draw.
+#[test]
+fn the_shunt_config_legacy_form_hides_populated_upstreams() {
+    use crate::tui::app::ShuntFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.form = ProviderForm::Legacy {
+        providers: vec!["anthropic".to_string()],
+    };
+    view.upstreams = vec![shorthand_up("anthropic", "api_key")];
+    view.routes = vec![RouteView {
+        position: 1,
+        model: Some(w("opus")),
+        provider: Some(w("anthropic")),
+        upstream_model: None,
+        effort: None,
+        service_tier: None,
+    }];
+    assert_config_detail(
+        view.clone(),
+        std::collections::HashSet::new(),
+        &[
+            "binary     /usr/local/bin/shunt",
+            "config     /home/u/.clauth/gateway.toml",
+            "version    0.49.1",
+            "state      healthy",
+            "reason     port busy",
+            "pid        4242",
+            "port       3001",
+            "restarts   2",
+            "last exit  exit 1",
+            "",
+            "SERVER",
+            "  bind              127.0.0.1:3001",
+            "  default_provider  anthropic",
+            "UPSTREAMS",
+            "  providers         anthropic",
+            "  └ [providers.*] form; convert to [[upstreams]] by hand to edit",
+            "MODELS",
+            "ROUTES",
+            "  ▶ 1  opus → anthropic",
+        ],
+    );
+    assert!(matches!(
+        &crate::tui::app::config_entry_stops(&view)[..],
+        [ShuntFocus::Entry {
+            key: ShuntEntryKey::Route(1)
+        }]
+    ));
 }

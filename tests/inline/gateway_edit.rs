@@ -149,11 +149,11 @@ fn auth(form: AuthForm, mode: &str) -> AuthView {
 #[test]
 fn the_view_reads_every_auth_form_with_each_value_as_written() {
     let _home = HomeSandbox::new();
-    let view = view_of(VIEW, None).expect("view");
+    let view = view_of(VIEW, BindOverride::None).expect("view");
     let expected = ConfigView {
         server: ServerView {
             bind: Some(w("\"127.0.0.1:3067\"", "127.0.0.1:3067")),
-            bind_override: None,
+            bind_override: BindOverride::None,
             default_provider: Some(w("'anthropic'", "anthropic")),
         },
         form: ProviderForm::Upstreams,
@@ -230,7 +230,7 @@ routes = [
   { model = "y", provider = "b" },
 ]
 "#;
-    let view = view_of(text, None).expect("view");
+    let view = view_of(text, BindOverride::None).expect("view");
     assert_eq!(view.upstreams, vec![upstream("a"), upstream("b")]);
     let ids: Vec<Option<Written>> = view.models.into_iter().map(|m| m.id).collect();
     assert_eq!(ids, vec![Some(w("\"m1\"", "m1")), Some(w("\"m2\"", "m2"))]);
@@ -256,7 +256,7 @@ id = "m"
 model = "m"
 provider = "anthropic"
 "#;
-    let view = view_of(text, None).expect("view");
+    let view = view_of(text, BindOverride::None).expect("view");
     assert_eq!(
         view.form,
         ProviderForm::Legacy {
@@ -381,7 +381,7 @@ fn the_view_names_a_bind_override_in_any_case_as_the_env_spells_it() {
         view.server,
         ServerView {
             bind: Some(w("\"127.0.0.1:3067\"", "127.0.0.1:3067")),
-            bind_override: Some(spelled.to_string()),
+            bind_override: BindOverride::Set(spelled.to_string()),
             default_provider: None,
         }
     );
@@ -389,7 +389,7 @@ fn the_view_names_a_bind_override_in_any_case_as_the_env_spells_it() {
     let no_override = record_with_env(&home, "[server]\n", "OTHER=1\n");
     assert_eq!(
         read_view(&no_override).expect("view").server.bind_override,
-        None
+        BindOverride::None
     );
 }
 
@@ -446,7 +446,7 @@ fn a_bind_edit_under_an_unrecorded_daemon_refuses_naming_the_restart() {
             .expect("the view reads on")
             .server
             .bind_override,
-        None
+        BindOverride::None
     );
 }
 
@@ -1350,7 +1350,7 @@ fn a_shape_the_editor_does_not_handle_refuses_naming_the_dotted_key() {
         "cannot set server.bind: the config spells \"server.bind\" in a shape clauth does not edit; edit the config by hand"
     );
     assert_eq!(
-        view_of(text, None)
+        view_of(text, BindOverride::None)
             .expect_err("the view refuses")
             .to_string(),
         "cannot read the shunt config for editing: the config spells \"server.bind\" in a shape clauth does not edit; edit the config by hand"
@@ -1846,7 +1846,81 @@ fn with_no_daemon_the_view_reads_the_override_from_this_processs_env() {
     );
     assert_eq!(
         read_view(&record).expect("view").server.bind_override,
-        Some("SHUNT_SERVER__BIND".to_string())
+        BindOverride::Set("SHUNT_SERVER__BIND".to_string())
+    );
+}
+
+/// An env file the view cannot read keeps the groups: the bind override is
+/// `Unknown(<reason>)` (missing / does not parse), never the config's blame.
+#[test]
+fn the_view_reads_on_an_unreadable_env_file_naming_the_reason() {
+    let home = HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(BIND_ENV, None)]);
+
+    let etc = home.home().join("etc");
+    fs::create_dir_all(&etc).expect("etc");
+    let config = etc.join("shunt.toml");
+    fs::write(&config, "[server]\nbind = \"127.0.0.1:3067\"\n").expect("config");
+    let mut record = GatewayRecord::new(config).expect("record");
+
+    // A missing env file.
+    record.env_file = Some(home.home().join("gone.env"));
+    assert_eq!(
+        read_view(&record).expect("view").server,
+        ServerView {
+            bind: Some(w("\"127.0.0.1:3067\"", "127.0.0.1:3067")),
+            bind_override: BindOverride::Unknown(EnvFileFailure::Missing),
+            default_provider: None,
+        }
+    );
+
+    // An env file with a NUL byte: the file reads, its parse refuses.
+    let env_file = home.home().join("nul.env");
+    fs::write(&env_file, b"SHUNT_SERVER__BIND=1\0").expect("env file");
+    record.env_file = Some(env_file);
+    assert_eq!(
+        read_view(&record).expect("view").server.bind_override,
+        BindOverride::Unknown(EnvFileFailure::DoesNotParse)
+    );
+}
+
+/// An env-file path that is a directory is a read error that is not
+/// `NotFound` on any platform, so it reads `unreadable`, never `missing`.
+#[test]
+fn the_view_reads_a_directory_env_file_as_unreadable() {
+    let home = HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(BIND_ENV, None)]);
+    let mut record = record_with_env(&home, "[server]\nbind = \"127.0.0.1:3067\"\n", "");
+    let dir = home.home().join("envdir");
+    fs::create_dir_all(&dir).expect("env dir");
+    record.env_file = Some(dir);
+    assert_eq!(
+        read_view(&record).expect("view").server.bind_override,
+        BindOverride::Unknown(EnvFileFailure::Unreadable)
+    );
+}
+
+/// On unix a case variant of `SHUNT_SERVER__BIND` in this process's env (which
+/// figment honours) reads as the override, named by its own spelling — never
+/// missed by reading the exact spelling alone.
+#[cfg(unix)]
+#[test]
+fn with_no_daemon_the_view_reads_a_mixed_case_override_as_figment_spells_it() {
+    let home = HomeSandbox::new();
+    let record = record_with_env(&home, "[server]\nbind = \"127.0.0.1:3067\"\n", "");
+    let _pin = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (BIND_ENV, None),
+            (
+                "Shunt_Server__Bind",
+                Some(std::ffi::OsStr::new("127.0.0.1:4000")),
+            ),
+        ],
+    );
+    assert_eq!(
+        read_view(&record).expect("view").server.bind_override,
+        BindOverride::Set("Shunt_Server__Bind".to_string())
     );
 }
 
@@ -2248,7 +2322,7 @@ fn line_endings_and_odd_strings_hold() {
     assert_eq!(
         view_of(
             "[[models]]\nid = \"m\"\n[models.upstream_model]\nwork = 3\n",
-            None
+            BindOverride::None
         )
         .expect("view")
         .models[0]
@@ -4411,7 +4485,7 @@ fn every_key_spelling_takes_its_edit_in_its_own_spelling() {
         "upstreams = [{ name = \"a\", provider = \"anthropic\" }]\n"
     );
     assert_eq!(
-        view_of(spaced, None).unwrap().upstreams[0]
+        view_of(spaced, BindOverride::None).unwrap().upstreams[0]
             .auth
             .as_ref()
             .map(|auth| auth.form),
@@ -4547,9 +4621,12 @@ fn every_key_spelling_takes_its_edit_in_its_own_spelling() {
     );
     // a scalar spelled as a dotted key refuses naming it as the file does
     assert_eq!(
-        view_of("upstreams = [{ name = \"a\", effort . x = \"y\" }]\n", None)
-            .expect_err("the view refuses")
-            .to_string(),
+        view_of(
+            "upstreams = [{ name = \"a\", effort . x = \"y\" }]\n",
+            BindOverride::None
+        )
+        .expect_err("the view refuses")
+        .to_string(),
         "cannot read the shunt config for editing: the config spells \"upstreams.effort . x\" in a shape clauth does not edit; edit the config by hand"
     );
 }
@@ -4884,7 +4961,7 @@ fn a_tab_spaced_dotted_auth_key_keeps_its_spelling() {
 fn a_quoted_key_holding_a_dot_is_one_key_and_no_auth() {
     let _home = HomeSandbox::new();
     let text = "upstreams = [{ name = \"a\", \"auth.mode\" = \"claude_oauth\" }]\n";
-    let view = view_of(text, None).expect("view");
+    let view = view_of(text, BindOverride::None).expect("view");
     assert_eq!(view.upstreams[0].auth, None);
     assert_eq!(
         planned(text, set_upstream("a", UpstreamField::AuthMode, Some("x"))),
@@ -5504,7 +5581,7 @@ provider = "anthropic"
     );
     // a route's field
     let routes = "[[routes]]\nmodel = \"m\"\nprovider = \"anthropic\"\n# tier\neffort = \"high\"\n[[routes]]\nmodel = \"n\"\nprovider = \"anthropic\"\n";
-    let first = view_of(routes, None).unwrap().routes[0].clone();
+    let first = view_of(routes, BindOverride::None).unwrap().routes[0].clone();
     assert_eq!(
         planned(
             routes,

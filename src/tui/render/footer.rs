@@ -525,6 +525,14 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 Some(ShuntFocus::Fix { fix, .. }) => hints.push(("f", fix_verb(fix))),
                 Some(ShuntFocus::Enabled { .. }) => hints.push(("space/↵", "toggle")),
                 Some(ShuntFocus::CheckOutput { .. }) => hints.push(("space/↵", "open")),
+                Some(ShuntFocus::Entry { key }) => hints.push((
+                    "space/↵",
+                    if app.services.shunt_expanded.contains(key) {
+                        "collapse"
+                    } else {
+                        "expand"
+                    },
+                )),
                 None => {}
             }
         }

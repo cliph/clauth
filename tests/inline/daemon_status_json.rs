@@ -19,14 +19,16 @@ use utoipa::openapi::schema::Schema;
 
 #[test]
 fn iso_from_ms_preserves_unsigned_timestamp_range() {
-    for ms in [0, 999, 1_000, 1_789_257_600_999, i64::MAX as u64, u64::MAX] {
-        assert_eq!(
-            iso_from_ms(ms),
-            crate::usage::epoch_secs_to_iso((ms / 1000) as i64)
-        );
+    for (ms, iso) in [
+        (0, "1970-01-01T00:00:00+00:00"),
+        (999, "1970-01-01T00:00:00+00:00"),
+        (1_000, "1970-01-01T00:00:01+00:00"),
+        (1_789_257_600_999, "2026-09-13T00:00:00+00:00"),
+        (i64::MAX as u64, "292278994-08-17T07:12:55+00:00"),
+        (u64::MAX, "584556019-04-03T14:25:51+00:00"),
+    ] {
+        assert_eq!(iso_from_ms(ms), iso, "ms = {ms}");
     }
-    assert_eq!(iso_from_ms(0), "1970-01-01T00:00:00+00:00");
-    assert_eq!(iso_from_ms(1_000), "1970-01-01T00:00:01+00:00");
 }
 
 /// The typed body as a `Value`, for the tests that assert published values;

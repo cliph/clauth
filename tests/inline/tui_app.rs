@@ -22729,14 +22729,15 @@ fn the_production_recompute_renders_the_config_groups_and_walks_onto_them() {
         detail.pop();
     }
     // The config path is the canonicalized sandbox tempdir path, which varies
-    // per box (and middle-truncates on a long one): pin its stable ends, then
-    // normalize it so the rest of the card pins by equality.
+    // per box and per OS separator (and middle-truncates on a long one): pin
+    // its leaf, then normalize it so the rest of the card pins by equality.
     let config_idx = detail
         .iter()
         .position(|r| r.starts_with("config  "))
         .expect("config line");
+    let leaf = format!("{sep}etc{sep}shunt.toml", sep = std::path::MAIN_SEPARATOR);
     assert!(
-        detail[config_idx].ends_with("/etc/shunt.toml"),
+        detail[config_idx].ends_with(&leaf),
         "config line keeps the leaf: {}",
         detail[config_idx]
     );

@@ -75,8 +75,11 @@ pub(super) fn master_detail(area: Rect, items: usize) -> (Rect, Rect) {
 /// Display columns occupied by the text before the caret in `input`.
 /// `InputState::cursor` is a byte offset; every edited field is ASCII-only in
 /// practice, so the char count of the pre-caret slice equals display columns.
+/// The slice is control-escaped like the editor body [`value_caret`] renders,
+/// so a control/bidi character the saved value carried keeps the caret column
+/// aligned with the escaped display.
 pub(super) fn head_cols(input: &InputState) -> usize {
-    input.value[..input.cursor.min(input.value.len())]
+    crate::tui::app::escape_control(&input.value[..input.cursor.min(input.value.len())])
         .chars()
         .count()
 }
@@ -743,10 +746,12 @@ pub(super) fn label_style(focused: bool) -> Style {
 }
 
 /// Render a typed editor's buffer with uniform `BG_SUNKEN` styling (DANGER fg
-/// when invalid). The native terminal cursor — set via
-/// `frame.set_cursor_position` — owns the caret glyph, so no simulated block
-/// cursor. Shared by the chain threshold/max-spend editors, the Config-tab
-/// refresh/weekly editors, and the Plugin-tab herdr tag-refresh editor.
+/// when invalid), the value control-escaped so a control/bidi character the
+/// saved value carried cannot inject into the terminal or reorder the line.
+/// The native terminal cursor — set via `frame.set_cursor_position` — owns the
+/// caret glyph, so no simulated block cursor. Shared by the chain
+/// threshold/max-spend editors, the Config-tab refresh/weekly editors, the
+/// Plugin-tab herdr tag-refresh editor, and the shunt card's field editor.
 pub(super) fn value_caret(input: &InputState, invalid: bool) -> Vec<Span<'static>> {
     let body = if invalid {
         theme::danger()
@@ -754,7 +759,10 @@ pub(super) fn value_caret(input: &InputState, invalid: bool) -> Vec<Span<'static
         theme::body()
     }
     .bg(theme::bg_sunken());
-    vec![Span::styled(input.value.clone(), body)]
+    vec![Span::styled(
+        crate::tui::app::escape_control(&input.value),
+        body,
+    )]
 }
 
 /// Rounded box with contract-compliant chrome.

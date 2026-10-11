@@ -1060,11 +1060,16 @@ fn value_spans(input: &InputState, editing: bool, mask_value: bool) -> Vec<Span<
         return vec![Span::styled(display, theme::accent())];
     }
     // In edit mode the terminal cursor (set via frame.set_cursor_position) owns
-    // the caret glyph — no simulated block highlight needed.
+    // the caret glyph — no simulated block highlight needed. Control-escaped
+    // like [`value_caret`], so the shared `head_cols` escaped column count
+    // stays aligned with the body it feeds.
     let body = Style::default()
         .fg(theme::text_color())
         .bg(theme::bg_sunken());
-    vec![Span::styled(input.value.clone(), body)]
+    vec![Span::styled(
+        crate::tui::app::escape_control(&input.value),
+        body,
+    )]
 }
 
 /// The `model` row at rest. A custom id (set via ⏎) matches no preset, so it

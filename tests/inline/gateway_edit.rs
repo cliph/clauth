@@ -1752,6 +1752,58 @@ fn a_hot_reloaded_edit_is_not_restart_only_and_a_rename_reports_its_cascade() {
     );
 }
 
+/// The dry run a rename confirm counts from: the cascade, no write, no check.
+#[cfg(unix)]
+#[test]
+fn plan_cascade_counts_a_rename_without_writing_or_checking() {
+    let text = "[[upstreams]]\nname = \"a\"\n\n[[routes]]\nmodel = \"m\"\nprovider = \"a\"\n\n[[models]]\nid = \"m\"\n[models.upstream_model]\na = \"a-model\"\n\n[[routes]]\nmodel = \"m\"\nprovider = \"a\"\n";
+    let rig = rig(text);
+    assert_eq!(
+        plan_cascade(
+            &rig.record,
+            &Edit::RenameUpstream {
+                name: "a".into(),
+                to: "b".into(),
+            }
+        )
+        .expect("counts"),
+        Some(Cascade {
+            routes: 2,
+            models: 1,
+            ..Cascade::default()
+        }),
+        "two routes and one model mapping name the upstream"
+    );
+    assert_eq!(rig.config_text(), text, "nothing written");
+    assert_eq!(rig.read("calls"), "", "no check ran");
+    assert_eq!(
+        plan_cascade(
+            &rig.record,
+            &Edit::RenameModel {
+                id: "m".into(),
+                to: "n".into(),
+            }
+        )
+        .expect("counts"),
+        Some(Cascade {
+            route_models: 2,
+            ..Cascade::default()
+        }),
+        "both routes name the model"
+    );
+    assert_eq!(
+        plan_cascade(
+            &rig.record,
+            &set_upstream("a", UpstreamField::Effort, Some("low"))
+        )
+        .expect("counts"),
+        None,
+        "a field edit carries no cascade"
+    );
+    assert_eq!(rig.config_text(), text);
+    assert_eq!(rig.read("calls"), "");
+}
+
 #[cfg(unix)]
 #[test]
 fn a_save_equal_to_the_file_writes_nothing_and_restarts_nothing() {

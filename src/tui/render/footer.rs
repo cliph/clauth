@@ -10,8 +10,9 @@ use ratatui::widgets::Paragraph;
 use super::super::app::{
     App, ConfigFocus, ConfigRow, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS, GlobalConfigRow,
     HERDR_OPTIONS, HerdrOption, KeyOwner, LoginSession, Modal, ServiceFix, ServicesFocus,
-    ShuntFocus, StatusFocus, Tab, TokenView, build_action_menu, config_rows, fallback_hint,
-    fix_verb, has_sub_focus, herdr_config_writable, keyboard_owner, token_model_count,
+    ShuntFieldEdit, ShuntFocus, StatusFocus, Tab, TokenView, build_action_menu, config_rows,
+    fallback_hint, fix_verb, has_sub_focus, herdr_config_writable, is_cycle_field, keyboard_owner,
+    token_model_count,
 };
 use super::super::theme;
 use super::format::spinner_frame;
@@ -23,6 +24,17 @@ const TAB_NAV: (&str, &str) = ("←→", "tabs");
 /// puts the field back to its saved value, and says so in the field's own
 /// terms, since beside a login in flight a bare `cancel` reads as the login's.
 const TYPED_FIELD: &[(&str, &str)] = &[("↵", "save"), ("←→", "caret"), ("esc", "revert")];
+
+/// A shunt cycle row's pending pick: no caret to walk, so it sheds `←→ caret`.
+const SHUNT_PICK: &[(&str, &str)] = &[("↵", "save"), ("esc", "revert")];
+
+/// A field editor whose row is saving is locked: only the editing keys (`esc`,
+/// typing, `↵`, `space`) are inert, so the footer names the non-edit keys that
+/// still act — `↑↓` moves off the row and `q` backs out (closing the editor) —
+/// and drops every edit hint. `?` and `x` fall through the owner, so `? help`
+/// is derived from what the owner claims and `x` (dismiss a toast) keeps its
+/// app-wide no-bar-hint convention.
+const LOCKED: &[(&str, &str)] = &[("↑↓", "row"), ("q", "back")];
 
 /// The `+ new` form's typed field: ⏎ and esc both end the edit and keep the
 /// typed value; nothing saves until the form's own `create account` row.
@@ -52,7 +64,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         // collapses, others handle their own keys), so the hint flips to
         // `q back` for the whole stack; the login modal's open code field is
         // the exception, where `q` is data and ↵ submits.
-        let keys = match owner.and_then(owner_hints) {
+        let keys = match owner.and_then(|o| owner_hints(o, app)) {
             Some(hints) => LoginKeys::Owner(hints),
             None => match app.modals.last() {
                 Some(Modal::Login) if session.paste_field.is_some() => LoginKeys::Paste,
@@ -74,10 +86,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // the whole row: `q` only where the editor itself binds it, `? help` only
     // where it lets `?` through. Every owner takes the arrows, so `←→ tabs`
     // rides only while nothing owns the keyboard.
-    let mut hints: Vec<(&str, &str)> = match owner.zip(owner.and_then(owner_hints)) {
+    let mut hints: Vec<(&str, &str)> = match owner.zip(owner.and_then(|o| owner_hints(o, app))) {
         Some((owner, own)) => {
             let mut hints = own.to_vec();
-            if !owner.claims(KeyCode::Char('?')) {
+            if !owner.claims(app, KeyCode::Char('?')) {
                 let at = hints
                     .iter()
                     .position(|(key, _)| *key == "q")
@@ -137,7 +149,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// bar the `? help` that [`draw`] derives from what the owner claims. `None`
 /// for the modal stack, which has no hint set of its own: the screen's hints
 /// stay under it.
-fn owner_hints(owner: KeyOwner) -> Option<&'static [(&'static str, &'static str)]> {
+fn owner_hints(owner: KeyOwner, app: &App) -> Option<&'static [(&'static str, &'static str)]> {
     match owner {
         KeyOwner::Modal => None,
         KeyOwner::SetupField
@@ -148,6 +160,16 @@ fn owner_hints(owner: KeyOwner) -> Option<&'static [(&'static str, &'static str)
         | KeyOwner::HerdrTag => Some(TYPED_FIELD),
         KeyOwner::NewAccountField => Some(NEW_ACCOUNT_FIELD),
         KeyOwner::NoteEditor => Some(NOTE_EDITOR_FIELD),
+        // The shunt field editor reuses the typed field's grammar; a pending
+        // cycle pick has no caret to walk, so it sheds `←→ caret`. While the
+        // row's save checks, its editor is locked: the edit keys are inert
+        // (no `esc revert` / `↵ save`), `↑↓` still moves off the row and `q`
+        // ascends, and the outcome surfaces as a toast or the `└` line.
+        KeyOwner::ShuntField => match app.services.shunt_field_edit.as_ref() {
+            Some(state) if app.services.saving(&state.key) => Some(LOCKED),
+            Some(state) if matches!(state.edit, ShuntFieldEdit::Pick { .. }) => Some(SHUNT_PICK),
+            _ => Some(TYPED_FIELD),
+        },
         // `←→` walk the chips and each space saves, so nothing reads as a
         // commit; `q` leaves the picker. ⏎ leaves it too, so it takes no group
         // of its own beside `q back`: three screen-specific groups at most.
@@ -520,21 +542,36 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             hints.push(("↑↓", "scroll"));
         }
         hints.push(("r", "refresh"));
-        if !app.services.shunt_action.running {
-            match focus {
-                Some(ShuntFocus::Fix { fix, .. }) => hints.push(("f", fix_verb(fix))),
-                Some(ShuntFocus::Enabled { .. }) => hints.push(("space/↵", "toggle")),
-                Some(ShuntFocus::CheckOutput { .. }) => hints.push(("space/↵", "open")),
-                Some(ShuntFocus::Entry { key }) => hints.push((
-                    "space/↵",
-                    if app.services.shunt_expanded.contains(key) {
-                        "collapse"
-                    } else {
-                        "expand"
-                    },
-                )),
-                None => {}
+        // Each hint derives from the same predicate its handler acts on: `f`
+        // and the `enabled` toggle read `shunt_action.running` and drop with
+        // it; a field row's edit hints read `saving(&key)` and drop while its
+        // save checks (the row is busy — `↵`/`space` are inert); expanding an
+        // entry and opening the check output never read either, so those stay.
+        match focus {
+            Some(ShuntFocus::Fix { fix, .. }) if !app.services.shunt_action.running => {
+                hints.push(("f", fix_verb(fix)));
             }
+            Some(ShuntFocus::Enabled { .. }) if !app.services.shunt_action.running => {
+                hints.push(("space/↵", "toggle"));
+            }
+            Some(ShuntFocus::CheckOutput { .. }) => hints.push(("space/↵", "open")),
+            Some(ShuntFocus::Entry { key }) => hints.push((
+                "space/↵",
+                if app.services.shunt_expanded.contains(key) {
+                    "collapse"
+                } else {
+                    "expand"
+                },
+            )),
+            Some(ShuntFocus::Field { key }) if !app.services.saving(key) => {
+                if is_cycle_field(key) {
+                    hints.push(("space", "cycle"));
+                    hints.push(("↵", "custom"));
+                } else {
+                    hints.push(("↵", "edit value"));
+                }
+            }
+            _ => {}
         }
         hints.extend([("a", "actions"), ("?", "help")]);
         return hints;

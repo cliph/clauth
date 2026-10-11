@@ -25,12 +25,16 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, ListItem, Paragraph};
 
 use super::super::app::{
-    App, Check, HERDR_OPTIONS, Health, HerdrOption, InputState, OUTDATED_PLUGIN_MARK, ServiceFix,
-    ServicesFocus, ShuntConfigRead, ShuntEntryKey, ShuntFocus, UnreadConfig, config_entry_keys,
-    entry_name, escape_control, herdr_config_writable, parse_herdr_tag_secs,
+    App, Check, ConfigEntryRef, HERDR_OPTIONS, Health, HerdrOption, InputState, ModelFieldKind,
+    OUTDATED_PLUGIN_MARK, RouteFieldKind, SHUNT_OK_MS, ServiceFix, ServicesFocus, ShuntConfigRead,
+    ShuntEntryKey, ShuntFieldEdit, ShuntFieldKey, ShuntFocus, UnreadConfig, UpstreamFieldKind,
+    config_entry_keys, config_field_stops, config_view, cycle_options, entry_field_keys,
+    entry_for_key, entry_name, escape_control, herdr_config_writable, is_cycle_field,
+    parse_herdr_tag_secs, shunt_field_value, written_display,
 };
 use super::super::theme;
 use super::format::{middle_truncate, spinner_frame};
+use super::header::pulse_name_spans;
 use super::panes::{
     cycle_row_lines, draw_following_list, draw_scrollbar, draw_scrolled_lines, empty_state,
     head_cols, help_tooltip_lines, help_tooltip_lines_at, highlight_row, invalid_tooltip_lines,
@@ -39,8 +43,8 @@ use super::panes::{
 use super::prose;
 use crate::format::truncate;
 use crate::gateway_edit::{
-    AccountView, AuthView, BindOverride, ConfigView, EnvFileFailure, ModelView, ProviderForm,
-    RouteView, ServerView, UpstreamView, Written,
+    BindOverride, ConfigView, EnvFileFailure, ModelView, ProviderForm, RouteView, ServerView,
+    UpstreamView, Written,
 };
 use crate::mcp::jobs::{self, JobPhase, RunningLiveness, StoredJob};
 use crate::profile::{HerdrSettings, PopupWidth};
@@ -403,6 +407,7 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
                 &mut eyebrows,
                 view,
                 &app.services.shunt_expanded,
+                app,
                 width,
             );
         }
@@ -467,41 +472,87 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
         lines[idx] = Line::from(Span::styled("MOVE PLAN", style));
     }
 
-    // A config group's eyebrow underlines while the focused entry sits in that
-    // group and the detail pane holds focus (the herdr OPTIONS section's rule).
-    let focused_entry = focus_stop.and_then(|i| match &check.shunt_focus[i] {
-        ShuntFocus::Entry { key } => Some(key),
+    // A config group's eyebrow underlines while the focused entry or field sits
+    // in that group and the detail pane holds focus (the herdr OPTIONS
+    // section's rule).
+    let focused_group = focus_stop.and_then(|i| match &check.shunt_focus[i] {
+        ShuntFocus::Entry { key } => Some(entry_group(key)),
+        ShuntFocus::Field { key } => Some(field_group(key)),
         _ => None,
     });
     if detail_focused
-        && let Some(key) = focused_entry
-        && let Some(line) = eyebrows[entry_group(key)]
+        && let Some(group) = focused_group
+        && let Some(line) = eyebrows[group]
     {
         lines[line] = Line::from(Span::styled(
-            eyebrow_name(entry_group(key)),
+            eyebrow_name(group),
             theme::label().underlined(),
         ));
     }
 
+    // The field whose typed editor is open, for the native cursor (published
+    // only when its row is in view).
+    let mut edit_caret: Option<(usize, usize)> = None;
     if let Some(idx) = focus_stop {
         let focus = &check.shunt_focus[idx];
-        let line = match focus {
+        let rendered = stop_rendered.get(idx).copied();
+        match focus {
             ShuntFocus::Entry { key } => {
                 let expanded = app.services.shunt_expanded.contains(key);
                 let Some(view) = config_view(app) else {
                     unreachable!("an entry stop renders only over a read config");
                 };
-                entry_line(view, key, expanded, detail_focused, width)
+                if let Some(rendered) = rendered {
+                    lines[rendered] = highlight_row(
+                        entry_line(view, key, expanded, detail_focused, width),
+                        width,
+                    );
+                }
+            }
+            ShuntFocus::Field { key } => {
+                let Some(view) = config_view(app) else {
+                    unreachable!("a field stop renders only over a read config");
+                };
+                let caret = field_row_caret(app, key);
+                // Replace every rendered line of the focused field with its
+                // selected render, each tinted across the full width: a wrapped
+                // cycle run keeps the focus bracket and the `BG_HOVER` tint on
+                // every line, not just the first. A refusal's `└` lines trail
+                // the field's own row and stay untinted, like every other
+                // tooltip in the app.
+                let rows = field_row_lines(view, key, detail_focused, app, width);
+                let refusal = app
+                    .services
+                    .shunt_field_edit
+                    .as_ref()
+                    .filter(|s| s.key == *key)
+                    .is_some_and(|s| s.refusal.is_some());
+                if let Some(rendered) = rendered {
+                    if let Some(caret) = caret {
+                        edit_caret = Some((rendered, caret));
+                    }
+                    for (i, row) in rows.into_iter().enumerate() {
+                        if rendered + i < lines.len() {
+                            lines[rendered + i] = if i == 0 || !refusal {
+                                highlight_row(row, width)
+                            } else {
+                                row
+                            };
+                        }
+                    }
+                }
             }
             _ => {
                 let Some(line) = focus.line() else {
-                    unreachable!("only an entry row lacks a detail line");
+                    unreachable!("only an entry or field row lacks a detail line");
                 };
-                shunt_focus_line(focus, &check.detail[line], detail_focused, app)
+                if let Some(rendered) = rendered {
+                    lines[rendered] = highlight_row(
+                        shunt_focus_line(focus, &check.detail[line], detail_focused, app),
+                        width,
+                    );
+                }
             }
-        };
-        if let Some(&rendered) = stop_rendered.get(idx) {
-            lines[rendered] = highlight_row(line, width);
         }
     }
 
@@ -517,13 +568,17 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
         inner,
     );
     draw_scrollbar(frame, inner, total, scroll as usize, viewport);
-}
 
-/// The read `ConfigView` the shunt card's config section renders from.
-fn config_view(app: &App) -> Option<&ConfigView> {
-    match &app.services.shunt_config {
-        Some(ShuntConfigRead::Ok(view)) => Some(view),
-        _ => None,
+    // The native terminal cursor at the typed editor's caret (the Setup
+    // editor's rule): the value column plus the caret's char column, on the
+    // row's visible line.
+    if let Some((row, caret)) = edit_caret
+        && let Some(visible) = row.checked_sub(scroll as usize).filter(|v| *v < viewport)
+    {
+        frame.set_cursor_position((
+            inner.x.saturating_add((CONFIG_VALUE_COL + caret) as u16),
+            inner.y.saturating_add(visible as u16),
+        ));
     }
 }
 
@@ -537,6 +592,16 @@ fn entry_group(key: &ShuntEntryKey) -> usize {
     }
 }
 
+/// The group index of one field row, in the same order.
+fn field_group(key: &ShuntFieldKey) -> usize {
+    match key {
+        ShuntFieldKey::Bind | ShuntFieldKey::DefaultProvider => 0,
+        ShuntFieldKey::Upstream { .. } => 1,
+        ShuntFieldKey::Model { .. } => 2,
+        ShuntFieldKey::Route { .. } => 3,
+    }
+}
+
 /// The group eyebrow word for an entry group.
 fn eyebrow_name(group: usize) -> &'static str {
     match group {
@@ -547,122 +612,126 @@ fn eyebrow_name(group: usize) -> &'static str {
     }
 }
 
+/// The config section's render state: the rows built so far, the published
+/// focus-stop rows (parallel to [`Check::shunt_focus`]), and the one-row-model
+/// field stops every focusable row's membership is checked against.
+struct ConfigRows<'a> {
+    lines: &'a mut Vec<Line<'static>>,
+    stop_rendered: &'a mut Vec<usize>,
+    field_stops: &'a [ShuntFocus],
+}
+
 /// The config groups, after the card's existing lines and one blank line: the
 /// SERVER field rows, then the UPSTREAMS / MODELS / ROUTES disclosure rows,
-/// each entry expanding in place. Read-only in this commit: only entry rows
-/// take focus, so only their rendered rows join `stop_rendered`, and only
-/// their groups' eyebrows ever underline. The entries derive from
-/// [`config_entry_keys`] — the same row model the focus walk builds its stops
-/// from — so the two cannot disagree for any view.
+/// each entry expanding in place. Field rows join the focus walk (in
+/// [`config_field_stops`]'s order) and take the caret; the bind row is read-only
+/// while overridden or the env file is unread, the legacy `providers` row and
+/// its note and the eyebrows never take focus. The entries and fields derive
+/// from [`config_entry_keys`] / [`entry_field_keys`] — the same row model the
+/// focus walk builds its stops from — so the two cannot disagree for any view.
 fn render_shunt_config(
     lines: &mut Vec<Line<'static>>,
     stop_rendered: &mut Vec<usize>,
     eyebrows: &mut [Option<usize>; 4],
     view: &ConfigView,
     expanded: &HashSet<ShuntEntryKey>,
+    app: &App,
     width: usize,
 ) {
     let keys = config_entry_keys(view);
+    // The one row model both the render and the focus walk derive from: a
+    // field's focusability is `config_field_stops`' membership, never a
+    // predicate copied beside it.
+    let field_stops = config_field_stops(view, expanded);
+    let mut rows = ConfigRows {
+        lines,
+        stop_rendered,
+        field_stops: &field_stops,
+    };
 
-    eyebrows[0] = Some(lines.len());
-    lines.push(Line::from(Span::styled("SERVER", theme::label())));
-    lines.push(bind_field_line(&view.server, width));
-    lines.push(field_line(
-        CARET_GUTTER,
-        "default_provider",
-        view.server.default_provider.as_ref(),
-        width,
-    ));
+    eyebrows[0] = Some(rows.lines.len());
+    rows.lines
+        .push(Line::from(Span::styled("SERVER", theme::label())));
+    push_field(&mut rows, view, &ShuntFieldKey::Bind, app, width);
+    push_field(&mut rows, view, &ShuntFieldKey::DefaultProvider, app, width);
 
-    eyebrows[1] = Some(lines.len());
-    lines.push(Line::from(Span::styled("UPSTREAMS", theme::label())));
+    eyebrows[1] = Some(rows.lines.len());
+    rows.lines
+        .push(Line::from(Span::styled("UPSTREAMS", theme::label())));
     match &view.form {
         ProviderForm::Upstreams => {
             for key in keys
                 .iter()
                 .filter(|k| matches!(k, ShuntEntryKey::Upstream { .. }))
             {
-                push_entry(lines, stop_rendered, view, key, expanded, width);
+                push_entry(&mut rows, view, key, expanded, app, width);
             }
         }
         ProviderForm::Legacy { providers } => {
-            lines.push(providers_field_line(providers, width));
-            lines.extend(legacy_note_lines(width));
+            rows.lines.push(providers_field_line(providers, width));
+            rows.lines.extend(legacy_note_lines(width));
         }
     }
 
-    eyebrows[2] = Some(lines.len());
-    lines.push(Line::from(Span::styled("MODELS", theme::label())));
+    eyebrows[2] = Some(rows.lines.len());
+    rows.lines
+        .push(Line::from(Span::styled("MODELS", theme::label())));
     for key in keys
         .iter()
         .filter(|k| matches!(k, ShuntEntryKey::Model { .. }))
     {
-        push_entry(lines, stop_rendered, view, key, expanded, width);
+        push_entry(&mut rows, view, key, expanded, app, width);
     }
 
-    eyebrows[3] = Some(lines.len());
-    lines.push(Line::from(Span::styled("ROUTES", theme::label())));
+    eyebrows[3] = Some(rows.lines.len());
+    rows.lines
+        .push(Line::from(Span::styled("ROUTES", theme::label())));
     for key in keys.iter().filter(|k| matches!(k, ShuntEntryKey::Route(_))) {
-        push_entry(lines, stop_rendered, view, key, expanded, width);
+        push_entry(&mut rows, view, key, expanded, app, width);
     }
 }
 
-/// Draw one entry row (and its expanded fields when expanded), publishing its
-/// rendered row for the focus walk's in-view test.
+/// Draw one entry row (and its expanded fields when expanded), publishing each
+/// focusable row for the focus walk's in-view test.
 fn push_entry(
-    lines: &mut Vec<Line<'static>>,
-    stop_rendered: &mut Vec<usize>,
+    rows: &mut ConfigRows<'_>,
     view: &ConfigView,
     key: &ShuntEntryKey,
     expanded: &HashSet<ShuntEntryKey>,
+    app: &App,
     width: usize,
 ) {
-    let start = lines.len();
-    lines.push(entry_line(view, key, expanded.contains(key), false, width));
-    stop_rendered.push(start);
+    let start = rows.lines.len();
+    rows.lines
+        .push(entry_line(view, key, expanded.contains(key), false, width));
+    rows.stop_rendered.push(start);
     if expanded.contains(key) {
-        lines.extend(entry_fields(view, key, width));
+        for field in entry_field_keys(view, key) {
+            push_field(rows, view, &field, app, width);
+        }
     }
 }
 
-/// The entry a key names, resolved by the key's own rule (name-or-id plus its
-/// occurrence index, route position) — the one lookup every render site goes
-/// through, so a key and the row it draws can never disagree.
-enum ConfigEntryRef<'a> {
-    Upstream(&'a UpstreamView),
-    Model(&'a ModelView),
-    Route(&'a RouteView),
-}
-
-fn entry_for_key<'a>(view: &'a ConfigView, key: &ShuntEntryKey) -> Option<ConfigEntryRef<'a>> {
-    match key {
-        ShuntEntryKey::Upstream { name, occurrence } => view
-            .upstreams
-            .iter()
-            .filter(|u| entry_name(u.name.as_ref()) == *name)
-            .nth(*occurrence)
-            .map(ConfigEntryRef::Upstream),
-        ShuntEntryKey::Model { id, occurrence } => view
-            .models
-            .iter()
-            .filter(|m| entry_name(m.id.as_ref()) == *id)
-            .nth(*occurrence)
-            .map(ConfigEntryRef::Model),
-        ShuntEntryKey::Route(position) => view
-            .routes
-            .iter()
-            .find(|r| r.position == *position)
-            .map(ConfigEntryRef::Route),
-    }
-}
-
-/// The expanded field rows of the entry `key` names, looked up in `view`.
-fn entry_fields(view: &ConfigView, key: &ShuntEntryKey, width: usize) -> Vec<Line<'static>> {
-    match entry_for_key(view, key) {
-        Some(ConfigEntryRef::Upstream(u)) => upstream_fields(u, width),
-        Some(ConfigEntryRef::Model(m)) => model_fields(m, width),
-        Some(ConfigEntryRef::Route(r)) => route_fields(r, width),
-        None => Vec::new(),
+/// Draw one field row (and, under an edited field, its refusal `└` line). A
+/// focusable field publishes its rendered row for the focus walk's in-view
+/// test; a read-only one (the bind row while overridden or the env file is
+/// unread) draws but never joins the stops — focusability is
+/// [`config_field_stops`]' membership, the one row model.
+fn push_field(
+    rows: &mut ConfigRows<'_>,
+    view: &ConfigView,
+    key: &ShuntFieldKey,
+    app: &App,
+    width: usize,
+) {
+    let start = rows.lines.len();
+    let field_rows = field_row_lines(view, key, false, app, width);
+    rows.lines.extend(field_rows);
+    if rows
+        .field_stops
+        .contains(&ShuntFocus::Field { key: key.clone() })
+    {
+        rows.stop_rendered.push(start);
     }
 }
 
@@ -818,96 +887,9 @@ fn model_summary(m: &ModelView) -> Option<String> {
     })
 }
 
-/// The expanded field rows of one upstream, in the brief's order. The `auth
-/// mode` row always renders; the sub-rows follow the MODE, never the auth's
-/// spelling: `api_key` takes `auth env` + `auth header`, the four pool OAuth
-/// modes (`claude_oauth`, `chatgpt_oauth`, `kimi_oauth`, `antigravity_oauth`)
-/// take `account` (only when set) + `accounts`, every other mode or none takes
-/// neither.
-fn upstream_fields(u: &UpstreamView, width: usize) -> Vec<Line<'static>> {
-    let mut fields = vec![
-        field_line(ENTRY_INDENT, "name", u.name.as_ref(), width),
-        field_line(ENTRY_INDENT, "provider", u.provider.as_ref(), width),
-        field_line(ENTRY_INDENT, "kind", u.kind.as_ref(), width),
-        field_line(ENTRY_INDENT, "base_url", u.base_url.as_ref(), width),
-        field_line(
-            ENTRY_INDENT,
-            "auth mode",
-            u.auth.as_ref().and_then(|a| a.mode.as_ref()),
-            width,
-        ),
-    ];
-    if let Some(auth) = &u.auth {
-        fields.extend(auth_mode_rows(auth, width));
-    }
-    fields.push(field_line(ENTRY_INDENT, "effort", u.effort.as_ref(), width));
-    fields.push(field_line(
-        ENTRY_INDENT,
-        "service_tier",
-        u.service_tier.as_ref(),
-        width,
-    ));
-    fields
-}
-
-/// The expanded auth sub-rows a mode carries, read off shunt's own `AuthMap`.
-fn auth_mode_rows(auth: &AuthView, width: usize) -> Vec<Line<'static>> {
-    match auth.mode.as_ref().map(written_display).as_deref() {
-        Some("api_key") => vec![
-            field_line(ENTRY_INDENT, "auth env", auth.env.as_ref(), width),
-            field_line(ENTRY_INDENT, "auth header", auth.header.as_ref(), width),
-        ],
-        Some("claude_oauth" | "chatgpt_oauth" | "kimi_oauth" | "antigravity_oauth") => {
-            let mut rows = Vec::new();
-            if auth.account.is_some() {
-                rows.push(field_line(
-                    ENTRY_INDENT,
-                    "account",
-                    auth.account.as_ref(),
-                    width,
-                ));
-            }
-            rows.push(accounts_field_line(ENTRY_INDENT, auth, width));
-            rows
-        }
-        _ => Vec::new(),
-    }
-}
-
-/// The expanded field rows of one model: `id`, `display_name`, then one row per
-/// `upstream_model` entry labelled by its provider key.
-fn model_fields(m: &ModelView, width: usize) -> Vec<Line<'static>> {
-    let mut fields = vec![
-        field_line(ENTRY_INDENT, "id", m.id.as_ref(), width),
-        field_line(ENTRY_INDENT, "display_name", m.display_name.as_ref(), width),
-    ];
-    if let Some(map) = &m.upstream_model {
-        for (provider, slug) in map {
-            fields.push(field_line(ENTRY_INDENT, provider, Some(slug), width));
-        }
-    }
-    fields
-}
-
-/// The expanded field rows of one route, in the brief's order.
-fn route_fields(r: &RouteView, width: usize) -> Vec<Line<'static>> {
-    vec![
-        field_line(ENTRY_INDENT, "model", r.model.as_ref(), width),
-        field_line(ENTRY_INDENT, "provider", r.provider.as_ref(), width),
-        field_line(
-            ENTRY_INDENT,
-            "upstream_model",
-            r.upstream_model.as_ref(),
-            width,
-        ),
-        field_line(ENTRY_INDENT, "effort", r.effort.as_ref(), width),
-        field_line(ENTRY_INDENT, "service_tier", r.service_tier.as_ref(), width),
-    ]
-}
-
-/// The caret gutter every focusable (or will-be-focusable) config row carries;
-/// the entry rows' disclosure glyph occupies it with its trailing space, so
-/// the name opens at [`ENTRY_INDENT`].
+/// The caret gutter every focusable config row carries; the entry rows'
+/// disclosure glyph occupies it with its trailing space, so the name opens at
+/// [`ENTRY_INDENT`].
 const CARET_GUTTER: usize = 2;
 /// The children of an expanded entry indented under its label: the caret gutter
 /// (2) + the disclosure glyph and its space (2).
@@ -928,60 +910,272 @@ fn config_key(label: &str, indent: usize) -> String {
     format!("{label:<width$}{}", " ".repeat(CONFIG_KEY_GUTTER))
 }
 
-/// One read-only `key value` field row: the label in the eyebrow style (the
-/// Setup card's static field rows), the value in `ACCENT` or `—` faint.
-fn field_line(indent: usize, label: &str, value: Option<&Written>, width: usize) -> Line<'static> {
-    let room = width.saturating_sub(CONFIG_VALUE_COL);
-    Line::from(vec![
-        Span::styled(
-            format!("{}{}", " ".repeat(indent), config_key(label, indent)),
-            theme::label(),
-        ),
-        written_value_span(value, room),
-    ])
+/// A field row's label word: the provider key for an `upstream_model` row.
+fn field_label(key: &ShuntFieldKey) -> String {
+    match key {
+        ShuntFieldKey::Bind => "bind".to_string(),
+        ShuntFieldKey::DefaultProvider => "default_provider".to_string(),
+        ShuntFieldKey::Upstream { field, .. } => match field {
+            UpstreamFieldKind::Name => "name",
+            UpstreamFieldKind::Provider => "provider",
+            UpstreamFieldKind::Kind => "kind",
+            UpstreamFieldKind::BaseUrl => "base_url",
+            UpstreamFieldKind::AuthMode => "auth mode",
+            UpstreamFieldKind::AuthAccount => "account",
+            UpstreamFieldKind::Accounts => "accounts",
+            UpstreamFieldKind::AuthEnv => "auth env",
+            UpstreamFieldKind::AuthHeader => "auth header",
+            UpstreamFieldKind::Effort => "effort",
+            UpstreamFieldKind::ServiceTier => "service_tier",
+        }
+        .to_string(),
+        ShuntFieldKey::Model { field, .. } => match field {
+            ModelFieldKind::Id => "id".to_string(),
+            ModelFieldKind::DisplayName => "display_name".to_string(),
+            ModelFieldKind::UpstreamModel(provider) => provider.clone(),
+        },
+        ShuntFieldKey::Route { field, .. } => match field {
+            RouteFieldKind::Model => "model",
+            RouteFieldKind::Provider => "provider",
+            RouteFieldKind::UpstreamModel => "upstream_model",
+            RouteFieldKind::Effort => "effort",
+            RouteFieldKind::ServiceTier => "service_tier",
+        }
+        .to_string(),
+    }
 }
 
-/// The `bind` row: `bind  <value>  set by <variable>` while the override is
-/// set, `bind  <value>  env file not read` when the env file failed; the
-/// suffix dim. Read-only whether or not the override holds.
-fn bind_field_line(server: &ServerView, width: usize) -> Line<'static> {
-    let room = width.saturating_sub(CONFIG_VALUE_COL);
-    let label = Span::styled(
-        format!(
-            "{}{}",
-            " ".repeat(CARET_GUTTER),
-            config_key("bind", CARET_GUTTER)
-        ),
-        theme::label(),
-    );
-    let value = server
-        .bind
+/// A field row's indent: the server fields sit at the card gutter, an entry's
+/// fields under its label.
+fn field_indent(key: &ShuntFieldKey) -> usize {
+    match key {
+        ShuntFieldKey::Bind | ShuntFieldKey::DefaultProvider => CARET_GUTTER,
+        _ => ENTRY_INDENT,
+    }
+}
+
+/// The caret slot of a field row: `✎` while its editor is open (a pending pick
+/// included), the braille spinner (`ACCENT`) while its save runs, `✓` (`SUCCESS`)
+/// for about a second after it lands, else `❯` focused / blank.
+fn field_lead(key: &ShuntFieldKey, selected: bool, app: &App) -> Span<'static> {
+    let editing = app
+        .services
+        .shunt_field_edit
         .as_ref()
-        .map(|w| escape_control(&written_display(w)));
-    let value_span = match &value {
-        None => Span::styled("—", theme::faint()),
-        Some(v) => Span::styled(truncate(v, room), theme::accent()),
-    };
-    let value_width = match &value {
-        None => 1,
-        Some(v) => v.chars().count().min(room),
-    };
-    let suffix = match &server.bind_override {
+        .is_some_and(|s| s.key == *key);
+    let saving = app.services.saving(key);
+    let ok = app
+        .services
+        .shunt_ok
+        .as_ref()
+        .is_some_and(|(k, at)| k == key && at.elapsed().as_millis() < SHUNT_OK_MS as u128);
+    if saving {
+        Span::styled(
+            format!("{} ", spinner_frame(app.tick_count)),
+            theme::accent(),
+        )
+    } else if editing {
+        Span::styled("✎ ", theme::accent().bold())
+    } else if ok {
+        Span::styled("✓ ", theme::success())
+    } else if selected {
+        Span::styled("❯ ", theme::accent().bold())
+    } else {
+        Span::styled("  ", Style::default())
+    }
+}
+
+/// The typed editor's caret char column in the value (the native cursor), when
+/// the field's typed editor is open; `None` for a pending pick, a saving field
+/// (the row shows the spinner, not `✎`), or no editor.
+fn field_row_caret(app: &App, key: &ShuntFieldKey) -> Option<usize> {
+    let state = app.services.shunt_field_edit.as_ref()?;
+    if state.key != *key {
+        return None;
+    }
+    if app.services.saving(key) {
+        return None;
+    }
+    match &state.edit {
+        ShuntFieldEdit::Typed { input, .. } => Some(head_cols(input)),
+        ShuntFieldEdit::Pick { .. } => None,
+    }
+}
+
+/// The bind row's read-only suffix: `set by <variable>` while overridden,
+/// `env file not read` when the env file failed, none otherwise.
+fn bind_suffix(server: &ServerView) -> Option<String> {
+    match &server.bind_override {
         BindOverride::Set(variable) => Some(format!("set by {variable}")),
         BindOverride::Unknown(_) => Some("env file not read".to_string()),
         BindOverride::None => None,
+    }
+}
+
+/// One field row (plus, under an edited field, its refusal `└` line): the caret
+/// slot, the label, then the value — the typed buffer on `bg_sunken` while its
+/// editor is open, a cycle run at rest or over a pending pick, and while the
+/// save runs a shimmer crest over the value with a dim `checking` trail.
+fn field_row_lines(
+    view: &ConfigView,
+    key: &ShuntFieldKey,
+    selected: bool,
+    app: &App,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let indent = field_indent(key);
+    let label = field_label(key);
+    let edit_state = app
+        .services
+        .shunt_field_edit
+        .as_ref()
+        .filter(|s| s.key == *key);
+    let saving = app.services.saving(key);
+    let value = shunt_field_value(view, key).flatten();
+    let room = width.saturating_sub(CONFIG_VALUE_COL);
+
+    let lead = || {
+        vec![
+            field_lead(key, selected, app),
+            Span::styled(
+                // The caret slot already covers the gutter's first two cells:
+                // the label opens at `indent` (2 server, 4 entry).
+                format!(
+                    "{}{}",
+                    " ".repeat(indent.saturating_sub(CARET_GUTTER)),
+                    config_key(&label, indent)
+                ),
+                label_style(selected),
+            ),
+        ]
     };
-    let mut spans = vec![label, value_span];
-    if let Some(suffix) = suffix {
-        // The suffix trail-ellipsizes in the room left after the value and its
-        // 2-space gap; when the value already fills the room, the suffix drops.
+
+    // While a save runs the row shows the saving state — the spinner (already
+    // in the caret slot), the value being saved under the shimmer crest and a
+    // dim `checking` trail — typed and cycle rows alike. The editor stays open
+    // with the typed text, but the row shows the value the save checks.
+    if saving {
+        let Some(save) = app.services.shunt_save.as_ref().filter(|s| s.key == *key) else {
+            unreachable!("saving implies a save in flight");
+        };
+        let mut spans = lead();
+        spans.extend(field_text_spans(save.value.as_deref(), room, Some(save)));
+        spans.push(Span::styled("  checking", theme::dim()));
+        return vec![Line::from(spans)];
+    }
+
+    // The typed editor: the buffer on `bg_sunken` (the shared Setup editor
+    // body, `DANGER` while a refusal shows), the native cursor owns the caret
+    // glyph (no simulated block). The refusal line trails under it.
+    if let Some(edit) = edit_state {
+        match &edit.edit {
+            ShuntFieldEdit::Typed { input, .. } => {
+                let mut spans = lead();
+                spans.extend(value_caret(input, edit.refusal.is_some()));
+                let mut rows = vec![Line::from(spans)];
+                if let Some(refusal) = &edit.refusal {
+                    rows.extend(invalid_tooltip_lines(refusal, width));
+                }
+                return rows;
+            }
+            ShuntFieldEdit::Pick { picked, saved } => {
+                return field_cycle_lines(
+                    lead(),
+                    key,
+                    Some(picked),
+                    saved.as_deref(),
+                    selected,
+                    width,
+                );
+            }
+        }
+    }
+
+    if is_cycle_field(key) {
+        // An unset cycle row reads `—` (the approved unset form, never shunt's
+        // default), not the bare option run; a held value shows the run.
+        return match value.as_deref() {
+            None => {
+                let mut spans = lead();
+                spans.push(Span::styled("—", theme::faint()));
+                vec![Line::from(spans)]
+            }
+            Some(held) => field_cycle_lines(lead(), key, Some(held), None, selected, width),
+        };
+    }
+
+    // A typed field at rest. The bind row's read-only suffix trails the value.
+    let mut spans = lead();
+    spans.extend(field_text_spans(value.as_deref(), room, None));
+    if key == &ShuntFieldKey::Bind
+        && let Some(suffix) = bind_suffix(&view.server)
+    {
+        let value_width = value
+            .as_deref()
+            .map(|v| v.chars().count().min(room))
+            .unwrap_or(1);
         let suffix_room = room.saturating_sub(value_width + 2);
         if suffix_room > 0 {
             spans.push(Span::styled("  ", theme::dim()));
             spans.push(Span::styled(truncate(&suffix, suffix_room), theme::dim()));
         }
     }
-    Line::from(spans)
+    vec![Line::from(spans)]
+}
+
+/// The typed value spans: `ACCENT` (or `—` faint) at rest; while `save` runs,
+/// the header's [`pulse_name_spans`] shimmer crest over the value.
+fn field_text_spans(
+    value: Option<&str>,
+    room: usize,
+    save: Option<&crate::tui::app::ShuntSave>,
+) -> Vec<Span<'static>> {
+    match value {
+        None => vec![Span::styled("—", theme::faint())],
+        Some(v) => {
+            let display = truncate(&escape_control(v), room);
+            match save {
+                Some(save) => pulse_name_spans(
+                    &display,
+                    theme::accent(),
+                    save.started.elapsed().as_millis() as u64,
+                ),
+                None => vec![Span::styled(display, theme::accent())],
+            }
+        }
+    }
+}
+
+/// A cycle field's row: the cycle run at rest (the held value `ACCENT`,
+/// bracketed only while focused), or over a pending pick (`held` the pick,
+/// `saved` the file's value). A held value outside the set trails the run as
+/// the `ACCENT` custom value; a saved out-of-set value trails faint while a
+/// pick is pending (a stop the cycle can return to). Each is control-escaped
+/// like every config-derived string.
+fn field_cycle_lines(
+    lead: Vec<Span<'static>>,
+    key: &ShuntFieldKey,
+    held: Option<&str>,
+    saved: Option<&str>,
+    selected: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let options = cycle_options(key);
+    let marked: Vec<(&str, bool)> = options.iter().map(|o| (*o, held == Some(o))).collect();
+    let custom: Option<(String, bool)> = match held {
+        Some(h) if !options.contains(&h) => Some((escape_control(h), true)),
+        _ => saved
+            .filter(|s| !options.contains(s))
+            .map(|s| (escape_control(s), false)),
+    };
+    cycle_row_lines(
+        lead,
+        &marked,
+        custom.as_ref().map(|(c, active)| (c.as_str(), *active)),
+        None,
+        selected,
+        width,
+    )
 }
 
 /// The legacy `providers` row: the names comma-joined as the value.
@@ -1003,56 +1197,6 @@ fn providers_field_line(names: &[String], width: usize) -> Line<'static> {
         ),
         Span::styled(truncate(&value, room), theme::accent()),
     ])
-}
-
-/// The `accounts` field row: the account names comma-joined. A table selection
-/// without a name contributes nothing (an unlisted shape).
-fn accounts_field_line(indent: usize, auth: &AuthView, width: usize) -> Line<'static> {
-    let room = width.saturating_sub(CONFIG_VALUE_COL);
-    let names: Vec<String> = auth
-        .accounts
-        .iter()
-        .flatten()
-        .filter_map(account_name)
-        .collect();
-    let value_span = if names.is_empty() {
-        Span::styled("—", theme::faint())
-    } else {
-        Span::styled(truncate(&names.join(", "), room), theme::accent())
-    };
-    Line::from(vec![
-        Span::styled(
-            format!("{}{}", " ".repeat(indent), config_key("accounts", indent)),
-            theme::label(),
-        ),
-        value_span,
-    ])
-}
-
-/// One account's name as it renders; `None` for a selection with no name.
-fn account_name(a: &AccountView) -> Option<String> {
-    match a {
-        AccountView::Name(w) => Some(escape_control(&written_display(w))),
-        AccountView::Selection { name: Some(w), .. } => Some(escape_control(&written_display(w))),
-        AccountView::Selection { name: None, .. } => None,
-    }
-}
-
-/// A `Written` as it renders: the decoded string, else the file's own text.
-fn written_display(w: &Written) -> String {
-    w.value.clone().unwrap_or_else(|| w.raw.clone())
-}
-
-/// The value span of a field row: `ACCENT` when set, `—` faint when absent,
-/// truncated to the room the value column holds.
-fn written_value_span(w: Option<&Written>, room: usize) -> Span<'static> {
-    match w {
-        None => Span::styled("—", theme::faint()),
-        Some(w) => Span::styled(
-            truncate(&escape_control(&written_display(w)), room),
-            theme::accent(),
-        ),
-    }
 }
 
 /// The card's `config  not read (<reason>)` line, in the action-section shape
@@ -1138,6 +1282,7 @@ fn shunt_focus_line(focus: &ShuntFocus, text: &str, selected: bool, app: &App) -
         }
         ShuntFocus::CheckOutput { .. } => problem_line(text, selected),
         ShuntFocus::Entry { .. } => unreachable!("entry rows render through entry_line"),
+        ShuntFocus::Field { .. } => unreachable!("field rows render through field_row_lines"),
     }
 }
 

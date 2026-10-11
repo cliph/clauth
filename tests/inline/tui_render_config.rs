@@ -1538,3 +1538,22 @@ fn the_alert_editor_names_its_range_and_turns_danger_on_a_refused_buffer() {
         assert_eq!(lines[0].spans[1].style.fg, want, "{raw:?}");
     }
 }
+
+/// A control character in an edited value renders escaped in the Setup editor
+/// body, and the shared caret-column count matches that escaped body, so the
+/// native cursor never drifts right of the caret.
+#[test]
+fn a_control_character_value_renders_escaped_in_the_setup_editor() {
+    let input = InputState::new("x\ty");
+    let spans = value_spans(&input, true, false);
+    let body: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(
+        body, "x\\ty",
+        "the editor body escapes the control character"
+    );
+    assert_eq!(
+        head_cols(&input),
+        body.chars().count(),
+        "the caret column counts the escaped body"
+    );
+}

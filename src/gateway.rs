@@ -3617,6 +3617,14 @@ fn insert_admin_table(doc: &mut DocumentMut, key_ref: &str) -> Result<(), Config
 /// staging file and leaves the original byte-identical. Every clauth edit of
 /// the adopted config lands here: the admin entry and the config editor
 /// (`crate::gateway_edit`).
+///
+/// The re-read-and-compare and the rename run under [`with_state_lock`] (the
+/// cross-process state flock), so two clauth writers — threads or processes —
+/// that both passed their check before either renamed cannot lose one update:
+/// the second writer's re-read sees the first one's bytes and refuses
+/// [`ConfigEditRefusal::ChangedDuringEdit`]. [`with_state_lock`] serializes
+/// threads as well as processes (`src/lock.rs`), so no in-process mutex is
+/// needed beside it.
 pub(crate) fn write_checked(
     record: &GatewayRecord,
     original: &[u8],
@@ -3648,17 +3656,151 @@ pub(crate) fn write_checked(
         &env,
         None,
     )?;
-    let now =
-        std::fs::read(config).with_context(|| format!("failed to re-read {}", config.display()))?;
-    if now != original {
-        return Err(ConfigEditRefusal::ChangedDuringEdit {
-            path: config.to_path_buf(),
+    // The check runs OUTSIDE the flock (it can take up to 10 s); only the
+    // re-read-and-compare and the rename serialize under it, so a second
+    // writer's re-read sees the first one's bytes.
+    with_state_lock(|_held| {
+        let now = std::fs::read(config)
+            .with_context(|| format!("failed to re-read {}", config.display()))?;
+        if now != original {
+            return Err(ConfigEditRefusal::ChangedDuringEdit {
+                path: config.to_path_buf(),
+            }
+            .into());
         }
-        .into());
+        #[cfg(test)]
+        run_config_write_hook(config);
+        staged
+            .rename_over(config)
+            .with_context(|| format!("failed to replace {}", config.display()))
+    })
+}
+
+/// Test seam: parks the FIRST [`write_checked`] to reach the critical section
+/// (after its re-read, before its rename) for one config path, so a test holds
+/// one writer there while a second runs. Keyed by path — no sibling test's
+/// write trips it — and RAII: dropping the guard (a panic included) clears the
+/// seam and releases a parked writer, so no later `write_checked` parks on a
+/// stale hold.
+#[cfg(test)]
+pub(crate) struct ConfigWriteSeam {
+    path: PathBuf,
+    spot: std::sync::Arc<ParkSpot>,
+    parked_rx: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+impl ConfigWriteSeam {
+    pub(crate) fn arm(path: PathBuf) -> Self {
+        let spot = std::sync::Arc::new(ParkSpot::default());
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let hook_spot = std::sync::Arc::clone(&spot);
+        let hook: ConfigSeamHook = std::sync::Arc::new(move || {
+            let mut state = hook_spot
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.parked {
+                // A later writer passes straight through.
+                return;
+            }
+            state.parked = true;
+            let _ = parked_tx.send(());
+            while !state.released {
+                state = hook_spot
+                    .cv
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        });
+        CONFIG_SEAMS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.clone(), hook);
+        Self {
+            path,
+            spot,
+            parked_rx,
+        }
     }
-    staged
-        .rename_over(config)
-        .with_context(|| format!("failed to replace {}", config.display()))
+
+    /// Waits up to `timeout` for the first writer to park in the critical
+    /// section (its re-read done, its rename held); `true` when it parked. A
+    /// bounded single attempt, not a blocking recv — the test loops on it so an
+    /// early writer failure can be named instead of hanging its siblings.
+    pub(crate) fn wait_for_park(&self, timeout: std::time::Duration) -> bool {
+        self.parked_rx.recv_timeout(timeout).is_ok()
+    }
+
+    /// Release the parked writer so it renames.
+    pub(crate) fn release(&self) {
+        let mut state = self
+            .spot
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.released = true;
+        self.spot.cv.notify_all();
+    }
+
+    /// Whether the state flock is currently held (the parked writer holds it
+    /// when the lock fences the critical section; a writer parked with no lock
+    /// held proves the lock is gone). `try_lock` answers at once, never a wait.
+    pub(crate) fn state_lock_is_held(&self) -> bool {
+        let dir = crate::profile::clauth_dir().expect("clauth dir");
+        let path = dir.join(crate::lock::LOCK_FILENAME);
+        let Ok(file) = crate::profile::open_state_file(&path) else {
+            return false;
+        };
+        matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+    }
+}
+
+#[cfg(test)]
+impl Drop for ConfigWriteSeam {
+    fn drop(&mut self) {
+        CONFIG_SEAMS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.path);
+        self.release();
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ParkSpot {
+    state: std::sync::Mutex<ParkState>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ParkState {
+    /// The first writer is parked here (later writers pass through).
+    parked: bool,
+    /// The test released it (or the seam dropped).
+    released: bool,
+}
+
+#[cfg(test)]
+type ConfigSeamHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+static CONFIG_SEAMS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, ConfigSeamHook>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+fn run_config_write_hook(path: &Path) {
+    let hook = CONFIG_SEAMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(path)
+        .cloned();
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 /// How long `shunt check` may run before clauth stops it. Measured

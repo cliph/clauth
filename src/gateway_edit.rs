@@ -587,6 +587,19 @@ fn refuse_overridden_bind(record: &GatewayRecord, op: String) -> Result<()> {
     }
 }
 
+/// A dry run of `edit` over the adopted config's text: the [`Cascade`] the
+/// edit would cause, or `None` when the edit changes nothing (its value equals
+/// the file's). No write and no check — the card's rename confirm counts its
+/// references from this, and the confirmed save then runs the same `Edit`
+/// through [`apply_edit`]'s normal path.
+pub(crate) fn plan_cascade(record: &GatewayRecord, edit: &Edit) -> Result<Option<Cascade>> {
+    let (_, text) = read_config_for_edit(record.config())?;
+    let Some(planned) = plan(&text, edit)? else {
+        return Ok(None);
+    };
+    Ok(planned.cascade)
+}
+
 struct Planned {
     candidate: String,
     cascade: Option<Cascade>,

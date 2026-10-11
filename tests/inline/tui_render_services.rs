@@ -3571,7 +3571,7 @@ fn base_view() -> ConfigView {
 fn config_view_app(view: ConfigView, expanded: std::collections::HashSet<ShuntEntryKey>) -> App {
     let mut card = crate::tui::app::shunt_check(&shunt_slot_full(), true, None);
     card.shunt_focus
-        .extend(crate::tui::app::config_entry_stops(&view));
+        .extend(crate::tui::app::config_field_stops(&view, &expanded));
     let mut app = app_with(card);
     app.services.shunt_config = Some(ShuntConfigRead::Ok(Box::new(view)));
     app.services.shunt_expanded = expanded;
@@ -3634,6 +3634,15 @@ fn render_config_section(
     let detail = config_detail_rows(&rows);
     let at = detail.iter().position(|r| r == "SERVER").expect("SERVER");
     detail[at..].to_vec()
+}
+
+/// The config-section detail rows of an app already carrying view + state (a
+/// save in flight, a focus), so a saving row's spinner/`checking` is pinable.
+fn render_app_config_rows(app: &App) -> Vec<String> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    config_detail_rows(&rows)
 }
 
 /// The groups follow the card's lines under `SERVER` / `UPSTREAMS` / `MODELS` /
@@ -3727,7 +3736,10 @@ fn the_shunt_config_renders_one_upstream_expanded_with_accounts() {
             "    provider        —",
             "    kind            —",
             "    base_url        —",
-            "    auth mode       claude_oauth",
+            "    auth mode       passthrough  api_key  chatgpt_oauth",
+            "                    claude_oauth  xai_oauth  cursor_oauth",
+            "                    kimi_oauth  google_oauth  antigravity_oauth",
+            "                    none",
             "    accounts        alice, bob",
             "    effort          —",
             "    service_tier    —",
@@ -3975,7 +3987,7 @@ fn the_shunt_config_renders_a_route_row() {
 
 // ── shunt config section key handling ────────────────────────────────────────
 
-use crate::tui::app::{ShuntFocusLine, handle_key};
+use crate::tui::app::handle_key;
 use ratatui::crossterm::event::KeyCode;
 
 /// Render the full frame at a tall viewport so every config entry is in view
@@ -3997,6 +4009,9 @@ fn a_config_entry_enter_expands_and_space_collapses() {
     render_tall(&app);
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    // The field rows lead the walk: bind → default_provider → the entry.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     assert!(
         matches!(
             app.services.focused_shunt_focus(),
@@ -4004,7 +4019,7 @@ fn a_config_entry_enter_expands_and_space_collapses() {
                 key: ShuntEntryKey::Upstream { name, .. }
             }) if name == "anthropic"
         ),
-        "descend lands on the first entry"
+        "descend lands on bind, two steps reach the entry"
     );
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
@@ -4030,11 +4045,11 @@ fn a_config_entry_enter_expands_and_space_collapses() {
     );
 }
 
-/// `↑↓` walks the entry rows and skips the field rows of an expanded entry —
-/// field rows are read-only in this commit and never take focus.
+/// `↑↓` walks the card in order: the server field rows lead, then each entry
+/// and its expanded field rows, in card order.
 #[test]
-fn the_config_focus_walk_reaches_entries_and_skips_field_rows() {
-    use crate::tui::app::ShuntFocus;
+fn the_config_focus_walk_reaches_fields_then_entries() {
+    use crate::tui::app::{ShuntFieldKey, ShuntFocus, UpstreamFieldKind};
     let _home = crate::testutil::HomeSandbox::new();
     let mut view = base_view();
     view.upstreams = vec![
@@ -4051,18 +4066,26 @@ fn the_config_focus_walk_reaches_entries_and_skips_field_rows() {
     render_tall(&app);
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        matches!(
+            app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Field {
+                key: ShuntFieldKey::Bind
+            })
+        ),
+        "descend lands on the bind field"
+    );
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     assert!(
         matches!(
             app.services.focused_shunt_focus(),
-            Some(ShuntFocus::Entry {
-                key: ShuntEntryKey::Upstream { name, .. }
-            }) if name == "openai"
+            Some(ShuntFocus::Field {
+                key: ShuntFieldKey::DefaultProvider
+            })
         ),
-        "one step lands on the next entry, not on anthropic's field rows"
+        "one step lands on default_provider"
     );
-
-    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     assert!(
         matches!(
             app.services.focused_shunt_focus(),
@@ -4070,7 +4093,719 @@ fn the_config_focus_walk_reaches_entries_and_skips_field_rows() {
                 key: ShuntEntryKey::Upstream { name, .. }
             }) if name == "anthropic"
         ),
-        "one step back returns to the first entry"
+        "two steps reach the first entry"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert!(
+        matches!(
+            app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Field {
+                key: ShuntFieldKey::Upstream { name, field: UpstreamFieldKind::Name, .. }
+            }) if name == "anthropic"
+        ),
+        "the expanded entry's first field follows its entry row"
+    );
+}
+
+/// A card with one action-section stop (`enabled`) in front of the config
+/// stops, so `rebuild_shunt_config_stops`' truncate-to-action-prefix runs on a
+/// real prefix (the action rows carry a detail `line`, the config stops none).
+fn config_view_app_with_enabled(
+    view: ConfigView,
+    expanded: std::collections::HashSet<ShuntEntryKey>,
+) -> App {
+    let mut app = config_view_app(view, expanded);
+    let check = app
+        .services
+        .checks
+        .iter_mut()
+        .find(|c| c.label == "shunt")
+        .expect("the shunt check");
+    check.shunt_action_start = Some(check.detail.len());
+    check.detail.push(String::new());
+    let line = check.detail.len();
+    check.detail.push("enabled".to_string());
+    check
+        .shunt_focus
+        .insert(0, crate::tui::app::ShuntFocus::Enabled { line });
+    app
+}
+
+/// The focused caret row's text: the blurred row with its two-cell gutter caret
+/// slot restored as `❯ `.
+fn caret_over(own: &str) -> String {
+    format!("❯ {}", own.get(2..).unwrap_or(""))
+}
+
+/// Walk every stop down to the end and back up, asserting at every step that
+/// the caret row's text is that stop's own row text (the blurred render's row,
+/// its caret slot restored) — the render and the walk agree on every stop, the
+/// action-section prefix included.
+fn assert_walk_lands_on_own_rows(app: &mut App) {
+    use crate::tui::app::{ServicesFocus, ShuntFocus};
+    app.services.focus = ServicesFocus::List;
+    let rest = render_app_config_rows(app);
+    let offset = rest
+        .iter()
+        .position(|r| r.starts_with("binary"))
+        .expect("the binary row");
+    let published = app.services.shunt_stop_rows.borrow().clone();
+    let stops = app
+        .services
+        .selected_check()
+        .map(|c| c.shunt_focus.clone())
+        .expect("the shunt check");
+    assert!(
+        matches!(stops.first(), Some(ShuntFocus::Enabled { .. })),
+        "the action-section stop stays in the walk after a toggle"
+    );
+    assert_eq!(published.len(), stops.len(), "one rendered row per stop");
+    let own: Vec<String> = (0..stops.len())
+        .map(|i| rest[offset + published[i]].clone())
+        .collect();
+
+    app.services.focus = ServicesFocus::Detail;
+    app.services.set_shunt_focus(Some(stops[0].kind()));
+    for (i, own_text) in own.iter().enumerate() {
+        let focused = render_app_config_rows(app);
+        let caret = focused
+            .iter()
+            .find(|r| r.contains('❯'))
+            .unwrap_or_else(|| panic!("no caret row:\n{}", focused.join("\n")));
+        assert_eq!(
+            caret,
+            &caret_over(own_text),
+            "down stop {i} lands on its own row:\n{}",
+            focused.join("\n")
+        );
+        if i + 1 < stops.len() {
+            handle_key(app, crate::testutil::key(KeyCode::Down));
+        }
+    }
+    for (i, own_text) in own.iter().enumerate().rev() {
+        let focused = render_app_config_rows(app);
+        let caret = focused
+            .iter()
+            .find(|r| r.contains('❯'))
+            .unwrap_or_else(|| panic!("no caret row:\n{}", focused.join("\n")));
+        assert_eq!(
+            caret,
+            &caret_over(own_text),
+            "up stop {i} lands on its own row:\n{}",
+            focused.join("\n")
+        );
+        if i > 0 {
+            handle_key(app, crate::testutil::key(KeyCode::Up));
+        }
+    }
+}
+
+/// `↵` on an entry expands it in place (no recompute); the very next `↓` walks
+/// into that entry's first field. The walk must never hold a stale stop list:
+/// on a stale cache the published rows and the walk's stops disagree in length
+/// and the step is dropped.
+#[test]
+fn expanding_an_entry_in_place_steps_down_into_its_first_field() {
+    use crate::tui::app::{
+        ServicesFocus, ShuntEntryKey, ShuntFieldKey, ShuntFocus, ShuntFocusLine, UpstreamFieldKind,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![shorthand_up("a", "claude_oauth")];
+    let mut app = config_view_app_with_enabled(view, std::collections::HashSet::new());
+    render_tall(&app);
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Entry(ShuntEntryKey::Upstream {
+            name: "a".into(),
+            occurrence: 0,
+        })));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    render_tall(&app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert!(
+        matches!(
+            app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Field {
+                key: ShuntFieldKey::Upstream {
+                    name,
+                    field: UpstreamFieldKind::Name,
+                    ..
+                }
+            }) if name == "a"
+        ),
+        "down after an in-place expand lands on the entry's name field"
+    );
+    assert_walk_lands_on_own_rows(&mut app);
+}
+
+/// `↵` on an expanded entry collapses it in place; the next `↓` skips the
+/// folded fields and lands on the following entry.
+#[test]
+fn collapsing_an_entry_in_place_steps_over_its_folded_fields() {
+    use crate::tui::app::{ServicesFocus, ShuntEntryKey, ShuntFocus, ShuntFocusLine};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![
+        shorthand_up("a", "claude_oauth"),
+        shorthand_up("b", "api_key"),
+    ];
+    let mut app = config_view_app_with_enabled(
+        view,
+        std::collections::HashSet::from([ShuntEntryKey::Upstream {
+            name: "a".into(),
+            occurrence: 0,
+        }]),
+    );
+    render_tall(&app);
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Entry(ShuntEntryKey::Upstream {
+            name: "a".into(),
+            occurrence: 0,
+        })));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    render_tall(&app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert!(
+        matches!(
+            app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Entry {
+                key: ShuntEntryKey::Upstream { name, .. }
+            }) if name == "b"
+        ),
+        "down after an in-place collapse skips the folded fields onto the next entry"
+    );
+    assert_walk_lands_on_own_rows(&mut app);
+}
+
+/// `esc` on a field row that is not editing folds its entry and focuses the
+/// entry row; `↓` then walks from there (never dropped on a stale stop list).
+#[test]
+fn esc_folding_an_entry_walks_from_the_entry_row() {
+    use crate::tui::app::{
+        ServicesFocus, ShuntEntryKey, ShuntFieldKey, ShuntFocus, ShuntFocusLine, UpstreamFieldKind,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![
+        shorthand_up("a", "claude_oauth"),
+        shorthand_up("b", "api_key"),
+    ];
+    let mut app = config_view_app_with_enabled(
+        view,
+        std::collections::HashSet::from([ShuntEntryKey::Upstream {
+            name: "a".into(),
+            occurrence: 0,
+        }]),
+    );
+    render_tall(&app);
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Field(ShuntFieldKey::Upstream {
+            name: "a".into(),
+            occurrence: 0,
+            field: UpstreamFieldKind::Name,
+        })));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    render_tall(&app);
+    assert!(
+        matches!(
+            app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Entry {
+                key: ShuntEntryKey::Upstream { name, .. }
+            }) if name == "a"
+        ),
+        "esc folds onto the entry row"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert!(
+        matches!(
+            app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Entry {
+                key: ShuntEntryKey::Upstream { name, .. }
+            }) if name == "b"
+        ),
+        "down walks from the entry row after an esc fold"
+    );
+    assert_walk_lands_on_own_rows(&mut app);
+}
+
+/// With a read-only bind, the render publishes exactly one rendered row per
+/// focus stop — no stop for the bind row the walk omits — and each stop's own
+/// row (by its text) sits at its published row: the caret lands there, never
+/// on the row above or below.
+#[test]
+fn the_focus_walk_lands_on_its_own_rows_with_a_read_only_bind() {
+    use crate::tui::app::{ServicesFocus, ShuntFieldKey, ShuntFocus};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.server.bind_override = BindOverride::Set("SHUNT_SERVER__BIND".to_string());
+    view.upstreams = vec![shorthand_up("anthropic", "claude_oauth")];
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Upstream {
+        name: "anthropic".into(),
+        occurrence: 0,
+    }]);
+    let mut app = config_view_app(view.clone(), expanded.clone());
+    render_tall(&app);
+    let stops = crate::tui::app::config_field_stops(&view, &expanded);
+
+    // Each stop's own line at rest, in card order (the read-only bind row and
+    // the eyebrows render but are not stops).
+    let own_lines = [
+        "  default_provider  anthropic",
+        "  ▼ anthropic       claude_oauth",
+        "    name            anthropic",
+        "    provider        —",
+        "    kind            —",
+        "    base_url        —",
+        "    auth mode       passthrough  api_key  chatgpt_oauth",
+        "    accounts        —",
+        "    effort          —",
+        "    service_tier    —",
+    ];
+    assert_eq!(
+        stops.len(),
+        own_lines.len(),
+        "the stop list matches the card"
+    );
+
+    // The blurred (list-focused) render holds every stop's own line at its
+    // true position; the published geometry must name exactly those rows.
+    app.services.focus = ServicesFocus::List;
+    let rest = render_app_config_rows(&app);
+    let offset = rest
+        .iter()
+        .position(|r| r.starts_with("binary"))
+        .expect("the binary row");
+    let published = app.services.shunt_stop_rows.borrow().clone();
+    assert_eq!(
+        published.len(),
+        stops.len(),
+        "one rendered row per focus stop; the read-only bind row joins none"
+    );
+    for (i, own) in own_lines.iter().enumerate() {
+        assert_eq!(
+            &rest[offset + published[i]],
+            own,
+            "stop {i} publishes its own row (its text, not just a count):\n{}",
+            rest.join("\n")
+        );
+    }
+
+    // Walk to each stop: the caret lands on that stop's own published row.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    for (i, stop) in stops.iter().enumerate() {
+        assert_eq!(
+            app.services.focused_shunt_focus().map(|s| s.kind()),
+            Some(stop.kind()),
+            "walk step {i} lands on its own stop"
+        );
+        let focused = render_app_config_rows(&app);
+        let caret_row = focused
+            .iter()
+            .position(|r| r.contains('❯'))
+            .unwrap_or_else(|| panic!("no caret row:\n{}", focused.join("\n")));
+        assert_eq!(
+            caret_row,
+            offset + published[i],
+            "the caret sits on stop {i}'s own row"
+        );
+        if i + 1 < stops.len() {
+            handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        }
+    }
+    assert!(
+        matches!(
+            stops.first(),
+            Some(ShuntFocus::Field {
+                key: ShuntFieldKey::DefaultProvider
+            })
+        ),
+        "the bind row is read-only, so the walk opens on default_provider"
+    );
+}
+
+/// While a cycle save runs, the row shows the same saving shape as a typed
+/// save: the spinner in the caret slot, the value being saved under the
+/// shimmer, and a dim `checking` trail — not the pre-save held value.
+#[test]
+fn a_cycle_save_renders_like_a_typed_save() {
+    use crate::tui::app::{ShuntFieldKey, ShuntSave, UpstreamFieldKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![UpstreamView {
+        name: Some(w("a")),
+        provider: None,
+        kind: Some(w("anthropic")),
+        base_url: None,
+        auth: None,
+        effort: None,
+        service_tier: None,
+    }];
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    }]);
+    let mut app = config_view_app(view, expanded);
+    let key = ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Kind,
+    };
+    app.services.shunt_save = Some(ShuntSave {
+        key,
+        started: std::time::Instant::now(),
+        value: Some("responses".into()),
+    });
+    app.tick_count = 0;
+    let rows = render_app_config_rows(&app);
+    let kind_row = rows
+        .iter()
+        .find(|r| r.contains("kind"))
+        .unwrap_or_else(|| panic!("no kind row:\n{}", rows.join("\n")));
+    assert_eq!(
+        kind_row.trim(),
+        "⠋   kind            responses  checking",
+        "a cycle save renders the value being saved with a dim checking trail"
+    );
+}
+
+/// The saving row's `checking` trail is `TEXT_DIM`, not `TEXT_FAINT` or the
+/// value's accent.
+#[test]
+fn a_saving_row_trails_checking_in_text_dim() {
+    use crate::tui::app::{ShuntFieldKey, ShuntSave, UpstreamFieldKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut view = base_view();
+    view.upstreams = vec![UpstreamView {
+        name: Some(w("a")),
+        provider: None,
+        kind: Some(w("anthropic")),
+        base_url: None,
+        auth: None,
+        effort: None,
+        service_tier: None,
+    }];
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    }]);
+    let mut app = config_view_app(view, expanded);
+    app.services.shunt_save = Some(ShuntSave {
+        key: ShuntFieldKey::Upstream {
+            name: "a".into(),
+            occurrence: 0,
+            field: UpstreamFieldKind::Kind,
+        },
+        started: std::time::Instant::now(),
+        value: Some("responses".into()),
+    });
+    app.tick_count = 0;
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let cells = crate::testutil::needle_cells(&buf, "checking").expect("checking renders");
+    let dim = crate::tui::theme::text_dim_color();
+    assert!(
+        cells.iter().all(|c| c.fg == dim),
+        "checking trails in TEXT_DIM, got {:?}",
+        cells.first().map(|c| c.fg)
+    );
+}
+
+/// A focused unset cycle row still reads `—` (the approved unset form), the
+/// caret in the gutter, never the bare option run.
+#[test]
+fn a_focused_unset_cycle_row_reads_an_em_dash() {
+    use crate::tui::app::{ServicesFocus, ShuntFieldKey, ShuntFocusLine, UpstreamFieldKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![UpstreamView {
+        name: Some(w("a")),
+        provider: None,
+        kind: None,
+        base_url: None,
+        auth: None,
+        effort: None,
+        service_tier: None,
+    }];
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    }]);
+    let mut app = config_view_app(view, expanded);
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Field(ShuntFieldKey::Upstream {
+            name: "a".into(),
+            occurrence: 0,
+            field: UpstreamFieldKind::Provider,
+        })));
+    render_tall(&app);
+    let rows = render_app_config_rows(&app);
+    let provider = rows
+        .iter()
+        .find(|r| r.contains('❯'))
+        .unwrap_or_else(|| panic!("no focused row:\n{}", rows.join("\n")));
+    assert_eq!(
+        provider,
+        "❯   provider        —",
+        "the focused unset cycle row reads —:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// A focused wrapped cycle run keeps the focus treatment on every line: the
+/// bracket sits on the picked option wherever it sits, and the `BG_HOVER` tint
+/// spans the continuation lines too.
+#[test]
+fn a_focused_wrapped_cycle_row_highlights_every_line() {
+    use crate::tui::app::{ShuntFieldKey, ShuntFocus, UpstreamFieldKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![UpstreamView {
+        name: Some(w("a")),
+        provider: Some(w("cursor")),
+        kind: None,
+        base_url: None,
+        auth: None,
+        effort: None,
+        service_tier: None,
+    }];
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    }]);
+    let mut app = config_view_app(view, expanded);
+    render_tall(&app);
+    // Walk to the provider field: bind → default_provider → entry → name →
+    // provider.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert!(
+        matches!(
+            app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Field {
+                key: ShuntFieldKey::Upstream {
+                    field: UpstreamFieldKind::Provider,
+                    ..
+                }
+            })
+        ),
+        "the provider field holds focus"
+    );
+    let rows = render_app_config_rows(&app);
+    let provider_idx = rows
+        .iter()
+        .position(|r| r.contains('❯'))
+        .expect("the focused provider row");
+    // The held value `cursor` sits on the run's continuation line, so its
+    // bracket must render there — not on the first line.
+    assert_eq!(
+        &rows[provider_idx..provider_idx + 3],
+        &[
+            "❯   provider        anthropic  codex  openai  xai  grok  kimi".to_string(),
+            "                    [cursor]  kimi-code  zhipu  minimax-cn".to_string(),
+            "                    opencode".to_string(),
+        ],
+        "the bracket sits on the continuation line:\n{}",
+        rows.join("\n")
+    );
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    // The `❯` caret, the bracketed held option and an option on the run's
+    // continuation line all sit on the BG_HOVER tint: the focus treatment spans
+    // every line of the wrapped run.
+    let hover = crate::tui::theme::bg_hover();
+    for needle in ["❯", "[cursor]", "opencode"] {
+        let cells = crate::testutil::needle_cells(&buf, needle)
+            .unwrap_or_else(|| panic!("`{needle}` missing"));
+        assert!(
+            cells.iter().any(|c| c.bg == hover),
+            "`{needle}` carries BG_HOVER on the focused wrapped cycle run"
+        );
+    }
+}
+
+/// A typed editor places the native cursor at the caret column of the value,
+/// on the row that renders it.
+#[test]
+fn a_typed_editor_places_the_native_cursor_at_the_caret() {
+    use crate::tui::app::{
+        InputState, ServicesFocus, ShuntFieldEdit, ShuntFieldEditState, ShuntFieldKey,
+        ShuntFocusLine, UpstreamFieldKind,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![UpstreamView {
+        name: Some(w("a")),
+        provider: None,
+        kind: None,
+        base_url: None,
+        auth: None,
+        effort: None,
+        service_tier: None,
+    }];
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    }]);
+    let key = ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    };
+    let mut app = config_view_app(view, expanded);
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Field(key.clone())));
+    app.services.shunt_field_edit = Some(ShuntFieldEditState {
+        key,
+        edit: ShuntFieldEdit::Typed {
+            input: InputState::new("hi"),
+            saved: None,
+        },
+        refusal: None,
+    });
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let caret = term.get_cursor_position().expect("the native cursor");
+    let buf = term.backend().buffer().clone();
+    let rows = crate::testutil::buffer_rows(&buf);
+    let effort_idx = rows
+        .iter()
+        .position(|r| r.contains("effort"))
+        .expect("the effort row renders");
+    assert_eq!(
+        caret.y as usize,
+        effort_idx,
+        "the caret sits on the edited row:\n{}",
+        rows.join("\n")
+    );
+    // The caret column is the end of the typed value, measured against the
+    // rendered value rather than an arithmetic sum.
+    let w = buf.area.width as usize;
+    let hi_x = (0..w)
+        .find(|&x| buf.content[effort_idx * w + x].symbol() == "h")
+        .expect("the typed value renders");
+    assert_eq!(
+        caret.x as usize,
+        hi_x + 2,
+        "the caret sits after the typed value"
+    );
+}
+
+/// A control character in the typed value renders escaped, and the native
+/// cursor sits after the escaped text — the shared `head_cols` counts what the
+/// editor body draws, so the caret never drifts right of it.
+#[test]
+fn a_control_character_value_keeps_the_shunt_editor_caret_aligned() {
+    use crate::tui::app::{
+        InputState, ServicesFocus, ShuntFieldEdit, ShuntFieldEditState, ShuntFieldKey,
+        ShuntFocusLine, UpstreamFieldKind,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![UpstreamView {
+        name: Some(w("a")),
+        provider: None,
+        kind: None,
+        base_url: None,
+        auth: None,
+        effort: None,
+        service_tier: None,
+    }];
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    }]);
+    let key = ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    };
+    let mut app = config_view_app(view, expanded);
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Field(key.clone())));
+    app.services.shunt_field_edit = Some(ShuntFieldEditState {
+        key,
+        edit: ShuntFieldEdit::Typed {
+            input: InputState::new("x\ty"),
+            saved: None,
+        },
+        refusal: None,
+    });
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let caret = term.get_cursor_position().expect("the native cursor");
+    let buf = term.backend().buffer().clone();
+    let rows = crate::testutil::buffer_rows(&buf);
+    let effort_idx = rows
+        .iter()
+        .position(|r| r.contains("effort"))
+        .expect("the effort row renders");
+    // `x\ty` renders as the escaped `x\ty` (4 cells: x, \, t, y); the caret
+    // sits right after the `y`.
+    let w = buf.area.width as usize;
+    let x_x = (0..w)
+        .find(|&x| buf.content[effort_idx * w + x].symbol() == "x")
+        .expect("the escaped value renders");
+    assert_eq!(
+        caret.x as usize,
+        x_x + 4,
+        "the caret sits after the escaped value:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// A saving value carries the shimmer crest: on the full tier, at mid-sweep,
+/// the value's cells are tinted away from the plain accent.
+#[test]
+fn a_saving_value_carries_the_shimmer_crest() {
+    use crate::tui::app::{ShuntFieldKey, ShuntSave, UpstreamFieldKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut view = base_view();
+    view.upstreams = vec![UpstreamView {
+        name: Some(w("a")),
+        provider: None,
+        kind: None,
+        base_url: None,
+        auth: None,
+        effort: None,
+        service_tier: None,
+    }];
+    let expanded = std::collections::HashSet::from([ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    }]);
+    let key = ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Effort,
+    };
+    let mut app = config_view_app(view, expanded);
+    app.services.shunt_save = Some(ShuntSave {
+        key,
+        started: std::time::Instant::now() - std::time::Duration::from_millis(200),
+        value: Some("high".into()),
+    });
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let cells = crate::testutil::needle_cells(&buf, "high").expect("the saving value");
+    assert!(
+        cells
+            .iter()
+            .any(|c| c.fg != crate::tui::theme::accent_color()),
+        "the shimmer crest tints the value away from the plain accent"
     );
 }
 
@@ -4078,7 +4813,7 @@ fn the_config_focus_walk_reaches_entries_and_skips_field_rows() {
 /// reorders the upstreams keeps focus on the same entry.
 #[test]
 fn config_focus_identity_holds_across_a_reorder() {
-    use crate::tui::app::ShuntFocus;
+    use crate::tui::app::{ShuntFocus, ShuntFocusLine};
     let _home = crate::testutil::HomeSandbox::new();
     let mut view = base_view();
     view.upstreams = vec![
@@ -4089,7 +4824,11 @@ fn config_focus_identity_holds_across_a_reorder() {
     render_tall(&app);
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
-    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Entry(ShuntEntryKey::Upstream {
+            name: "openai".into(),
+            occurrence: 0,
+        })));
     assert_eq!(
         app.services.shunt_focus_kind(),
         Some(ShuntFocusLine::Entry(ShuntEntryKey::Upstream {
@@ -4103,8 +4842,10 @@ fn config_focus_identity_holds_across_a_reorder() {
     // identity stays, so focus re-resolves to openai at its new position.
     view.upstreams.reverse();
     let mut card = crate::tui::app::shunt_check(&shunt_slot_full(), true, None);
-    card.shunt_focus
-        .extend(crate::tui::app::config_entry_stops(&view));
+    card.shunt_focus.extend(crate::tui::app::config_field_stops(
+        &view,
+        &app.services.shunt_expanded,
+    ));
     app.services.checks = vec![card];
     app.services.shunt_config = Some(ShuntConfigRead::Ok(Box::new(view)));
     render_tall(&app);
@@ -4161,9 +4902,12 @@ fn the_config_footer_hints_expand_then_collapse() {
     render_tall(&app);
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     assert_eq!(
         super::super::footer::services_hints(&app),
         vec![
+            ("↑↓", "row"),
             ("r", "refresh"),
             ("space/↵", "expand"),
             ("a", "actions"),
@@ -4176,6 +4920,7 @@ fn the_config_footer_hints_expand_then_collapse() {
     assert_eq!(
         super::super::footer::services_hints(&app),
         vec![
+            ("↑↓", "row"),
             ("r", "refresh"),
             ("space/↵", "collapse"),
             ("a", "actions"),
@@ -4334,7 +5079,7 @@ fn the_shunt_config_renders_two_same_id_models_distinctly() {
 /// `↵` expands only the focused one.
 #[test]
 fn the_config_focus_walk_reaches_two_same_id_models() {
-    use crate::tui::app::ShuntFocus;
+    use crate::tui::app::{ShuntFocus, ShuntFocusLine};
     let _home = crate::testutil::HomeSandbox::new();
     let mut view = base_view();
     view.models = vec![
@@ -4353,7 +5098,13 @@ fn the_config_focus_walk_reaches_two_same_id_models() {
     render_tall(&app);
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
-    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    // The server fields lead the walk; focus the second same-id model directly.
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Entry(ShuntEntryKey::Model {
+            id: "m".into(),
+            occurrence: 1,
+        })));
+    render_tall(&app);
     assert!(
         matches!(
             app.services.focused_shunt_focus(),
@@ -4361,7 +5112,7 @@ fn the_config_focus_walk_reaches_two_same_id_models() {
                 key: ShuntEntryKey::Model { id, occurrence: 1 }
             }) if id == "m"
         ),
-        "one step lands on the second same-id model"
+        "focus lands on the second same-id model"
     );
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
@@ -4408,7 +5159,10 @@ fn the_shunt_config_renders_two_same_name_upstreams_distinctly() {
             "    provider        —".to_string(),
             "    kind            —".to_string(),
             "    base_url        —".to_string(),
-            "    auth mode       claude_oauth".to_string(),
+            "    auth mode       passthrough  api_key  chatgpt_oauth".to_string(),
+            "                    claude_oauth  xai_oauth  cursor_oauth".to_string(),
+            "                    kimi_oauth  google_oauth  antigravity_oauth".to_string(),
+            "                    none".to_string(),
             "    accounts        —".to_string(),
             "    effort          —".to_string(),
             "    service_tier    —".to_string(),
@@ -4445,7 +5199,10 @@ fn the_shunt_config_renders_two_nameless_upstreams_distinctly() {
             "    provider        —".to_string(),
             "    kind            —".to_string(),
             "    base_url        —".to_string(),
-            "    auth mode       claude_oauth".to_string(),
+            "    auth mode       passthrough  api_key  chatgpt_oauth".to_string(),
+            "                    claude_oauth  xai_oauth  cursor_oauth".to_string(),
+            "                    kimi_oauth  google_oauth  antigravity_oauth".to_string(),
+            "                    none".to_string(),
             "    accounts        —".to_string(),
             "    effort          —".to_string(),
             "    service_tier    —".to_string(),
@@ -4460,7 +5217,7 @@ fn the_shunt_config_renders_two_nameless_upstreams_distinctly() {
 /// `↵` expands only the focused one.
 #[test]
 fn the_config_focus_walk_reaches_two_same_name_upstreams() {
-    use crate::tui::app::ShuntFocus;
+    use crate::tui::app::{ShuntFocus, ShuntFocusLine};
     let _home = crate::testutil::HomeSandbox::new();
     let mut view = base_view();
     view.upstreams = vec![
@@ -4471,7 +5228,12 @@ fn the_config_focus_walk_reaches_two_same_name_upstreams() {
     render_tall(&app);
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
-    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Entry(ShuntEntryKey::Upstream {
+            name: "a".into(),
+            occurrence: 1,
+        })));
+    render_tall(&app);
     assert!(
         matches!(
             app.services.focused_shunt_focus(),
@@ -4479,7 +5241,7 @@ fn the_config_focus_walk_reaches_two_same_name_upstreams() {
                 key: ShuntEntryKey::Upstream { name, occurrence: 1 }
             }) if name == "a"
         ),
-        "one step lands on the second same-name upstream"
+        "focus lands on the second same-name upstream"
     );
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
@@ -4507,7 +5269,7 @@ fn the_config_focus_walk_reaches_two_same_name_upstreams() {
 /// expands only the focused one.
 #[test]
 fn the_config_focus_walk_reaches_two_nameless_upstreams() {
-    use crate::tui::app::ShuntFocus;
+    use crate::tui::app::{ShuntFocus, ShuntFocusLine};
     let _home = crate::testutil::HomeSandbox::new();
     let mut view = base_view();
     view.upstreams = vec![nameless_up("api_key"), nameless_up("claude_oauth")];
@@ -4515,7 +5277,12 @@ fn the_config_focus_walk_reaches_two_nameless_upstreams() {
     render_tall(&app);
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
-    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Entry(ShuntEntryKey::Upstream {
+            name: String::new(),
+            occurrence: 1,
+        })));
+    render_tall(&app);
     assert!(
         matches!(
             app.services.focused_shunt_focus(),
@@ -4523,7 +5290,7 @@ fn the_config_focus_walk_reaches_two_nameless_upstreams() {
                 key: ShuntEntryKey::Upstream { name, occurrence: 1 }
             }) if name.is_empty()
         ),
-        "one step lands on the second nameless upstream"
+        "focus lands on the second nameless upstream"
     );
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
@@ -4811,10 +5578,11 @@ fn the_shunt_config_entry_styles_follow_the_design_contract() {
         "focused label bold"
     );
 
-    // A field value ACCENT (the SERVER default_provider), `—` faint.
+    // A field value ACCENT (the SERVER default_provider), a typed absent key
+    // `—` faint (the upstream's base_url).
     let value = crate::testutil::needle_cells(&buf, "anthropic").expect("value");
     assert_eq!(value[0].fg, super::theme::accent_color(), "value accent");
-    let dash = crate::testutil::needle_cells(&buf, "provider        —").expect("absent value");
+    let dash = crate::testutil::needle_cells(&buf, "base_url        —").expect("absent value");
     assert_eq!(
         dash[dash.len() - 1].fg,
         super::theme::text_faint_color(),

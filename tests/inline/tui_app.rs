@@ -5090,10 +5090,11 @@ fn set_daemon(app: &mut App, health: crate::daemon::DaemonHealth) {
     super::sync_gateway_state(app);
 }
 
-/// Drain the Services probes until the shunt action in flight lands.
+/// Drain the Services probes until the shunt action (or a config save, which
+/// runs on its own worker) in flight lands.
 fn drain_shunt_action(app: &mut App) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while app.services.shunt_action.running {
+    while app.services.shunt_action.running || app.services.shunt_save_worker.running {
         assert!(
             std::time::Instant::now() < deadline,
             "the shunt action did not land"
@@ -14945,6 +14946,7 @@ fn await_service_probes(app: &mut App) {
         || app.services.move_plan_probe.running
         || app.services.pool_probe.running
         || app.services.shunt_action.running
+        || app.services.shunt_save_worker.running
     {
         assert!(
             std::time::Instant::now() < deadline,
@@ -22766,14 +22768,14 @@ fn the_production_recompute_renders_the_config_groups_and_walks_onto_them() {
         rows.join("\n")
     );
 
-    // The walk from `enabled` reaches the first entry row (the config stops
-    // joined the walk).
+    // The walk from `enabled` reaches the first entry row: enabled → the admin
+    // fix → the bind and default_provider field rows → the entry.
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
-    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
-    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
-    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
-    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    for _ in 0..4 {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    }
     assert!(
         matches!(
             app.services.focused_shunt_focus(),
@@ -22782,6 +22784,1685 @@ fn the_production_recompute_renders_the_config_groups_and_walks_onto_them() {
             }) if name == "anthropic"
         ),
         "the walk reaches the first entry row"
+    );
+}
+
+// ── config field editing (C2) ────────────────────────────────────────────────
+
+/// A sandbox holding an adopted config + a stub `shunt` that passes checks (a
+/// `fail` marker refuses), and a recomputed Services app over it with the real
+/// action worker installed, so a save runs the engine off the UI thread. The
+/// `HomeSandbox` and its `EnvPin` are the caller's, held for the test's life.
+#[cfg(unix)]
+struct ConfigEditRig {
+    config: std::path::PathBuf,
+    stub: std::path::PathBuf,
+    app: App,
+}
+
+#[cfg(unix)]
+fn config_edit_rig(home: &crate::testutil::HomeSandbox, text: &str) -> ConfigEditRig {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::create_dir_all(home.home().join("etc")).unwrap();
+    let etc = std::fs::canonicalize(home.home().join("etc")).unwrap();
+    let config = etc.join("shunt.toml");
+    std::fs::write(&config, text).unwrap();
+    let stub = home.home().join("stub");
+    std::fs::create_dir_all(&stub).unwrap();
+    let binary = stub.join("shunt");
+    std::fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\nd='{}'\necho call >> \"$d/calls\"\ncp \"$3\" \"$d/candidate\"\nif [ -e \"$d/fail\" ]; then echo 'config error: boom' >&2; exit 1; fi\nexit 0\n",
+            stub.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config.clone()).unwrap();
+    record.binary = Some(binary);
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record);
+        Ok(())
+    })
+    .unwrap();
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.services.shunt_action.prober = Some(super::run_shunt_action);
+    app.services.shunt_save_worker.prober = Some(super::run_shunt_action);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    ConfigEditRig { config, stub, app }
+}
+
+#[cfg(unix)]
+impl ConfigEditRig {
+    fn render(&mut self) {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+        term.draw(|f| crate::tui::render::draw(f, &self.app))
+            .unwrap();
+    }
+
+    /// Focus one field row (expanding its entry), ready for `↵`.
+    fn focus_field(&mut self, key: super::ShuntFieldKey) {
+        let entry = match &key {
+            super::ShuntFieldKey::Upstream {
+                name, occurrence, ..
+            } => Some(super::ShuntEntryKey::Upstream {
+                name: name.clone(),
+                occurrence: *occurrence,
+            }),
+            super::ShuntFieldKey::Model { id, occurrence, .. } => {
+                Some(super::ShuntEntryKey::Model {
+                    id: id.clone(),
+                    occurrence: *occurrence,
+                })
+            }
+            super::ShuntFieldKey::Route { position, .. } => {
+                Some(super::ShuntEntryKey::Route(*position))
+            }
+            super::ShuntFieldKey::Bind | super::ShuntFieldKey::DefaultProvider => None,
+        };
+        if let Some(entry) = entry {
+            self.app.services.shunt_expanded.insert(entry);
+        }
+        super::recompute_services_checks(&mut self.app, false, super::ShuntRefresh::Keep);
+        self.app.services.focus = super::ServicesFocus::Detail;
+        self.app
+            .services
+            .set_shunt_focus(Some(super::ShuntFocusLine::Field(key)));
+        self.render();
+    }
+
+    fn config_text(&self) -> String {
+        std::fs::read_to_string(&self.config).unwrap()
+    }
+
+    fn drain(&mut self) {
+        drain_shunt_action(&mut self.app);
+    }
+}
+
+/// Type `text` into the open field editor and save it with `↵`.
+#[cfg(unix)]
+fn type_and_save(app: &mut App, text: &str) {
+    for c in text.chars() {
+        super::handle_key(app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    super::handle_key(app, crate::testutil::key(KeyCode::Enter));
+}
+
+/// Clear the seeded buffer (the editor opens with the saved value, caret at
+/// the end), then [`type_and_save`].
+#[cfg(unix)]
+fn clear_and_save(app: &mut App, text: &str) {
+    let n = app
+        .services
+        .shunt_field_edit
+        .as_ref()
+        .map(|s| match &s.edit {
+            super::ShuntFieldEdit::Typed { input, .. } => input.value.chars().count(),
+            super::ShuntFieldEdit::Pick { .. } => 0,
+        })
+        .unwrap_or(0);
+    for _ in 0..n {
+        super::handle_key(app, crate::testutil::key(KeyCode::Backspace));
+    }
+    type_and_save(app, text);
+}
+
+#[cfg(unix)]
+const RIG_TEXT: &str =
+    "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nauth = \"claude_oauth\"\n";
+
+/// The shunt card's detail rows, split off the two-pane `││` border with the
+/// pane padding dropped (the render test's `config_detail_rows` shape): the
+/// field rows keep their caret slot, so a save's spinner/`✓` is pinable.
+#[cfg(unix)]
+fn shunt_config_rows(app: &App) -> Vec<String> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let mut out: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.split("││").nth(1))
+        .map(|r| {
+            let r = r.trim_matches('│');
+            let r = r.strip_prefix(' ').unwrap_or(r);
+            r.trim_end().to_string()
+        })
+        .collect();
+    while out.last().is_some_and(String::is_empty) {
+        out.pop();
+    }
+    out
+}
+
+/// A typed save lands its bytes in the file (read back by equality) and the
+/// row reads the new value; an emptied field saves as an unset.
+#[cfg(unix)]
+#[test]
+fn a_typed_field_save_lands_the_bytes_and_an_emptied_field_unsets() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.focus_field(super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        rig.app.services.shunt_field_edit.is_some(),
+        "enter opens the effort editor"
+    );
+    type_and_save(&mut rig.app, "high");
+    assert!(rig.app.services.shunt_save.is_some(), "the save started");
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nauth = \"claude_oauth\"\neffort = \"high\"\n"
+    );
+
+    // Empty the same field: the key unsets.
+    rig.focus_field(super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    clear_and_save(&mut rig.app, "");
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nauth = \"claude_oauth\"\n"
+    );
+}
+
+/// An unlocked shunt field editor treats `q` as data: typing a value holding a
+/// `q` (no save running) keeps the editor open on the detail, the buffer
+/// holding that exact text.
+#[cfg(unix)]
+#[test]
+fn an_unlocked_field_editor_types_q_as_data() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.focus_field(super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    for c in "qux".chars() {
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    assert_eq!(
+        rig.app.services.focus,
+        super::ServicesFocus::Detail,
+        "q is data: focus stays on the detail"
+    );
+    let Some(state) = rig.app.services.shunt_field_edit.as_ref() else {
+        panic!("the editor stays open while typing a value with q");
+    };
+    let super::ShuntFieldEdit::Typed { input, .. } = &state.edit else {
+        panic!("the effort editor is a typed editor");
+    };
+    assert_eq!(
+        input.value, "qux",
+        "the buffer holds the typed text with the q"
+    );
+}
+
+/// An accounts edit reorders (order kept, spaces around commas trimmed) and an
+/// emptied list removes the key.
+#[cfg(unix)]
+#[test]
+fn an_accounts_edit_reorders_and_empties() {
+    let text = "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nauth = { mode = \"claude_oauth\", accounts = [\"alice\", \"bob\"] }\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    rig.focus_field(super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Accounts,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    clear_and_save(&mut rig.app, " bob, alice ");
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nauth = { mode = \"claude_oauth\", accounts = [\"bob\", \"alice\"] }\n"
+    );
+
+    rig.focus_field(super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Accounts,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    clear_and_save(&mut rig.app, "");
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nauth = { mode = \"claude_oauth\" }\n"
+    );
+}
+
+/// `space` on a cycle row moves the pick (`✎`, nothing written), `↵` saves it,
+/// `esc` restores the saved value — the file stays byte-identical until `↵`.
+#[cfg(unix)]
+#[test]
+fn a_cycle_pick_saves_with_enter_and_restores_with_esc() {
+    let text = "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nkind = \"anthropic\"\nbase_url = \"https://example.com\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    rig.focus_field(super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Kind,
+    });
+    // `space` moves the pick to the next kind (`responses`); nothing written.
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(rig.app.services.shunt_field_edit.is_some());
+    assert_eq!(rig.config_text(), text, "a pending pick writes nothing");
+    // `esc` restores the saved value and leaves the editor.
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Esc));
+    assert!(rig.app.services.shunt_field_edit.is_none());
+    assert_eq!(rig.config_text(), text);
+    // Now pick and save: `space` then `↵`.
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(' ')));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nkind = \"responses\"\nbase_url = \"https://example.com\"\n"
+    );
+}
+
+/// While a save is held, the row's caret slot shows the spinner and the value
+/// trails a dim `checking`.
+#[cfg(unix)]
+#[test]
+fn a_held_save_spins_a_second_save_toasts_and_the_check_shows() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    let effort = super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Effort,
+    };
+    rig.focus_field(effort.clone());
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    type_and_save(&mut rig.app, "high");
+    // The save is in flight on its own worker (nothing drained yet): the row's
+    // caret slot shows the braille spinner and the value being saved trails a
+    // dim `checking`.
+    assert!(
+        rig.app.services.shunt_save_worker.running,
+        "the save is in flight"
+    );
+    rig.app.tick_count = 0;
+    let rows = shunt_config_rows(&rig.app);
+    let effort_row = rows
+        .iter()
+        .find(|r| r.contains("effort"))
+        .unwrap_or_else(|| panic!("no effort row:\n{}", rows.join("\n")));
+    assert_eq!(
+        effort_row.trim(),
+        format!("⠋   effort{}high  checking", " ".repeat(10)),
+        "the saving row shows the spinner, the value being saved and a dim checking trail"
+    );
+
+    // While the save checks, the editor is locked: `↵` does nothing (no
+    // re-save, no toast) and the editor stays open holding the typed text.
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        !rig.app
+            .toasts
+            .iter()
+            .any(|t| { t.body == "a save is still checking\nwait for it, then save again" }),
+        "↵ on the locked editor toasts nothing"
+    );
+    assert!(
+        rig.app.services.shunt_field_edit.is_some(),
+        "the locked editor stays open"
+    );
+
+    // The save drains: the `✓` shows on the saved row for about a second.
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nauth = \"claude_oauth\"\neffort = \"high\"\n"
+    );
+    let rows = shunt_config_rows(&rig.app);
+    let effort_row = rows
+        .iter()
+        .find(|r| r.contains("effort"))
+        .unwrap_or_else(|| panic!("no effort row:\n{}", rows.join("\n")));
+    assert_eq!(
+        effort_row.trim(),
+        format!("✓   effort{}high", " ".repeat(10)),
+        "the ✓ shows on the saved row"
+    );
+}
+
+/// A refused `shunt check` toasts `save failed` with the compact detail line
+/// and fills the card's `check output` line; the file stays byte-identical.
+#[cfg(unix)]
+#[test]
+fn a_refused_check_toasts_and_fills_the_check_output_line() {
+    use crate::tui::app::ToastKind;
+    let text = RIG_TEXT;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    std::fs::write(rig.stub.join("fail"), "").unwrap();
+    rig.focus_field(super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    type_and_save(&mut rig.app, "high");
+    rig.drain();
+    assert_eq!(rig.config_text(), text, "a refused check writes nothing");
+    let expected = crate::tui::render::prose::mark_commands(&format!(
+        "save failed\n{}",
+        super::escape_control(&format!(
+            "`shunt check` refused the save (exit 1) · shunt.toml unchanged · {} check output on the shunt card",
+            crate::tui::render::prose::key("↵"),
+        ))
+    ));
+    assert_eq!(
+        rig.app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((ToastKind::Danger, expected.as_str())),
+        "the toast names the save's own op"
+    );
+    assert_eq!(
+        rig.app.services.check_output.as_ref().map(|c| c.text()),
+        Some("config error: boom"),
+        "the failed check's stderr is held on the card, by content"
+    );
+}
+
+/// A bind save on a running supervised gateway confirms `restart shunt?` with
+/// the live-session count; the confirmed save toasts `shunt restarting`.
+#[cfg(unix)]
+#[test]
+fn a_bind_save_confirms_with_the_live_session_count() {
+    use crate::daemon::gateway::GatewayState as S;
+    use crate::tui::app::{ConfirmAction, ToastKind};
+    let text = "[server]\nbind = \"127.0.0.1:3001\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    crate::testutil::write_daemon_gateway_slot(&home, S::Healthy);
+    set_daemon(&mut rig.app, crate::daemon::DaemonHealth::Fresh);
+    super::recompute_services_checks(&mut rig.app, false, super::ShuntRefresh::Keep);
+    rig.focus_field(super::ShuntFieldKey::Bind);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    clear_and_save(&mut rig.app, "127.0.0.1:4000");
+    let state = top_confirm(&rig.app);
+    assert_eq!(state.message, "restart shunt?");
+    assert!(matches!(
+        state.on_confirm,
+        ConfirmAction::RestartBind { .. }
+    ));
+    assert_eq!(
+        state.detail.as_deref(),
+        Some("bind is read at start; in-flight requests drain, then it starts on 127.0.0.1:4000."),
+        "no live sessions: the count clause is absent"
+    );
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(rig.config_text(), "[server]\nbind = \"127.0.0.1:4000\"\n");
+    assert_eq!(
+        rig.app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            ToastKind::Success,
+            "shunt restarting\nbind saved · it starts on 127.0.0.1:4000"
+        ))
+    );
+}
+
+/// A rename whose cascade touches references confirms with the count line; the
+/// confirmed save lands and moves focus to the renamed field.
+#[cfg(unix)]
+#[test]
+fn a_rename_counts_its_cascade_and_confirms() {
+    use crate::tui::app::{ConfirmAction, ShuntFieldKey, ShuntFocus, UpstreamFieldKind};
+    let text = "[[upstreams]]\nname = \"a\"\n\n[[routes]]\nmodel = \"m\"\nprovider = \"a\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Name,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    clear_and_save(&mut rig.app, "b");
+    let state = top_confirm(&rig.app);
+    assert_eq!(state.message, "rename upstream \"a\" to \"b\"?");
+    assert_eq!(
+        state.detail.as_deref(),
+        Some("also renames it in 1 route."),
+        "one route names the upstream"
+    );
+    assert!(matches!(
+        state.on_confirm,
+        ConfirmAction::RenameField { .. }
+    ));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        "[[upstreams]]\nname = \"b\"\n\n[[routes]]\nmodel = \"m\"\nprovider = \"b\"\n"
+    );
+    assert!(
+        matches!(
+            rig.app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Field {
+                key: ShuntFieldKey::Upstream { name, field: UpstreamFieldKind::Name, .. }
+            }) if name == "b"
+        ),
+        "focus follows the renamed field"
+    );
+}
+
+/// A second save while one checks toasts info and writes nothing, leaving the
+/// editor open. `before` is read only after the first save drained, so the
+/// first save's write cannot race the "nothing was written" read.
+#[cfg(unix)]
+#[test]
+fn a_second_save_while_checking_toasts_and_writes_nothing() {
+    use crate::tui::app::ToastKind;
+    let text = RIG_TEXT;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    let effort = super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Effort,
+    };
+    rig.focus_field(effort.clone());
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    type_and_save(&mut rig.app, "high");
+    rig.drain();
+    let before = rig.config_text();
+
+    // Hold the save worker (its own `running` is the guard): re-open the
+    // editor, commit a different value — the second save toasts and writes
+    // nothing, its editor open.
+    rig.focus_field(effort);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.app.services.shunt_save_worker.running = true;
+    clear_and_save(&mut rig.app, "low");
+    assert_eq!(
+        rig.app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            ToastKind::Info,
+            "a save is still checking\nwait for it, then save again"
+        )),
+        "the second save toasts"
+    );
+    assert!(
+        rig.app.services.shunt_field_edit.is_some(),
+        "the editor stays open"
+    );
+    assert_eq!(rig.config_text(), before, "nothing was written");
+}
+
+/// `esc` on an expanded entry's field folds the entry and focuses the entry
+/// row; `esc` on a server field ascends.
+#[cfg(unix)]
+#[test]
+fn esc_on_a_field_folds_its_entry() {
+    use crate::tui::app::{ServicesFocus, ShuntFieldKey, ShuntFocus, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Name,
+    });
+    assert!(
+        rig.app
+            .services
+            .shunt_expanded
+            .iter()
+            .any(|k| { matches!(k, super::ShuntEntryKey::Upstream { name, .. } if name == "a") })
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Esc));
+    assert!(
+        !rig.app
+            .services
+            .shunt_expanded
+            .iter()
+            .any(|k| { matches!(k, super::ShuntEntryKey::Upstream { name, .. } if name == "a") }),
+        "esc folds the entry"
+    );
+    assert!(
+        matches!(
+            rig.app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Entry {
+                key: super::ShuntEntryKey::Upstream { name, .. }
+            }) if name == "a"
+        ),
+        "focus returns to the entry row"
+    );
+    // `esc` on the bind (a server field) ascends to the list.
+    rig.focus_field(ShuntFieldKey::Bind);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(rig.app.services.focus, ServicesFocus::List);
+}
+
+/// A bind save on a stopped gateway saves without the restart confirm.
+#[cfg(unix)]
+#[test]
+fn a_bind_save_on_a_stopped_gateway_saves_without_the_confirm() {
+    use crate::daemon::gateway::GatewayState as S;
+    use crate::tui::app::ConfirmAction;
+    let text = "[server]\nbind = \"127.0.0.1:3001\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    crate::testutil::write_daemon_gateway_slot(&home, S::Disabled);
+    set_daemon(&mut rig.app, crate::daemon::DaemonHealth::Fresh);
+    super::recompute_services_checks(&mut rig.app, false, super::ShuntRefresh::Keep);
+    rig.focus_field(super::ShuntFieldKey::Bind);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    clear_and_save(&mut rig.app, "127.0.0.1:4000");
+    assert!(
+        !rig.app.modals.iter().any(|m| matches!(m, super::Modal::Confirm(s) if matches!(s.on_confirm, ConfirmAction::RestartBind { .. }))),
+        "a stopped gateway confirms nothing"
+    );
+    rig.drain();
+    assert_eq!(rig.config_text(), "[server]\nbind = \"127.0.0.1:4000\"\n");
+    assert!(
+        !rig.app
+            .toasts
+            .iter()
+            .any(|t| t.body.starts_with("shunt restarting")),
+        "an unconfirmed bind save toasts no restart:\n{:?}",
+        rig.app.toasts
+    );
+}
+
+/// An engine refusal raised on the save worker keeps the editor open with the
+/// typed text and renders the refusal's own sentence on the `└` DANGER line;
+/// the file stays byte-identical.
+#[cfg(unix)]
+#[test]
+fn a_refused_save_keeps_the_editor_open_and_shows_the_refusal_line() {
+    let text = RIG_TEXT;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    rig.focus_field(super::ShuntFieldKey::Bind);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    clear_and_save(&mut rig.app, "${SHUNT_BIND}");
+    rig.drain();
+    assert_eq!(rig.config_text(), text, "a refused save writes nothing");
+    let state = rig
+        .app
+        .services
+        .shunt_field_edit
+        .as_ref()
+        .expect("the editor stays open");
+    assert_eq!(
+        state.refusal.as_deref(),
+        Some(
+            "cannot set server.bind: [server].bind is a ${...} reference, which clauth does not resolve; set SHUNT_SERVER__BIND in the gateway's env file to the address instead"
+        ),
+        "the engine's refusal sentence is attached to the open editor"
+    );
+    let rows = shunt_config_rows(&rig.app);
+    let bind_idx = rows
+        .iter()
+        .position(|r| r.contains("bind"))
+        .expect("the bind row renders");
+    assert_eq!(
+        &rows[bind_idx + 1..bind_idx + 4],
+        &[
+            " └ cannot set server.bind: [server].bind is a ${...} reference,".to_string(),
+            "   which clauth does not resolve; set SHUNT_SERVER__BIND in the".to_string(),
+            "   gateway's env file to the address instead".to_string(),
+        ],
+        "the refusal renders on the `└` line under the field:\n{}",
+        rows.join("\n")
+    );
+
+    // The `└` lines stay untinted on a focused row, like every other tooltip in
+    // the app — only the field's own row carries the hover bg.
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &rig.app))
+        .unwrap();
+    let buf = term.backend().buffer().clone();
+    let cells = crate::testutil::needle_cells(&buf, "└ cannot set server.bind")
+        .expect("the refusal renders");
+    assert!(
+        cells.iter().all(|c| c.bg != crate::tui::theme::bg_hover()),
+        "the `└` refusal lines stay untinted, got {:?}",
+        cells.first().map(|c| c.bg)
+    );
+}
+
+/// While a save checks, its editor is locked: `esc` does nothing, and `↓`
+/// moves focus away (closing the editor). A refusal landing after the user
+/// moved away toasts `save failed` + the sentence; nothing is written.
+#[cfg(unix)]
+#[test]
+fn a_refusal_landing_after_focus_moved_away_toasts_and_writes_nothing() {
+    use crate::tui::app::{ShuntFieldKey, ShuntFocus, ToastKind};
+    let text = RIG_TEXT;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    rig.focus_field(ShuntFieldKey::Bind);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    let n = rig
+        .app
+        .services
+        .shunt_field_edit
+        .as_ref()
+        .map(|s| match &s.edit {
+            super::ShuntFieldEdit::Typed { input, .. } => input.value.chars().count(),
+            super::ShuntFieldEdit::Pick { .. } => 0,
+        })
+        .unwrap_or(0);
+    for _ in 0..n {
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Backspace));
+    }
+    for c in "${SHUNT_BIND}".chars() {
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    // Hold the save in flight by hand (the worker's own `running` is the
+    // guard), so the locked-editor keys run before any outcome lands.
+    rig.app.services.shunt_save_worker.running = true;
+    rig.app.services.shunt_save = Some(super::ShuntSave {
+        key: ShuntFieldKey::Bind,
+        started: std::time::Instant::now(),
+        value: Some("${SHUNT_BIND}".to_string()),
+    });
+
+    // The editor is locked: `esc` does nothing (the editor stays open holding
+    // the typed text).
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Esc));
+    assert!(
+        rig.app.services.shunt_field_edit.is_some(),
+        "esc on a locked editor does nothing"
+    );
+
+    // `↓` moves focus away: the editor closes and the walk steps on.
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Down));
+    assert!(
+        rig.app.services.shunt_field_edit.is_none(),
+        "down on a locked editor closes it"
+    );
+    assert!(
+        matches!(
+            rig.app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Field {
+                key: ShuntFieldKey::DefaultProvider
+            })
+        ),
+        "focus moved to the next field"
+    );
+
+    // Release a refusing outcome: it reaches the toast, never the `└` line.
+    let sentence = "cannot set server.bind: [server].bind is a ${...} reference, which clauth does not resolve; set SHUNT_SERVER__BIND in the gateway's env file to the address instead";
+    rig.app
+        .services
+        .shunt_save_worker
+        .tx
+        .send(super::ShuntActionOutcome::ConfigRefused {
+            key: ShuntFieldKey::Bind,
+            sentence: sentence.to_string(),
+        })
+        .expect("send the refusal");
+    rig.drain();
+    let expected = format!("save failed\n{sentence}");
+    assert_eq!(
+        rig.app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((ToastKind::Danger, expected.as_str())),
+        "the refusal toasts by equality"
+    );
+    assert_eq!(rig.config_text(), text, "a refused save writes nothing");
+    assert!(
+        rig.app.services.shunt_field_edit.is_none(),
+        "no editor reopens for the moved-away refusal"
+    );
+}
+
+/// While a save checks, the locked editor's footer names the non-edit keys it
+/// keeps (`↑↓ row`, `q back`, plus the derived `? help`) and no edit hint. The
+/// editing keys (`esc`, typing, `↵`, `space`) are inert, so `esc revert` /
+/// `↵ save` never advertise a key that does nothing.
+#[cfg(unix)]
+#[test]
+fn a_locked_save_footer_hints_row_and_back_not_edit_keys() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.focus_field(super::ShuntFieldKey::Bind);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.app.services.shunt_save = Some(super::ShuntSave {
+        key: super::ShuntFieldKey::Bind,
+        started: std::time::Instant::now(),
+        value: Some("${SHUNT_BIND}".to_string()),
+    });
+    let footer = footer_row(&rig.app, 120, 40);
+    assert_eq!(
+        footer.trim(),
+        "↑↓ row   ? help   q back",
+        "the locked footer shows row/help/back, no edit hints"
+    );
+}
+
+/// On a locked editor (its save still checking), the non-edit keys the footer
+/// advertises actually work: `x` dismisses a pre-seeded toast, `?` opens Help
+/// with the editor still locked under it, and `q` closes the editor and ascends
+/// to the list — the editor never outlives the detail focus, so a later refusal
+/// toasts and `↓` walks the list, never a hidden card.
+#[cfg(unix)]
+#[test]
+fn a_locked_save_editor_keeps_x_question_and_q_live() {
+    use crate::tui::app::{ShuntFieldKey, ToastKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.focus_field(ShuntFieldKey::Bind);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.app.services.shunt_save_worker.running = true;
+    rig.app.services.shunt_save = Some(super::ShuntSave {
+        key: ShuntFieldKey::Bind,
+        started: std::time::Instant::now(),
+        value: Some("${SHUNT_BIND}".to_string()),
+    });
+
+    // `x` dismisses a pre-seeded toast.
+    rig.app.toast(ToastKind::Info, "a toast");
+    assert_eq!(rig.app.toasts.len(), 1);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char('x')));
+    assert!(
+        rig.app.toasts.is_empty(),
+        "x dismisses the toast while locked"
+    );
+
+    // `?` opens Help with the editor still locked under it.
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char('?')));
+    assert!(
+        matches!(rig.app.modals.last(), Some(super::Modal::Help)),
+        "? opens Help over the locked editor"
+    );
+    assert!(
+        rig.app.services.shunt_field_edit.is_some() && rig.app.services.shunt_save.is_some(),
+        "the editor stays open and locked under Help"
+    );
+    rig.app.modals.clear();
+
+    // `q` closes the editor and ascends to the list, so nothing owns the
+    // keyboard on the blurred card.
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char('q')));
+    assert_eq!(
+        rig.app.services.focus,
+        super::ServicesFocus::List,
+        "q ascends to the list"
+    );
+    assert!(
+        rig.app.services.shunt_field_edit.is_none(),
+        "q closes the editor"
+    );
+    assert!(
+        super::keyboard_owner(&rig.app).is_none(),
+        "no owner keeps the keyboard on the list"
+    );
+
+    // A second service row makes `↓` observable: after `q`, the list cursor
+    // moves, never the hidden card's walk.
+    let mut second = rig.app.services.checks[0].clone();
+    second.label = "herdr";
+    second.shunt_focus.clear();
+    second.shunt_action_start = None;
+    rig.app.services.checks.push(second);
+
+    // A refusal landing after the editor closed toasts by equality.
+    let sentence = "cannot set server.bind: [server].bind is a ${...} reference, which clauth does not resolve; set SHUNT_SERVER__BIND in the gateway's env file to the address instead";
+    rig.app
+        .services
+        .shunt_save_worker
+        .tx
+        .send(super::ShuntActionOutcome::ConfigRefused {
+            key: ShuntFieldKey::Bind,
+            sentence: sentence.to_string(),
+        })
+        .expect("send the refusal");
+    rig.drain();
+    let expected = format!("save failed\n{sentence}");
+    assert_eq!(
+        rig.app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((ToastKind::Danger, expected.as_str())),
+        "the refusal toasts by equality"
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        rig.app.services.cursor, 1,
+        "down moves the list cursor, not a hidden card"
+    );
+}
+
+/// A row whose save is checking sheds its edit hints in the footer — `↵ edit
+/// value` on a typed row, `space cycle   ↵ custom` on a cycle row — since those
+/// keys are inert there; a neighbour row keeps its own hint. All by equality.
+#[cfg(unix)]
+#[test]
+fn a_saving_row_sheds_its_edit_hints_in_the_footer() {
+    use crate::tui::app::{ShuntFieldKey, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+
+    // A typed row (Bind) whose save checks, no editor open.
+    rig.focus_field(ShuntFieldKey::Bind);
+    rig.app.services.shunt_save = Some(super::ShuntSave {
+        key: ShuntFieldKey::Bind,
+        started: std::time::Instant::now(),
+        value: Some("${SHUNT_BIND}".to_string()),
+    });
+    let footer = footer_row(&rig.app, 120, 40);
+    assert_eq!(
+        footer.trim(),
+        "←→ tabs   ↑↓ row   r refresh   a actions   ? help   q back",
+        "a saving typed row sheds `↵ edit value`"
+    );
+
+    // A neighbour typed row (DefaultProvider) keeps its hint while Bind saves.
+    rig.app
+        .services
+        .set_shunt_focus(Some(super::ShuntFocusLine::Field(
+            ShuntFieldKey::DefaultProvider,
+        )));
+    let footer = footer_row(&rig.app, 120, 40);
+    assert_eq!(
+        footer.trim(),
+        "←→ tabs   ↑↓ row   r refresh   ↵ edit value   a actions   ? help   q back",
+        "a row beside a saving one keeps its `↵ edit value` hint"
+    );
+
+    // A cycle row (kind) whose save checks sheds both cycle hints.
+    let kind = ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Kind,
+    };
+    rig.focus_field(kind.clone());
+    rig.app.services.shunt_save = Some(super::ShuntSave {
+        key: kind.clone(),
+        started: std::time::Instant::now(),
+        value: Some("responses".to_string()),
+    });
+    let footer = footer_row(&rig.app, 120, 40);
+    assert_eq!(
+        footer.trim(),
+        "←→ tabs   ↑↓ row   r refresh   a actions   ? help   q back",
+        "a saving cycle row sheds `space cycle` and `↵ custom`"
+    );
+}
+
+/// Returning to a row whose save is still checking never opens a fresh editor
+/// over the file's value: `↵` and `space` are inert there. A refusal landing
+/// with no editor open for its row toasts (round 3's rule), never a `└` line
+/// under a value the editor no longer shows.
+#[cfg(unix)]
+#[test]
+fn entering_a_row_whose_save_still_checks_opens_no_fresh_editor() {
+    use crate::tui::app::{ShuntFieldKey, ShuntFocus, ToastKind};
+    let text = RIG_TEXT;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    rig.focus_field(ShuntFieldKey::Bind);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    let n = rig
+        .app
+        .services
+        .shunt_field_edit
+        .as_ref()
+        .map(|s| match &s.edit {
+            super::ShuntFieldEdit::Typed { input, .. } => input.value.chars().count(),
+            super::ShuntFieldEdit::Pick { .. } => 0,
+        })
+        .unwrap_or(0);
+    for _ in 0..n {
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Backspace));
+    }
+    for c in "${SHUNT_BIND}".chars() {
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    rig.app.services.shunt_save_worker.running = true;
+    rig.app.services.shunt_save = Some(super::ShuntSave {
+        key: ShuntFieldKey::Bind,
+        started: std::time::Instant::now(),
+        value: Some("${SHUNT_BIND}".to_string()),
+    });
+
+    // Move away, then back onto the still-saving row.
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Down));
+    assert!(
+        matches!(
+            rig.app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Field {
+                key: ShuntFieldKey::DefaultProvider
+            })
+        ),
+        "down moves off the saving row"
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Up));
+    assert!(
+        matches!(
+            rig.app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Field {
+                key: ShuntFieldKey::Bind
+            })
+        ),
+        "up returns to the saving row"
+    );
+
+    // `↵` and `space` open nothing on a row whose save is in flight.
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        rig.app.services.shunt_field_edit.is_none(),
+        "↵ on a saving row opens no fresh editor"
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        rig.app.services.shunt_field_edit.is_none(),
+        "space on a saving row opens no fresh editor"
+    );
+
+    // A refusal landing with no editor open toasts, never a `└` under the
+    // file's value.
+    let sentence = "cannot set server.bind: [server].bind is a ${...} reference, which clauth does not resolve; set SHUNT_SERVER__BIND in the gateway's env file to the address instead";
+    rig.app
+        .services
+        .shunt_save_worker
+        .tx
+        .send(super::ShuntActionOutcome::ConfigRefused {
+            key: ShuntFieldKey::Bind,
+            sentence: sentence.to_string(),
+        })
+        .expect("send the refusal");
+    rig.drain();
+    let expected = format!("save failed\n{sentence}");
+    assert_eq!(
+        rig.app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((ToastKind::Danger, expected.as_str())),
+        "the refusal toasts by equality, never a `└` line"
+    );
+    assert_eq!(rig.config_text(), text, "a refused save writes nothing");
+}
+
+/// The R3-3 inert rule holds on a CYCLE row too: returning to a cycle row whose
+/// save still checks, `space` opens no fresh pick (the row is busy), and a
+/// refusal landing with no pick open toasts by equality — never a `└` under a
+/// value the user never picked.
+#[cfg(unix)]
+#[test]
+fn a_saving_cycle_row_opens_no_fresh_pick_and_toasts_the_refusal() {
+    use crate::tui::app::{ShuntFieldKey, ShuntFocus, ToastKind, UpstreamFieldKind};
+    let text = RIG_TEXT;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    let kind = ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: UpstreamFieldKind::Kind,
+    };
+    rig.focus_field(kind.clone());
+    // Open a pick on the cycle row, then mark its save in flight.
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        rig.app.services.shunt_field_edit.is_some(),
+        "space opens a pick"
+    );
+    rig.app.services.shunt_save_worker.running = true;
+    rig.app.services.shunt_save = Some(super::ShuntSave {
+        key: kind.clone(),
+        started: std::time::Instant::now(),
+        value: Some("responses".to_string()),
+    });
+
+    // Move away and back onto the still-saving cycle row.
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Up));
+    assert!(
+        matches!(
+            rig.app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Field { key }) if key == &kind
+        ),
+        "up returns to the saving cycle row"
+    );
+
+    // `space` opens no fresh pick on a row whose save is in flight.
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        rig.app.services.shunt_field_edit.is_none(),
+        "space on a saving cycle row opens no fresh pick"
+    );
+
+    // The refusal lands as a toast (no pick open), nothing written.
+    let sentence = "cannot set upstreams[0].kind: not a kind shunt knows";
+    rig.app
+        .services
+        .shunt_save_worker
+        .tx
+        .send(super::ShuntActionOutcome::ConfigRefused {
+            key: kind,
+            sentence: sentence.to_string(),
+        })
+        .expect("send the refusal");
+    rig.drain();
+    let expected = format!("save failed\n{sentence}");
+    assert_eq!(
+        rig.app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((ToastKind::Danger, expected.as_str())),
+        "the refusal toasts by equality"
+    );
+    assert_eq!(rig.config_text(), text, "a refused save writes nothing");
+}
+
+/// A panicking save prober drains as the failed outcome: the row stops
+/// spinning, unlocks, and the toast reads `save failed` / `the save stopped
+/// unexpectedly; nothing was written` by equality.
+#[cfg(unix)]
+#[test]
+fn a_panicking_save_prober_lands_as_a_failed_outcome() {
+    use crate::tui::app::ToastKind;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    let effort = super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Effort,
+    };
+    rig.focus_field(effort);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.app.services.shunt_save_worker.prober = Some(|_job| panic!("boom"));
+    clear_and_save(&mut rig.app, "high");
+    rig.drain();
+    assert!(
+        rig.app.services.shunt_save.is_none(),
+        "the panicked save clears the in-flight guard"
+    );
+    assert!(
+        rig.app.services.shunt_field_edit.is_some(),
+        "the editor stays open after a panicked save"
+    );
+    assert_eq!(
+        rig.app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            ToastKind::Danger,
+            "save failed\nthe save stopped unexpectedly; nothing was written",
+        )),
+        "the panicked save toasts the failed outcome by equality"
+    );
+    assert_eq!(
+        rig.config_text(),
+        RIG_TEXT,
+        "a panicked save writes nothing"
+    );
+}
+
+/// A landing save touches only its own row: after the user closes the saving
+/// field's editor, moves on and types in another field, the save landing keeps
+/// that editor, its text and the moved focus.
+#[cfg(unix)]
+#[test]
+fn a_landing_save_touches_only_its_own_row() {
+    let text = RIG_TEXT;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    let effort = super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Effort,
+    };
+    let base_url = super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::BaseUrl,
+    };
+    rig.focus_field(effort.clone());
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    type_and_save(&mut rig.app, "high");
+    // Close the saving field's editor and move on, then type in another field
+    // while the save is still in flight. `↓` closes the locked editor (the
+    // `esc` of a field that is not editing is the entry fold, and while its
+    // save checks the editor's `esc` does nothing).
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Down));
+    rig.focus_field(base_url.clone());
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    for c in "https://typed.example".chars() {
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nauth = \"claude_oauth\"\neffort = \"high\"\n",
+        "the effort save landed"
+    );
+    let edit = rig
+        .app
+        .services
+        .shunt_field_edit
+        .as_ref()
+        .expect("the other editor stays open");
+    assert_eq!(edit.key, base_url, "the other field's editor is untouched");
+    match &edit.edit {
+        super::ShuntFieldEdit::Typed { input, .. } => {
+            assert_eq!(input.value, "https://typed.example", "the typed text stays");
+        }
+        other => panic!("the base_url editor is typed, got {other:?}"),
+    }
+    assert!(
+        matches!(
+            rig.app.services.focused_shunt_focus(),
+            Some(super::ShuntFocus::Field { key }) if *key == base_url
+        ),
+        "focus stays on the field the user moved to"
+    );
+}
+
+/// An emptied bind reads shunt's default in the restart confirm and toasts
+/// `bind removed` with the default, from the constant the bind reader already
+/// falls back to.
+#[cfg(unix)]
+#[test]
+fn an_emptied_bind_reads_the_default_in_the_confirm_and_toast() {
+    use crate::daemon::gateway::GatewayState as S;
+    use crate::tui::app::ToastKind;
+    let text = "[server]\nbind = \"127.0.0.1:3001\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    crate::testutil::write_daemon_gateway_slot(&home, S::Healthy);
+    set_daemon(&mut rig.app, crate::daemon::DaemonHealth::Fresh);
+    super::recompute_services_checks(&mut rig.app, false, super::ShuntRefresh::Keep);
+    rig.focus_field(super::ShuntFieldKey::Bind);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    clear_and_save(&mut rig.app, "");
+    let state = top_confirm(&rig.app);
+    assert_eq!(
+        state.detail.as_deref(),
+        Some(
+            "bind is read at start; in-flight requests drain, then it starts on shunt's default, 127.0.0.1:3001."
+        ),
+        "an emptied bind names shunt's default"
+    );
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(rig.config_text(), "[server]\n", "the key removed");
+    assert_eq!(
+        rig.app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            ToastKind::Success,
+            "shunt restarting\nbind removed · it starts on 127.0.0.1:3001"
+        ))
+    );
+}
+
+/// A custom (out-of-set) cycle value survives a pick that cycles past it: it
+/// still renders mid-pick, `esc` restores it, and `↵` on it saves unchanged.
+#[cfg(unix)]
+#[test]
+fn a_custom_cycle_value_survives_a_pick_and_saves_unchanged() {
+    let text = "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nkind = \"antigravity_cli\"\nbase_url = \"https://example.com\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    let kind = super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Kind,
+    };
+    rig.focus_field(kind.clone());
+    // `space` moves the pick to the first option, past the custom value; the
+    // custom value still renders as a faint stop the cycle can return to.
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(' ')));
+    let rows = shunt_config_rows(&rig.app);
+    assert!(
+        rows.iter().any(|r| r.contains("antigravity_cli")),
+        "the custom value stays visible mid-pick:\n{}",
+        rows.join("\n")
+    );
+    // `esc` restores it, byte-identical.
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(rig.config_text(), text, "esc restores the custom value");
+    // `↵` at rest opens the typed editor on the custom value; `↵` saves it
+    // unchanged (equal value writes nothing).
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    match &rig.app.services.shunt_field_edit.as_ref().unwrap().edit {
+        super::ShuntFieldEdit::Typed { input, .. } => {
+            assert_eq!(
+                input.value, "antigravity_cli",
+                "the editor opens on the custom value"
+            );
+        }
+        other => panic!("a cycle row's ↵ opens the typed editor, got {other:?}"),
+    }
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        text,
+        "saving the custom value unchanged writes nothing"
+    );
+}
+
+/// A bind save on a running gateway counts the live sessions the `stop shunt?`
+/// way, at 1 and N.
+#[cfg(unix)]
+#[test]
+fn a_bind_save_counts_the_live_sessions_in_the_confirm() {
+    use crate::daemon::gateway::GatewayState as S;
+    use crate::live_sessions::LiveTally;
+    use crate::profile::Profile;
+    let text = "[server]\nbind = \"127.0.0.1:3001\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    rig.app.config().profiles = vec![
+        Profile::new(
+            "gw".to_string(),
+            Some("http://127.0.0.1:3001".to_string()),
+            None,
+        ),
+        Profile::new(
+            "gw2".to_string(),
+            Some("http://127.0.0.1:3001".to_string()),
+            None,
+        ),
+    ];
+    crate::testutil::write_daemon_gateway_slot(&home, S::Healthy);
+    set_daemon(&mut rig.app, crate::daemon::DaemonHealth::Fresh);
+    super::recompute_services_checks(&mut rig.app, false, super::ShuntRefresh::Keep);
+
+    rig.app.live_sessions = LiveTally::of([crate::testutil::live_row("s1", "gw")]);
+    rig.focus_field(super::ShuntFieldKey::Bind);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    clear_and_save(&mut rig.app, "127.0.0.1:4000");
+    assert_eq!(
+        top_confirm(&rig.app).detail.as_deref(),
+        Some(
+            "bind is read at start; 1 live session uses it; in-flight requests drain, then it starts on 127.0.0.1:4000."
+        ),
+        "one live session"
+    );
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+
+    rig.app.live_sessions = LiveTally::of([
+        crate::testutil::live_row("s1", "gw"),
+        crate::testutil::live_row("s2", "gw2"),
+        crate::testutil::live_row("s3", "gw"),
+    ]);
+    // The first save moved the bind to 4000; the count reads the current bind.
+    rig.app.config().profiles = vec![
+        Profile::new(
+            "gw".to_string(),
+            Some("http://127.0.0.1:4000".to_string()),
+            None,
+        ),
+        Profile::new(
+            "gw2".to_string(),
+            Some("http://127.0.0.1:4000".to_string()),
+            None,
+        ),
+    ];
+    rig.focus_field(super::ShuntFieldKey::Bind);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    clear_and_save(&mut rig.app, "127.0.0.1:5000");
+    assert_eq!(
+        top_confirm(&rig.app).detail.as_deref(),
+        Some(
+            "bind is read at start; 3 live sessions use it; in-flight requests drain, then it starts on 127.0.0.1:5000."
+        ),
+        "three live sessions"
+    );
+}
+
+/// A model rename whose cascade touches references confirms with the count
+/// line for a model.
+#[cfg(unix)]
+#[test]
+fn a_model_rename_counts_its_cascade_and_confirms() {
+    use crate::tui::app::{ConfirmAction, ModelFieldKind, ShuntFieldKey, ShuntFocus};
+    let text = "[[models]]\nid = \"m\"\n\n[[models]]\nid = \"auto\"\n[models.router]\ntype = \"random\"\ntargets = [\"m[1m]\"]\n\n[[models]]\nid = \"sub\"\n[models.subagents]\ntype = \"passthrough\"\ntarget = \"m\"\n\n[[routes]]\nmodel = \"m\"\nprovider = \"p\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    rig.focus_field(ShuntFieldKey::Model {
+        id: "m".into(),
+        occurrence: 0,
+        field: ModelFieldKind::Id,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    clear_and_save(&mut rig.app, "n");
+    let state = top_confirm(&rig.app);
+    assert_eq!(state.message, "rename model \"m\" to \"n\"?");
+    assert_eq!(
+        state.detail.as_deref(),
+        Some("also renames it in 1 route · 1 router target · 1 subagent target."),
+        "one route, one router target and one subagent target name the model"
+    );
+    assert!(matches!(
+        state.on_confirm,
+        ConfirmAction::RenameField { .. }
+    ));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert!(
+        matches!(
+            rig.app.services.focused_shunt_focus(),
+            Some(ShuntFocus::Field {
+                key: ShuntFieldKey::Model { id, field: ModelFieldKind::Id, .. }
+            }) if id == "n"
+        ),
+        "focus follows the renamed model"
+    );
+}
+
+/// A rename with zero references saves like any field, with no confirm — an
+/// upstream and a model alike.
+#[cfg(unix)]
+#[test]
+fn a_zero_count_rename_saves_without_the_confirm() {
+    use crate::tui::app::{ConfirmAction, ModelFieldKind, ShuntFieldKey};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+
+    let mut rig = config_edit_rig(&home, "[[upstreams]]\nname = \"a\"\n");
+    rig.focus_field(ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Name,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    clear_and_save(&mut rig.app, "b");
+    assert!(
+        !rig.app.modals.iter().any(|m| matches!(m, super::Modal::Confirm(s) if matches!(s.on_confirm, ConfirmAction::RenameField { .. }))),
+        "a zero-count upstream rename confirms nothing"
+    );
+    rig.drain();
+    assert_eq!(rig.config_text(), "[[upstreams]]\nname = \"b\"\n");
+
+    // A model with no referencing route, router target or subagent target
+    // renames straight through too.
+    let mut rig = config_edit_rig(&home, "[[models]]\nid = \"m\"\n");
+    rig.focus_field(ShuntFieldKey::Model {
+        id: "m".into(),
+        occurrence: 0,
+        field: ModelFieldKind::Id,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    clear_and_save(&mut rig.app, "n");
+    assert!(
+        !rig.app.modals.iter().any(|m| matches!(m, super::Modal::Confirm(s) if matches!(s.on_confirm, ConfirmAction::RenameField { .. }))),
+        "a zero-count model rename confirms nothing"
+    );
+    rig.drain();
+    assert_eq!(rig.config_text(), "[[models]]\nid = \"n\"\n");
+}
+
+/// The field footer hints match the key handler: a typed row advertises Setup's
+/// `↵ edit value`, a cycle row `space cycle` / `↵ custom`.
+#[cfg(unix)]
+#[test]
+fn the_field_footer_hints_match_the_key_handler() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    let effort = super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Effort,
+    };
+    let kind = super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Kind,
+    };
+    rig.focus_field(effort);
+    let footer = footer_row(&rig.app, 120, 40);
+    assert!(
+        footer.contains("↵ edit value"),
+        "a typed row at rest advertises Setup's string: {footer}"
+    );
+    rig.focus_field(kind);
+    let footer = footer_row(&rig.app, 120, 40);
+    assert!(
+        footer.contains("space cycle") && footer.contains("↵ custom"),
+        "a cycle row at rest advertises both keys: {footer}"
+    );
+}
+
+/// A typed editor's caret slot shows the `✎` glyph (Setup's editor body, the
+/// native cursor owning the caret glyph).
+#[cfg(unix)]
+#[test]
+fn a_typed_editor_shows_the_pencil_glyph() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    let effort = super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Effort,
+    };
+    rig.focus_field(effort);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    let rows = shunt_config_rows(&rig.app);
+    let effort_row = rows
+        .iter()
+        .find(|r| r.contains("effort"))
+        .unwrap_or_else(|| panic!("no effort row:\n{}", rows.join("\n")));
+    assert_eq!(effort_row, "✎   effort", "the caret slot shows the pencil");
+}
+
+/// A pending cycle pick hints `↵ save` / `esc revert` — no caret to walk, so
+/// the typed editor's `←→ caret` sheds.
+#[cfg(unix)]
+#[test]
+fn a_pending_cycle_pick_hints_save_and_revert() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    let kind = super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Kind,
+    };
+    rig.focus_field(kind);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(' ')));
+    let footer = footer_row(&rig.app, 120, 40);
+    assert_eq!(
+        footer.trim(),
+        "↵ save   esc revert",
+        "a pending pick hints save and revert, no caret to walk"
+    );
+}
+
+/// The bind restart confirm's affirmative button reads `restart` and renders as
+/// a destructive button (DANGER fg, like its `stop shunt?` sibling): a bind
+/// restart drains in-flight requests and bounces every live session.
+#[cfg(unix)]
+#[test]
+fn the_bind_restart_confirm_labels_the_restart_button() {
+    use crate::daemon::gateway::GatewayState as S;
+    let text = "[server]\nbind = \"127.0.0.1:3001\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut rig = config_edit_rig(&home, text);
+    crate::testutil::write_daemon_gateway_slot(&home, S::Healthy);
+    set_daemon(&mut rig.app, crate::daemon::DaemonHealth::Fresh);
+    super::recompute_services_checks(&mut rig.app, false, super::ShuntRefresh::Keep);
+    rig.focus_field(super::ShuntFieldKey::Bind);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    clear_and_save(&mut rig.app, "127.0.0.1:4000");
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &rig.app))
+        .unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let button_row = rows
+        .iter()
+        .find(|r| r.contains("cancel"))
+        .unwrap_or_else(|| panic!("no button row:\n{}", rows.join("\n")));
+    assert!(
+        button_row.contains("restart"),
+        "the confirm's affirmative button reads restart: {button_row}"
+    );
+    // The `restart` button renders DANGER (unfocused: DANGER fg), like `stop`.
+    // The button row spells `cancel     restart` (five spaces), so `needle_cells`
+    // finds the button's own `restart`, never the message row's `restart shunt?`.
+    let cells = crate::testutil::needle_cells(term.backend().buffer(), "cancel     restart")
+        .unwrap_or_else(|| panic!("no restart button:\n{}", rows.join("\n")));
+    for cell in &cells[cells.len() - "restart".chars().count()..] {
+        assert_eq!(
+            cell.fg,
+            crate::tui::theme::danger_color(),
+            "the restart button renders in DANGER"
+        );
+    }
+}
+
+/// The rename confirm's affirmative button reads `rename`.
+#[cfg(unix)]
+#[test]
+fn the_rename_confirm_labels_the_rename_button() {
+    let text = "[[upstreams]]\nname = \"a\"\n\n[[routes]]\nmodel = \"m\"\nprovider = \"a\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    rig.focus_field(super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Name,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    clear_and_save(&mut rig.app, "b");
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &rig.app))
+        .unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let button_row = rows
+        .iter()
+        .find(|r| r.contains("cancel"))
+        .unwrap_or_else(|| panic!("no button row:\n{}", rows.join("\n")));
+    let interior = button_row
+        .split('│')
+        .map(str::trim)
+        .find(|s| s.contains("cancel"))
+        .expect("the button segment");
+    assert_eq!(
+        interior, "cancel     rename",
+        "the confirm's button row reads exactly cancel then rename: {button_row}"
+    );
+}
+
+/// The rename confirm escapes the typed name: a bidi override in the typed
+/// target renders as its visible `\u{…}` spelling, never raw (a raw bidi char
+/// could reorder the line the user confirms). The confirmed save writes the
+/// raw typed value.
+#[cfg(unix)]
+#[test]
+fn the_rename_confirm_escapes_the_typed_name() {
+    let text = "[[upstreams]]\nname = \"a\"\n\n[[routes]]\nmodel = \"m\"\nprovider = \"a\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    rig.focus_field(super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Name,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    clear_and_save(&mut rig.app, "a\u{202e}");
+    assert_eq!(
+        top_confirm(&rig.app).message,
+        "rename upstream \"a\" to \"a\\u{202e}\"?",
+        "the rename confirm escapes the typed name"
+    );
+    // The confirmed save lands the raw typed name — the actual U+202E bytes,
+    // never the `\u{…}` spelling the message shows.
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        "[[upstreams]]\nname = \"a\u{202e}\"\n\n[[routes]]\nmodel = \"m\"\nprovider = \"a\u{202e}\"\n"
+    );
+}
+
+/// The rename confirm escapes the name it renames FROM too: a config name
+/// carrying a bidi override renders as its `\u{…}` spelling in the message.
+#[cfg(unix)]
+#[test]
+fn the_rename_confirm_escapes_the_config_name() {
+    let text = "[[upstreams]]\nname = \"a\u{202e}\"\n\n[[routes]]\nmodel = \"m\"\nprovider = \"a\u{202e}\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    rig.focus_field(super::ShuntFieldKey::Upstream {
+        name: "a\u{202e}".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Name,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    clear_and_save(&mut rig.app, "b");
+    assert_eq!(
+        top_confirm(&rig.app).message,
+        "rename upstream \"a\\u{202e}\" to \"b\"?",
+        "the rename confirm escapes the config's own name"
+    );
+}
+
+/// The model arm of the same rule: a model id carrying a bidi override renders
+/// as its `\u{…}` spelling in the rename confirm.
+#[cfg(unix)]
+#[test]
+fn the_rename_confirm_escapes_the_model_id() {
+    use crate::tui::app::{ModelFieldKind, ShuntFieldKey};
+    let text =
+        "[[models]]\nid = \"m\u{202e}\"\n\n[[routes]]\nmodel = \"m\u{202e}\"\nprovider = \"p\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    rig.focus_field(ShuntFieldKey::Model {
+        id: "m\u{202e}".into(),
+        occurrence: 0,
+        field: ModelFieldKind::Id,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    clear_and_save(&mut rig.app, "n");
+    assert_eq!(
+        top_confirm(&rig.app).message,
+        "rename model \"m\\u{202e}\" to \"n\"?",
+        "the rename confirm escapes the model's own id"
     );
 }
 

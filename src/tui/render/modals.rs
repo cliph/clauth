@@ -493,7 +493,9 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
 
     // Destructive/global ops carry a DANGER cue on their confirm button.
     // `CaptureOverwrite` replaces an existing profile's credentials in
-    // place — irreversible like the other destructive actions here.
+    // place — irreversible like the other destructive actions here. A bind
+    // restart drains in-flight requests and bounces N live sessions' gateway,
+    // the same blast radius `StopShunt` is marked destructive for.
     let destructive = matches!(
         state.on_confirm,
         ConfirmAction::Switch(_)
@@ -506,6 +508,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             | ConfirmAction::DeleteLiveSession(_)
             | ConfirmAction::AddAdminTable
             | ConfirmAction::StopShunt
+            | ConfirmAction::RestartBind { .. }
     );
 
     // `AddChainCandidate` names the candidate in its confirm button so the
@@ -518,6 +521,8 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         ConfirmAction::AddAdminKey | ConfirmAction::AddAdminTable => "add".to_string(),
         ConfirmAction::StartDaemon => "start".to_string(),
         ConfirmAction::StopShunt => "stop".to_string(),
+        ConfirmAction::RestartBind { .. } => "restart".to_string(),
+        ConfirmAction::RenameField { .. } => "rename".to_string(),
         _ => "confirm".to_string(),
     };
 
@@ -1400,7 +1405,7 @@ fn labelled_input(label: &str, input: &InputState, focused: bool) -> Line<'stati
     };
     labelled_line(
         label,
-        Span::styled(input.value.clone(), value_style),
+        Span::styled(crate::tui::app::escape_control(&input.value), value_style),
         focused,
     )
 }

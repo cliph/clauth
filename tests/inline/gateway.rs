@@ -3384,6 +3384,129 @@ fn a_config_edited_during_the_check_is_never_overwritten() {
     );
 }
 
+/// Receive writer b's result from the channel, bounded by the same 120 s hang
+/// detector as the park wait; `stuck` names what a timeout means in the
+/// caller's branch. A disconnect (b's thread ended without sending) is a b
+/// panic: surface it through the join.
+#[cfg(unix)]
+fn recv_writer_b(
+    b_rx: std::sync::mpsc::Receiver<Result<()>>,
+    writer_b: std::thread::JoinHandle<()>,
+    stuck: &str,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match b_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match writer_b.join() {
+                Ok(()) => panic!("writer b finished without reporting its result"),
+                Err(e) => panic!("writer b panicked before reporting its result: {e:?}"),
+            },
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "writer b never finished within 120 s: {stuck}"
+        );
+    }
+}
+
+/// Two clauth writers of the same adopted config serialize their re-read +
+/// rename under the state flock: the writer that renames second refuses
+/// `ChangedDuringEdit` instead of silently overwriting the first one's bytes.
+///
+/// Deterministic and isolated: the seam parks the first writer (a) between its
+/// re-read and its rename, keyed to this test's config path, and the state
+/// flock's held state decides the two branches with no sleep. With the lock
+/// present the probe sees the flock held (a parked inside it), so b is blocked
+/// and refuses after a renames; with the lock removed the probe sees the flock
+/// free, so b re-reads the original (a is still parked) and renames first —
+/// both report success and the refusal pin reds.
+#[cfg(unix)]
+#[test]
+fn two_clauth_writers_serialize_so_the_second_refuses_changed_during_edit() {
+    let g = gate(USER_CONFIG);
+    let original = fs::read(&g.config).expect("read original");
+    let candidate_a = format!("{USER_CONFIG}# writer a\n");
+    let candidate_b = format!("{USER_CONFIG}# writer b\n");
+
+    let seam = ConfigWriteSeam::arm(g.config.clone());
+
+    let record = g.record.clone();
+    let a = candidate_a.clone();
+    let original_a = original.clone();
+    let writer_a = std::thread::spawn(move || write_checked(&record, &original_a, &a));
+    // Wait for the first writer to park, bounded as a hang detector (120 s),
+    // not a race bound: if writer a failed before its re-read, name its result
+    // instead of blocking this thread and every sibling behind `HOME_TEST_LOCK`.
+    let park_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        if seam.wait_for_park(std::time::Duration::from_millis(50)) {
+            break;
+        }
+        if writer_a.is_finished() {
+            let result = writer_a.join().expect("writer a joins");
+            panic!("writer a finished before parking in the critical section: {result:?}");
+        }
+        assert!(
+            std::time::Instant::now() < park_deadline,
+            "timed out waiting for the first writer to park in the critical section"
+        );
+    }
+
+    let record = g.record.clone();
+    let b = candidate_b.clone();
+    let original_b = original.clone();
+    let (b_tx, b_rx) = std::sync::mpsc::channel();
+    let writer_b = std::thread::spawn(move || {
+        let result = write_checked(&record, &original_b, &b);
+        let _ = b_tx.send(result);
+    });
+
+    let (a_result, b_result) = if seam.state_lock_is_held() {
+        // b is parked on the flock; release a so it renames, then b re-reads
+        // a's bytes and refuses.
+        seam.release();
+        let a_result = writer_a.join().expect("writer a joins");
+        let b_result = recv_writer_b(
+            b_rx,
+            writer_b,
+            "it stayed blocked after writer a released the state flock",
+        );
+        (a_result, b_result)
+    } else {
+        // The flock is free while a is parked: with no fence at all, b
+        // re-reads the original and renames first; any other fence leaves b
+        // blocked behind the parked a, which the bounded wait names instead of
+        // hanging.
+        let b_result = recv_writer_b(
+            b_rx,
+            writer_b,
+            "writer a parked with the state flock free, so something other than the state flock fences the critical section",
+        );
+        seam.release();
+        let a_result = writer_a.join().expect("writer a joins");
+        (a_result, b_result)
+    };
+
+    assert!(a_result.is_ok(), "writer a succeeds: {a_result:?}");
+    assert!(
+        matches!(
+            b_result
+                .as_ref()
+                .err()
+                .and_then(|e| e.downcast_ref::<ConfigEditRefusal>()),
+            Some(ConfigEditRefusal::ChangedDuringEdit { .. })
+        ),
+        "the second writer refuses ChangedDuringEdit, got {b_result:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&g.config).expect("read"),
+        candidate_a,
+        "the file holds writer a's bytes alone"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_symlinked_config_is_refused() {

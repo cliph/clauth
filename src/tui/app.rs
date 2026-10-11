@@ -931,6 +931,18 @@ pub(crate) enum ConfirmAction {
     StartDaemon,
     /// `stop shunt?`'s `stop`: the transient hold, if the verb still applies.
     StopShunt,
+    /// `restart shunt?`'s `restart`: save a bind edit whose restart the confirm
+    /// gates (only while the gateway is supervised and running).
+    RestartBind {
+        key: ShuntFieldKey,
+        edit: Box<crate::gateway_edit::Edit>,
+    },
+    /// `rename upstream|model …?`'s `rename`: save a rename whose cascade the
+    /// confirm counted.
+    RenameField {
+        key: ShuntFieldKey,
+        edit: Box<crate::gateway_edit::Edit>,
+    },
 }
 
 /// One-field name prompt shared by the Setup menu's two naming actions. The
@@ -1763,10 +1775,12 @@ pub(crate) struct Problem {
     pub(crate) fix: ServiceFix,
 }
 
-/// One actionable line on the `shunt` card: a fix (`f  <verb>`) or the
-/// `enabled` toggle row. Descended, ↑↓ pages the card one line at a time; an
-/// actionable line takes focus as it scrolls into view, read-only rows never
-/// do, and `f`/`space`/`↵` act only on the focused one.
+/// One actionable line on the `shunt` card: a fix (`f  <verb>`), the `enabled`
+/// toggle row, the `check output` line, or a config-section stop (an entry row
+/// whose `↵`/`space` toggles it expanded, or a field row whose `↵`/`space` opens
+/// it and `space` cycles a cycle row). Descended, ↑↓ pages the card one line at
+/// a time; an actionable line takes focus as it scrolls into view, read-only
+/// rows never do, and `f`/`space`/`↵` act only on the focused one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ShuntFocus {
     /// An `f  <verb>` line at this detail index.
@@ -1780,6 +1794,9 @@ pub(crate) enum ShuntFocus {
     /// `space` toggles it expanded. Not a `Check::detail` line: the render
     /// draws the config section after the detail lines.
     Entry { key: ShuntEntryKey },
+    /// A config-section field row (an editable `key value` line, or a cycle
+    /// row), whose `↵` opens it and `space` cycles a cycle row.
+    Field { key: ShuntFieldKey },
 }
 
 impl ShuntFocus {
@@ -1790,18 +1807,19 @@ impl ShuntFocus {
             ShuntFocus::Fix { line, .. }
             | ShuntFocus::Enabled { line }
             | ShuntFocus::CheckOutput { line } => Some(*line),
-            ShuntFocus::Entry { .. } => None,
+            ShuntFocus::Entry { .. } | ShuntFocus::Field { .. } => None,
         }
     }
 
     /// The fix this line applies, `None` on the `enabled`, `check output` and
-    /// config entry rows.
+    /// config entry/field rows.
     pub(crate) fn fix(&self) -> Option<&ServiceFix> {
         match self {
             ShuntFocus::Fix { fix, .. } => Some(fix),
             ShuntFocus::Enabled { .. }
             | ShuntFocus::CheckOutput { .. }
-            | ShuntFocus::Entry { .. } => None,
+            | ShuntFocus::Entry { .. }
+            | ShuntFocus::Field { .. } => None,
         }
     }
 
@@ -1811,6 +1829,7 @@ impl ShuntFocus {
             ShuntFocus::Enabled { .. } => ShuntFocusLine::Enabled,
             ShuntFocus::CheckOutput { .. } => ShuntFocusLine::CheckOutput,
             ShuntFocus::Entry { key } => ShuntFocusLine::Entry(key.clone()),
+            ShuntFocus::Field { key } => ShuntFocusLine::Field(key.clone()),
             ShuntFocus::Fix {
                 fix: ServiceFix::AdoptConfig(_),
                 ..
@@ -1849,6 +1868,8 @@ pub(crate) enum ShuntFocusLine {
     CheckOutput,
     /// A config-section entry row, by its identity.
     Entry(ShuntEntryKey),
+    /// A config-section field row, by its `(entry, field)` identity.
+    Field(ShuntFieldKey),
 }
 
 /// A config-section entry's identity: the group (the variant) plus the
@@ -1871,6 +1892,112 @@ pub(crate) enum ShuntEntryKey {
     },
     Route(usize),
 }
+
+/// A config field's identity on the shunt card: the entry it belongs to (a
+/// server field is keyed on its own, the variant alone) plus the field within
+/// it. Field rows are keyed by `(entry key, field)` — never a line index — so
+/// focus follows the edited row across a recompute: a rename follows the new
+/// name and the expanded set's key moves with it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ShuntFieldKey {
+    Bind,
+    DefaultProvider,
+    Upstream {
+        name: String,
+        occurrence: usize,
+        field: UpstreamFieldKind,
+    },
+    Model {
+        id: String,
+        occurrence: usize,
+        field: ModelFieldKind,
+    },
+    Route {
+        position: usize,
+        field: RouteFieldKind,
+    },
+}
+
+/// A field of an expanded upstream row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum UpstreamFieldKind {
+    Name,
+    Provider,
+    Kind,
+    BaseUrl,
+    AuthMode,
+    AuthAccount,
+    Accounts,
+    AuthEnv,
+    AuthHeader,
+    Effort,
+    ServiceTier,
+}
+
+/// A field of an expanded model row.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ModelFieldKind {
+    Id,
+    DisplayName,
+    /// One `upstream_model` entry, keyed by its provider.
+    UpstreamModel(String),
+}
+
+/// A field of an expanded route row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RouteFieldKind {
+    Model,
+    Provider,
+    UpstreamModel,
+    Effort,
+    ServiceTier,
+}
+
+/// The shunt card's open field editor (or a cycle row's pending pick). `None`
+/// at rest, when a field row shows `❯` + its value.
+#[derive(Debug, Clone)]
+pub(crate) enum ShuntFieldEdit {
+    /// A typed row's open editor — a typed row's `↵`, or a cycle row's `↵` at
+    /// rest, which opens the custom-value editor. `input` holds the typed text;
+    /// `saved` the value the editor opened on (`None` = unset), so `esc`
+    /// restores it exactly.
+    Typed {
+        input: InputState,
+        saved: Option<String>,
+    },
+    /// A cycle row's pending pick after `space` moved it: `picked` is the
+    /// unsaved pick (the row shows `✎`, nothing written), `saved` the file's
+    /// value. `↵` saves the pick, `esc` restores `saved`.
+    Pick {
+        saved: Option<String>,
+        picked: String,
+    },
+}
+
+/// One field save in flight: the row's key (so the render spinner/shimmer the
+/// right row) and when it started (the `✓` holds for about a second).
+#[derive(Debug, Clone)]
+pub(crate) struct ShuntSave {
+    pub(crate) key: ShuntFieldKey,
+    pub(crate) started: std::time::Instant,
+    /// The value being saved (`None` = unset), which the saving row renders
+    /// under the shimmer crest (the editor stays open with the typed text, but
+    /// the row shows the value the save checks).
+    pub(crate) value: Option<String>,
+}
+
+/// The shunt card's open field editor: which field, its edit state, and a
+/// refusal's own sentence (rendered on the `└` DANGER line under the field,
+/// the editor kept open with the typed text). `None` at rest.
+#[derive(Debug, Clone)]
+pub(crate) struct ShuntFieldEditState {
+    pub(crate) key: ShuntFieldKey,
+    pub(crate) edit: ShuntFieldEdit,
+    pub(crate) refusal: Option<String>,
+}
+
+/// How long a field's caret slot shows the `SUCCESS` `✓` after its save lands.
+pub(crate) const SHUNT_OK_MS: u64 = 1000;
 
 /// The adopted config read through [`crate::gateway_edit::read_view`] on the
 /// recompute. The render draws the card's config section from it.
@@ -2090,6 +2217,15 @@ pub(crate) enum ShuntActionJob {
     Hold,
     /// `start shunt` on a held gateway: remove the hold.
     RemoveHold,
+    /// Save one config field through the E1 engine (`apply_edit`), off the UI
+    /// thread. `key` rides back in the outcome so the row can spinner/`✓` it;
+    /// `confirmed` names a save that went through the `restart shunt?` confirm.
+    ConfigEdit {
+        record: crate::gateway::GatewayRecord,
+        edit: Box<crate::gateway_edit::Edit>,
+        key: ShuntFieldKey,
+        confirmed: bool,
+    },
 }
 
 /// The result of one shunt-card action, drained on the tick into a toast and a
@@ -2145,6 +2281,35 @@ pub(crate) enum ShuntActionOutcome {
     /// recompute so the card reads the record's real state.
     #[default]
     NoOp,
+    /// A config field save landed: the `✓` shows on the row, and (for a
+    /// confirmed written bind) the restart toast. `value` is what was saved
+    /// (`None` = unset, the bind for the restart toast); `restart_only` names
+    /// a bind save; `confirmed` says it went through the restart confirm.
+    ConfigSaved {
+        key: ShuntFieldKey,
+        written: bool,
+        restart_only: bool,
+        value: Option<String>,
+        confirmed: bool,
+    },
+    /// The engine refused the edit on the input or the file's shape: its own
+    /// sentence renders on the `└` DANGER line under the field, the editor
+    /// kept open.
+    ConfigRefused {
+        key: ShuntFieldKey,
+        sentence: String,
+    },
+    /// `shunt check` (or the landing) refused: the compact detail line and the
+    /// held `check output`, as the admin edit surfaces them.
+    ConfigCheckFailed {
+        error: String,
+        check_output: Option<crate::gateway::CheckStderr>,
+        config: std::path::PathBuf,
+    },
+    /// An engine bug or an untyped failure: `save failed` + the error chain.
+    ConfigFailed {
+        error: String,
+    },
 }
 
 /// The one-shot worker behind the shunt card's confirmed actions: at most one
@@ -2264,6 +2429,14 @@ pub(crate) struct ServicesState {
     /// Which config entry rows are expanded, keyed by the entry's identity.
     /// Dropped keys whose entry left the config are pruned on the recompute.
     pub(crate) shunt_expanded: HashSet<ShuntEntryKey>,
+    /// The shunt card's open field editor; `None` at rest.
+    pub(crate) shunt_field_edit: Option<ShuntFieldEditState>,
+    /// One field save in flight; the row renders the spinner + shimmer +
+    /// `checking` while it runs.
+    pub(crate) shunt_save: Option<ShuntSave>,
+    /// The field whose save just landed and when — its caret slot shows `✓`
+    /// for about a second, then the normal caret.
+    pub(crate) shunt_ok: Option<(ShuntFieldKey, Instant)>,
     /// The cached standalone-store move plan (`None` = not yet planned). The
     /// plan runs on a worker — it spawns `ps`/`powershell` on macOS/Windows —
     /// on tab entry, on `r`, and after any shunt-card action lands.
@@ -2289,6 +2462,11 @@ pub(crate) struct ServicesState {
     pub(crate) pool_probe: ProbeWorker<PoolOutcome>,
     /// The worker running one confirmed shunt-card action at a time.
     pub(crate) shunt_action: ShuntActionWorker,
+    /// The worker running one config field save at a time, apart from
+    /// [`Self::shunt_action`] so a running stop/start/adopt/admin action can
+    /// neither block nor be blocked by a save. Its `running` is the one-save
+    /// guard; a panicked save drains as a failed outcome that clears it.
+    pub(crate) shunt_save_worker: ShuntActionWorker,
     /// The `shunt` detail's focused actionable line, by its kind. Owned by the
     /// key handler and the recompute; the render reads it to draw the caret,
     /// and re-settles it (the descend rule) where it publishes the geometry
@@ -2374,6 +2552,9 @@ impl Default for ServicesState {
             shunt_record: None,
             shunt_config: None,
             shunt_expanded: HashSet::new(),
+            shunt_field_edit: None,
+            shunt_save: None,
+            shunt_ok: None,
             move_plan: None,
             move_plan_probe: ProbeWorker::new(move_plan_probe),
             admin_need: None,
@@ -2381,6 +2562,7 @@ impl Default for ServicesState {
             pool: None,
             pool_probe: ProbeWorker::new(pool_probe),
             shunt_action: ShuntActionWorker::new(run_shunt_action),
+            shunt_save_worker: ShuntActionWorker::new(run_shunt_action),
             shunt_focus: std::cell::RefCell::new(None),
             shunt_stop_rows: std::cell::RefCell::new(Vec::new()),
             shunt_viewport: std::cell::Cell::new(0),
@@ -2458,6 +2640,14 @@ impl ServicesState {
         }
         let scroll = self.detail_scroll.min(self.detail_max_scroll.get());
         shunt_in_view(scroll, self.shunt_viewport.get() as usize, rows[i]).then_some(&stops[i])
+    }
+
+    /// Whether a save for `key` is still checking (its own worker in flight).
+    /// The one predicate every render, key-handler and footer site reads, so a
+    /// hint, a spinner, the editor lock and a re-open guard can never disagree
+    /// about which row is busy.
+    pub(crate) fn saving(&self, key: &ShuntFieldKey) -> bool {
+        self.shunt_save.as_ref().is_some_and(|s| s.key == *key)
     }
 
     /// The held focus identity, cloned out of the interior-mutability cell.
@@ -4413,6 +4603,9 @@ pub(crate) enum KeyOwner {
     WeeklyThreshold,
     /// The Services tab's herdr tag-refresh field.
     HerdrTag,
+    /// The shunt card's open config field editor (a typed field or a pending
+    /// cycle pick).
+    ShuntField,
     /// The usage tab's note editor (the `n`-opened draft on the selected
     /// account).
     NoteEditor,
@@ -4421,9 +4614,27 @@ pub(crate) enum KeyOwner {
 impl KeyOwner {
     /// Whether this owner takes `code`, or lets it through to the global keys.
     /// The chip picker binds neither `?` nor `x`, so help and toast dismissal
-    /// work mid-pick; a typed field takes both, since they are data there.
-    pub(crate) fn claims(self, code: KeyCode) -> bool {
-        !(self == Self::DayPicker && matches!(code, KeyCode::Char('?' | 'x')))
+    /// work mid-pick; a typed field takes both, since they are data there. A
+    /// shunt editor whose row is saving is locked — only the editing keys are
+    /// inert, so `?` (help) and `x` (dismiss a toast) fall through while `↑↓`
+    /// and `q` (back) stay claimed and act in the editor's own handler (`q`
+    /// closes the editor and ascends, so a locked editor never outlives the
+    /// detail focus).
+    pub(crate) fn claims(self, app: &App, code: KeyCode) -> bool {
+        if self == Self::DayPicker && matches!(code, KeyCode::Char('?' | 'x')) {
+            return false;
+        }
+        if self == Self::ShuntField
+            && app
+                .services
+                .shunt_field_edit
+                .as_ref()
+                .is_some_and(|state| app.services.saving(&state.key))
+            && matches!(code, KeyCode::Char('?' | 'x'))
+        {
+            return false;
+        }
+        true
     }
 }
 
@@ -4458,6 +4669,7 @@ pub(crate) fn keyboard_owner(app: &App) -> Option<KeyOwner> {
         Tab::Config if app.context_nudge_draft.is_some() => Some(KeyOwner::ContextNudge),
         Tab::Config if app.weekly_threshold_draft.is_some() => Some(KeyOwner::WeeklyThreshold),
         Tab::Services if app.services.herdr_tag_draft.is_some() => Some(KeyOwner::HerdrTag),
+        Tab::Services if app.services.shunt_field_edit.is_some() => Some(KeyOwner::ShuntField),
         Tab::Usage if app.note_editor.is_some() => Some(KeyOwner::NoteEditor),
         Tab::Overview
         | Tab::Usage
@@ -4483,7 +4695,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     // A modal, then an open editor, owns the keyboard: typed digits and
     // letters can't trip global shortcuts, and ←/→ never switch the tab. A key
     // the owner does not claim falls through to the global senses below.
-    if let Some(owner) = keyboard_owner(app).filter(|owner| owner.claims(key.code)) {
+    if let Some(owner) = keyboard_owner(app).filter(|owner| owner.claims(app, key.code)) {
         match owner {
             KeyOwner::Modal => handle_modal_key(app, key),
             KeyOwner::SetupField | KeyOwner::NewAccountField => handle_config_edit_key(app, key),
@@ -4493,6 +4705,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             KeyOwner::ContextNudge => handle_context_nudge_edit_key(app, key),
             KeyOwner::WeeklyThreshold => handle_weekly_threshold_edit_key(app, key),
             KeyOwner::HerdrTag => handle_herdr_tag_edit_key(app, key),
+            KeyOwner::ShuntField => handle_shunt_field_edit_key(app, key),
             KeyOwner::NoteEditor => handle_note_editor_key(app, key),
         }
         return;
@@ -4648,7 +4861,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             } else if app.tab == Tab::Status && app.status.focus == StatusFocus::Detail {
                 app.status.focus = StatusFocus::List;
             } else if app.tab == Tab::Services && app.services.focus == ServicesFocus::Detail {
-                app.services.focus = ServicesFocus::List;
+                if !shunt_esc_folds_entry(app) {
+                    leave_shunt_detail(app);
+                }
             } else if app.tab == Tab::Tokens && app.token_view == TokenView::Models {
                 app.token_view = TokenView::Dashboard;
             }
@@ -4671,7 +4886,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 } else if app.tab == Tab::Tokens {
                     app.token_view = TokenView::Dashboard;
                 } else if app.tab == Tab::Services {
-                    app.services.focus = ServicesFocus::List;
+                    leave_shunt_detail(app);
                 } else {
                     app.status.focus = StatusFocus::List;
                 }
@@ -4930,7 +5145,7 @@ fn switch_tab(app: &mut App, tab: Tab) {
             app.status.focus = StatusFocus::List;
         }
         Tab::Services => {
-            app.services.focus = ServicesFocus::List;
+            leave_shunt_detail(app);
             app.services.cursor = 0;
             app.services.detail_scroll = 0;
             // Entering the tab clears an open tag editor the same way the
@@ -5495,7 +5710,9 @@ fn handle_plugin_problems_key(app: &mut App, key: KeyEvent) {
 
 /// The shunt detail's keymap: ↑↓ walks the actionable lines (landing on each
 /// as it scrolls into view, one line at a time through the read-only text),
-/// `f` applies the focused fix, `space`/`↵` flip the focused `enabled` row.
+/// `f` applies the focused fix, `space`/`↵` act on the focused line (flip the
+/// `enabled` toggle, open the `check output` modal, expand/collapse a config
+/// entry, or open/step a config field editor — `space` cycles a cycle field).
 /// Focus is the key handler's own state (a [`ShuntFocusLine`] identity); the
 /// render reads it and re-settles it (the descend rule) when a resize or a
 /// card change pushed the held line out of view. Only the shunt detail routes
@@ -5508,12 +5725,35 @@ fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
         KeyCode::PageUp => shunt_page(app, false),
         KeyCode::PageDown => shunt_page(app, true),
         KeyCode::Char('f') => apply_service_fix(app),
-        KeyCode::Enter | KeyCode::Char(' ') => match app.services.focused_shunt_focus() {
+        KeyCode::Enter => match app.services.focused_shunt_focus() {
             Some(ShuntFocus::Enabled { .. }) => toggle_shunt_enabled(app),
             Some(ShuntFocus::CheckOutput { .. }) => open_check_output_modal(app),
             Some(ShuntFocus::Entry { key }) => {
                 let key = key.clone();
                 toggle_shunt_entry(app, &key);
+            }
+            Some(ShuntFocus::Field { key }) => {
+                let key = key.clone();
+                open_shunt_field_editor(app, &key);
+            }
+            Some(ShuntFocus::Fix { .. }) | None => {}
+        },
+        KeyCode::Char(' ') => match app.services.focused_shunt_focus() {
+            Some(ShuntFocus::Enabled { .. }) => toggle_shunt_enabled(app),
+            Some(ShuntFocus::CheckOutput { .. }) => open_check_output_modal(app),
+            Some(ShuntFocus::Entry { key }) => {
+                let key = key.clone();
+                toggle_shunt_entry(app, &key);
+            }
+            Some(ShuntFocus::Field { key }) => {
+                let key = key.clone();
+                // `space` on a cycle row moves the pick; on a typed row it
+                // opens the editor, like `↵`.
+                if is_cycle_field(&key) {
+                    step_shunt_pick(app, &key);
+                } else {
+                    open_shunt_field_editor(app, &key);
+                }
             }
             Some(ShuntFocus::Fix { .. }) | None => {}
         },
@@ -5747,6 +5987,441 @@ fn toggle_shunt_entry(app: &mut App, key: &ShuntEntryKey) {
     if !app.services.shunt_expanded.remove(key) {
         app.services.shunt_expanded.insert(key.clone());
     }
+    rebuild_shunt_config_stops(app);
+}
+
+/// Re-derive the card's cached config stops in the same call that changed the
+/// expanded set, so the walk and the render agree at once (the render calls the
+/// same [`config_field_stops`] over the same view and expanded set every frame).
+/// The action-section stops (every stop with a detail line) are kept; the
+/// config section is replaced from the one row model.
+fn rebuild_shunt_config_stops(app: &mut App) {
+    let Some(stops) =
+        config_view(app).map(|view| config_field_stops(view, &app.services.shunt_expanded))
+    else {
+        return;
+    };
+    let Some(check) = app.services.checks.iter_mut().find(|c| c.label == "shunt") else {
+        return;
+    };
+    check.shunt_focus.truncate(
+        check
+            .shunt_focus
+            .iter()
+            .take_while(|s| s.line().is_some())
+            .count(),
+    );
+    check.shunt_focus.extend(stops);
+}
+
+// ── the config field editor ─────────────────────────────────────────────────
+
+/// The entry a field row belongs to; `None` on a server field.
+fn field_entry(key: &ShuntFieldKey) -> Option<ShuntEntryKey> {
+    match key {
+        ShuntFieldKey::Bind | ShuntFieldKey::DefaultProvider => None,
+        ShuntFieldKey::Upstream {
+            name, occurrence, ..
+        } => Some(ShuntEntryKey::Upstream {
+            name: name.clone(),
+            occurrence: *occurrence,
+        }),
+        ShuntFieldKey::Model { id, occurrence, .. } => Some(ShuntEntryKey::Model {
+            id: id.clone(),
+            occurrence: *occurrence,
+        }),
+        ShuntFieldKey::Route { position, .. } => Some(ShuntEntryKey::Route(*position)),
+    }
+}
+
+/// Whether `key` is a rename field (upstream `name`, model `id`), whose save
+/// dry-runs the cascade and confirms before writing.
+fn is_rename_field(key: &ShuntFieldKey) -> bool {
+    matches!(
+        key,
+        ShuntFieldKey::Upstream {
+            field: UpstreamFieldKind::Name,
+            ..
+        } | ShuntFieldKey::Model {
+            field: ModelFieldKind::Id,
+            ..
+        }
+    )
+}
+
+/// Open one field's typed editor, seeded from the saved value (`None` = unset).
+/// Both `↵` and `space` open a typed row; a cycle row's `↵` at rest opens the
+/// same custom-value editor. A row whose save is still checking never reopens a
+/// fresh editor over the file's value: `↵`/`space` are inert there, so a
+/// refusal landing later toasts instead of describing text the editor no
+/// longer shows.
+fn open_shunt_field_editor(app: &mut App, key: &ShuntFieldKey) {
+    if app.services.saving(key) {
+        return;
+    }
+    let saved = config_view(app).and_then(|view| shunt_field_value(view, key).flatten());
+    let input = InputState::new(saved.as_deref().unwrap_or(""));
+    app.services.shunt_field_edit = Some(ShuntFieldEditState {
+        key: key.clone(),
+        edit: ShuntFieldEdit::Typed { input, saved },
+        refusal: None,
+    });
+}
+
+/// The next cycle pick after the current value, wrapping; a value outside the
+/// set (or none) lands on the first option.
+fn next_pick(options: &[&str], current: Option<&str>) -> String {
+    match current.and_then(|c| options.iter().position(|o| *o == c)) {
+        Some(i) => options[(i + 1) % options.len()].to_string(),
+        None => options[0].to_string(),
+    }
+}
+
+/// `space` on a cycle row: move the pick to the next option (nothing written),
+/// or advance an already-pending pick. A row whose save is still checking never
+/// opens a fresh pick (same inert rule as the typed editor).
+fn step_shunt_pick(app: &mut App, key: &ShuntFieldKey) {
+    if app.services.saving(key) {
+        return;
+    }
+    let Some(value) = config_view(app).and_then(|view| shunt_field_value(view, key)) else {
+        return;
+    };
+    let options = cycle_options(key);
+    let (current, saved) = match &app.services.shunt_field_edit {
+        Some(state) if state.key == *key => match &state.edit {
+            ShuntFieldEdit::Pick { saved, picked } => (Some(picked.clone()), saved.clone()),
+            _ => (value.clone(), value),
+        },
+        _ => (value.clone(), value),
+    };
+    let picked = next_pick(options, current.as_deref());
+    app.services.shunt_field_edit = Some(ShuntFieldEditState {
+        key: key.clone(),
+        edit: ShuntFieldEdit::Pick { saved, picked },
+        refusal: None,
+    });
+}
+
+/// Keystrokes while a config field editor is open: `↵` commits, `esc` restores
+/// the saved value and leaves the editor, `space` steps a pending cycle pick,
+/// every other key edits the typed buffer (a pending pick takes neither).
+fn handle_shunt_field_edit_key(app: &mut App, key: KeyEvent) {
+    let Some(state) = app.services.shunt_field_edit.clone() else {
+        return;
+    };
+    // While this row's save is checking, its editor is locked: no key edits
+    // its text or closes it (the footer drops its edit hints), but focus may
+    // still move away — the outcome then toasts instead of the `└` line. `↑↓`
+    // step off the row (closing the editor) and `q` ascends to the list; both
+    // stay claimed here so neither reaches a global binding that would leave
+    // the editor open on a list-focused screen.
+    if app.services.saving(&state.key) {
+        match key.code {
+            KeyCode::Up | KeyCode::Down => {
+                app.services.shunt_field_edit = None;
+                shunt_step(app, key.code == KeyCode::Down);
+            }
+            KeyCode::Char('q') => leave_shunt_detail(app),
+            _ => {}
+        }
+        return;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            app.services.shunt_field_edit = None;
+        }
+        KeyCode::Enter => commit_shunt_field(app, &state.key),
+        KeyCode::Char(' ') if matches!(state.edit, ShuntFieldEdit::Pick { .. }) => {
+            step_shunt_pick(app, &state.key);
+        }
+        _ => {
+            if let Some(s) = app.services.shunt_field_edit.as_mut()
+                && let ShuntFieldEdit::Typed { input, .. } = &mut s.edit
+            {
+                apply_input_edit(input, key);
+            }
+        }
+    }
+}
+
+/// `↵` in a field editor: build the edit and either save it (through a confirm
+/// for a bind restart or a cascading rename) or show the dry run's refusal.
+fn commit_shunt_field(app: &mut App, key: &ShuntFieldKey) {
+    let Some(state) = app.services.shunt_field_edit.clone() else {
+        return;
+    };
+    let typed = match &state.edit {
+        ShuntFieldEdit::Typed { input, .. } => input.value.clone(),
+        ShuntFieldEdit::Pick { picked, .. } => picked.clone(),
+    };
+    let Some(record) = app.services.shunt_record.clone() else {
+        return;
+    };
+    let Some(view) = config_view(app).cloned() else {
+        return;
+    };
+    let Some(edit) = edit_for_field(&view, key, &typed) else {
+        return;
+    };
+
+    // A rename dry-runs the same edit (no write, no check) and counts what
+    // else it touches; any count confirms first.
+    if is_rename_field(key) {
+        match crate::gateway_edit::plan_cascade(&record, &edit) {
+            Ok(Some(cascade)) if cascade_has_refs(&cascade, key) => {
+                let counts = rename_counts_line(&cascade, key);
+                let kind = match key {
+                    ShuntFieldKey::Upstream { .. } => "upstream",
+                    _ => "model",
+                };
+                let from = rename_from(key);
+                app.disarm_quit();
+                app.open_modal(Modal::Confirm(ConfirmState {
+                    message: format!(
+                        "rename {kind} \"{from}\" to \"{}\"?",
+                        escape_control(&typed)
+                    ),
+                    detail: Some(format!("also renames it in {counts}.")),
+                    choice: false,
+                    scroll: ConfirmScroll::default(),
+                    on_confirm: ConfirmAction::RenameField {
+                        key: key.clone(),
+                        edit: Box::new(edit),
+                    },
+                }));
+                return;
+            }
+            Err(e) => {
+                show_field_refusal(app, key, &e);
+                return;
+            }
+            Ok(_) => {}
+        }
+    }
+
+    // A bind save restarts the gateway: confirm while supervised and running
+    // (and the value actually changed — an equal-value save writes nothing;
+    // an emptied bind over an unset one is no change either).
+    if key == &ShuntFieldKey::Bind {
+        let changed = match &state.edit {
+            ShuntFieldEdit::Typed { saved, .. } => saved.as_deref().unwrap_or("") != typed.as_str(),
+            ShuntFieldEdit::Pick { .. } => true,
+        };
+        if changed && bind_save_needs_confirm(app) {
+            let detail = bind_restart_detail(app, &typed);
+            app.disarm_quit();
+            app.open_modal(Modal::Confirm(ConfirmState {
+                message: "restart shunt?".to_string(),
+                detail: Some(detail),
+                choice: false,
+                scroll: ConfirmScroll::default(),
+                on_confirm: ConfirmAction::RestartBind {
+                    key: key.clone(),
+                    edit: Box::new(edit),
+                },
+            }));
+            return;
+        }
+    }
+
+    start_field_save(app, key.clone(), edit, false);
+}
+
+/// The rename confirm's `from`: the entry's current name/id, control-escaped
+/// like every config-derived string a modal shows.
+fn rename_from(key: &ShuntFieldKey) -> String {
+    match key {
+        ShuntFieldKey::Upstream { name, .. } => escape_control(name),
+        ShuntFieldKey::Model { id, .. } => escape_control(id),
+        _ => String::new(),
+    }
+}
+
+/// Whether a rename's cascade touches any other reference (a zero-count rename
+/// saves like any field).
+fn cascade_has_refs(cascade: &crate::gateway_edit::Cascade, key: &ShuntFieldKey) -> bool {
+    match key {
+        ShuntFieldKey::Upstream { .. } => {
+            cascade.routes
+                + cascade.models
+                + cascade.default_provider
+                + cascade.route_prefixes
+                + cascade.codex_endpoint
+                + cascade.codex_routes
+                > 0
+        }
+        ShuntFieldKey::Model { .. } => {
+            cascade.route_models + cascade.routers + cascade.subagents > 0
+        }
+        _ => false,
+    }
+}
+
+/// The rename confirm's count line: singular at 1, a kind at 0 left out, joined
+/// by ` · `.
+fn rename_counts_line(cascade: &crate::gateway_edit::Cascade, key: &ShuntFieldKey) -> String {
+    let count = |n: usize, one: &str, many: &str| match n {
+        0 => None,
+        1 => Some(one.to_string()),
+        n => Some(format!("{n} {many}")),
+    };
+    let mut parts = Vec::new();
+    match key {
+        ShuntFieldKey::Upstream { .. } => {
+            parts.extend(count(cascade.routes, "1 route", "routes"));
+            parts.extend(count(
+                cascade.default_provider,
+                "default_provider",
+                "default_provider",
+            ));
+            parts.extend(count(cascade.models, "1 model mapping", "model mappings"));
+            parts.extend(count(
+                cascade.route_prefixes,
+                "1 route prefix",
+                "route prefixes",
+            ));
+            parts.extend(count(
+                cascade.codex_endpoint,
+                "codex_endpoint",
+                "codex_endpoint",
+            ));
+            parts.extend(count(cascade.codex_routes, "1 codex route", "codex routes"));
+        }
+        ShuntFieldKey::Model { .. } => {
+            parts.extend(count(cascade.route_models, "1 route", "routes"));
+            parts.extend(count(cascade.routers, "1 router target", "router targets"));
+            parts.extend(count(
+                cascade.subagents,
+                "1 subagent target",
+                "subagent targets",
+            ));
+        }
+        _ => {}
+    }
+    parts.join(" · ")
+}
+
+/// Whether a bind save needs the restart confirm: the gateway is supervised and
+/// running (`starting`, `healthy` or `unhealthy`).
+fn bind_save_needs_confirm(app: &App) -> bool {
+    use crate::daemon::gateway::GatewayState;
+    let (slot, supervised) = crate::daemon::gateway_slot(app.daemon_health);
+    supervised
+        && matches!(
+            slot.state,
+            GatewayState::Starting | GatewayState::Healthy | GatewayState::Unhealthy
+        )
+}
+
+/// The live-session count clause both the `stop shunt?` and the `restart
+/// shunt?` confirms lead with: `1 live session uses it; ` at one, `N live
+/// sessions use it; ` above one, absent at 0 and when clauth cannot count.
+fn live_sessions_clause(app: &App) -> String {
+    match gateway_session_count(app) {
+        Some(1) => "1 live session uses it; ".to_string(),
+        Some(n) if n > 1 => format!("{n} live sessions use it; "),
+        Some(_) | None => String::new(),
+    }
+}
+
+/// The `restart shunt?` detail, its live-session count the `stop shunt?` way
+/// (the count clause absent at 0 and when clauth cannot count). An emptied bind
+/// reads the target as shunt's default, never a bare trailing "on .".
+fn bind_restart_detail(app: &App, bind: &str) -> String {
+    let target = if bind.is_empty() {
+        format!("shunt's default, {}", crate::gateway::SHUNT_DEFAULT_BIND)
+    } else {
+        escape_control(bind)
+    };
+    format!(
+        "bind is read at start; {}in-flight requests drain, then it starts on {target}.",
+        live_sessions_clause(app)
+    )
+}
+
+/// Show a save's failure: an [`EditRefusal`] renders its own sentence on the
+/// field's `└` line (the editor kept open with the typed text); any other
+/// failure — an engine bug or an untyped read error — toasts `save failed` +
+/// the chain, never the `└` line.
+fn show_field_refusal(app: &mut App, key: &ShuntFieldKey, err: &anyhow::Error) {
+    if let Some(refusal) = err.downcast_ref::<crate::gateway_edit::EditRefusal>() {
+        if let Some(state) = app.services.shunt_field_edit.as_mut()
+            && state.key == *key
+        {
+            state.refusal = Some(refusal.to_string());
+        }
+    } else {
+        app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&error_toast_detail(err))),
+        );
+    }
+}
+
+/// Start the save worker for one field (its own worker; the outcome drains on
+/// the tick). One save at a time — the worker's own `running` is the guard —
+/// and the editor stays open with the typed text until the outcome lands.
+fn start_field_save(
+    app: &mut App,
+    key: ShuntFieldKey,
+    edit: crate::gateway_edit::Edit,
+    confirmed: bool,
+) {
+    if app.services.shunt_save_worker.running {
+        app.toast(
+            ToastKind::Info,
+            "a save is still checking\nwait for it, then save again",
+        );
+        return;
+    }
+    let Some(record) = app.services.shunt_record.clone() else {
+        return;
+    };
+    app.services.shunt_save = Some(ShuntSave {
+        key: key.clone(),
+        started: Instant::now(),
+        value: edit_save_value(&edit),
+    });
+    app.services
+        .shunt_save_worker
+        .start(ShuntActionJob::ConfigEdit {
+            record,
+            edit: Box::new(edit),
+            key,
+            confirmed,
+        });
+}
+
+/// Ascend off the shunt detail: close any open field editor and move focus to
+/// the list. Every site that moves `services.focus` off the shunt detail (the
+/// global `esc` and `q` ascend arms, the tab jump's Services reset, and the
+/// locked editor's own `q`) goes through here, so the state "list focused,
+/// editor open" cannot exist — an editor left open would keep owning the
+/// keyboard on a pane that does not hold focus.
+fn leave_shunt_detail(app: &mut App) {
+    app.services.shunt_field_edit = None;
+    app.services.focus = ServicesFocus::List;
+}
+
+/// `esc` on a field row that is not editing: fold its entry (back to the entry
+/// row). Returns `true` when it folded; a server field row (or no field focus)
+/// leaves it to ascend as today.
+fn shunt_esc_folds_entry(app: &mut App) -> bool {
+    let Some(focus) = app.services.focused_shunt_focus().cloned() else {
+        return false;
+    };
+    let ShuntFocus::Field { key } = focus else {
+        return false;
+    };
+    let Some(entry) = field_entry(&key) else {
+        return false;
+    };
+    app.services.shunt_expanded.remove(&entry);
+    rebuild_shunt_config_stops(app);
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Entry(entry)));
+    true
 }
 
 /// Open the read-only `check output` modal over the held failed-check stderr,
@@ -6539,11 +7214,14 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool, shunt: ShuntR
         app.services.pool.as_ref(),
         app.services.check_output.is_some(),
     );
-    // The config entry rows join the focus walk after the action section, in
-    // card order (upstreams, models, routes); the render draws them in the
-    // same order, so the published geometry stays parallel to this list.
+    // The config rows join the focus walk after the action section, in card
+    // order (server fields, then each entry and its expanded fields); the
+    // render draws them in the same order, so the published geometry stays
+    // parallel to this list.
     if let Some(ShuntConfigRead::Ok(view)) = &app.services.shunt_config {
-        shunt.shunt_focus.extend(config_entry_stops(view));
+        shunt
+            .shunt_focus
+            .extend(config_field_stops(view, &app.services.shunt_expanded));
     }
     checks.push(shunt);
 
@@ -6658,11 +7336,13 @@ fn drain_service_probes(app: &mut App) {
     let move_plan = app.services.move_plan_probe.drain();
     let pool = app.services.pool_probe.drain();
     let action = app.services.shunt_action.drain();
+    let save = app.services.shunt_save_worker.drain();
     if herdr.is_none()
         && standalone.is_none()
         && move_plan.is_none()
         && pool.is_none()
         && action.is_none()
+        && save.is_none()
     {
         return;
     }
@@ -6679,8 +7359,22 @@ fn drain_service_probes(app: &mut App) {
     if let Some(readout) = pool {
         app.services.pool = Some(readout);
     }
-    let action_landed = action.is_some();
+    let action_landed = action.is_some() || save.is_some();
     if let Some(outcome) = action {
+        handle_shunt_action_outcome(app, outcome);
+    }
+    if let Some(outcome) = save {
+        // The save worker runs only `ConfigEdit`, which never yields `NoOp`,
+        // so a `NoOp` here is a panicked save: it drains as a failed outcome
+        // that clears the guard and keeps the editor open. A panic can land
+        // only before the staged rename (the rename is the write's last step
+        // and everything after it is pure), so nothing was written holds.
+        let outcome = match outcome {
+            ShuntActionOutcome::NoOp => ShuntActionOutcome::ConfigFailed {
+                error: "the save stopped unexpectedly; nothing was written".to_string(),
+            },
+            other => other,
+        };
         handle_shunt_action_outcome(app, outcome);
     }
     // After a shunt action lands (success OR failure) the plan and pool caches
@@ -6760,20 +7454,7 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
                 ToastKind::Danger,
                 format!("admin key failed\n{}", escape_control(&error)),
             );
-            // Hold the output only for the config this edit ran against: a
-            // re-adopt that landed while the check ran must never show another
-            // gateway's output on this card. A check-output-free refusal (or a
-            // non-typed error) retires the held output the same way.
-            let current = app
-                .services
-                .shunt_record
-                .as_ref()
-                .map(|record| record.config().to_path_buf());
-            app.services.check_output = if Some(&config) == current.as_ref() {
-                check_output
-            } else {
-                None
-            };
+            hold_check_output(app, &config, check_output);
         }
         ShuntActionOutcome::Held => {
             app.toast(
@@ -6797,7 +7478,132 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
             );
         }
         ShuntActionOutcome::NoOp => {}
+        ShuntActionOutcome::ConfigSaved {
+            key,
+            written,
+            restart_only,
+            value,
+            confirmed,
+        } => {
+            app.services.shunt_save = None;
+            // The `✓` shows for about a second on the row that saved; a rename
+            // moves focus to the renamed field (the expanded set's key moves
+            // with it).
+            let new_key = config_view(app)
+                .and_then(|view| renamed_field_key(view, &key, value.as_deref().unwrap_or("")))
+                .unwrap_or(key.clone());
+            // A rename moves the expanded set's key with the renamed entry, so
+            // the new name's fields stay expanded and the focus follows.
+            if is_rename_field(&key) {
+                if let Some(old_entry) = field_entry(&key) {
+                    app.services.shunt_expanded.remove(&old_entry);
+                }
+                if let Some(new_entry) = field_entry(&new_key) {
+                    app.services.shunt_expanded.insert(new_entry);
+                }
+            }
+            app.services.shunt_ok = Some((new_key.clone(), Instant::now()));
+            // A landing save touches only its own row: it closes the editor and
+            // moves focus only when they still name the saved row (a rename's
+            // new name included), never another editor the user opened or a row
+            // the user moved to while the save ran.
+            if app
+                .services
+                .shunt_field_edit
+                .as_ref()
+                .is_some_and(|state| state.key == key)
+            {
+                app.services.shunt_field_edit = None;
+            }
+            if app
+                .services
+                .focused_shunt_focus()
+                .is_some_and(|focus| focus == &ShuntFocus::Field { key: key.clone() })
+            {
+                app.services
+                    .set_shunt_focus(Some(ShuntFocusLine::Field(new_key)));
+            }
+            if written && restart_only && confirmed {
+                // An emptied bind writes the key's removal, so shunt starts on
+                // its own default; a set bind restarts on the new address.
+                if let Some(bind) = value {
+                    app.toast(
+                        ToastKind::Success,
+                        format!(
+                            "shunt restarting\nbind saved · it starts on {}",
+                            escape_control(&bind)
+                        ),
+                    );
+                } else {
+                    app.toast(
+                        ToastKind::Success,
+                        format!(
+                            "shunt restarting\nbind removed · it starts on {}",
+                            crate::gateway::SHUNT_DEFAULT_BIND
+                        ),
+                    );
+                }
+            }
+        }
+        ShuntActionOutcome::ConfigRefused { key, sentence } => {
+            app.services.shunt_save = None;
+            // The engine refused the input or the file's shape: the editor
+            // stays open with the typed text, the refusal on the `└` line.
+            // Once the user moved focus away (or opened another field), there
+            // is no editor for that row to write — the refusal toasts instead
+            // of reaching no surface.
+            if let Some(state) = app.services.shunt_field_edit.as_mut()
+                && state.key == key
+            {
+                state.refusal = Some(sentence);
+            } else {
+                app.toast(
+                    ToastKind::Danger,
+                    format!("save failed\n{}", escape_control(&sentence)),
+                );
+            }
+        }
+        ShuntActionOutcome::ConfigCheckFailed {
+            error,
+            check_output,
+            config,
+        } => {
+            app.services.shunt_save = None;
+            app.toast(
+                ToastKind::Danger,
+                format!("save failed\n{}", escape_control(&error)),
+            );
+            hold_check_output(app, &config, check_output);
+        }
+        ShuntActionOutcome::ConfigFailed { error } => {
+            app.services.shunt_save = None;
+            app.toast(
+                ToastKind::Danger,
+                format!("save failed\n{}", escape_control(&error)),
+            );
+        }
     }
+}
+
+/// Hold a failed `shunt check`'s stderr on the card, but only for the config
+/// the edit ran against: a re-adopt that landed while the check ran must never
+/// show another gateway's output on this card. A check-output-free refusal (or
+/// a non-typed error) retires the held output the same way.
+fn hold_check_output(
+    app: &mut App,
+    config: &std::path::Path,
+    check_output: Option<crate::gateway::CheckStderr>,
+) {
+    let current = app
+        .services
+        .shunt_record
+        .as_ref()
+        .map(|record| record.config().to_path_buf());
+    app.services.check_output = if Some(config) == current.as_deref() {
+        check_output
+    } else {
+        None
+    };
 }
 
 /// The `delegates` row: a selector whose detail is the job list. Green while a
@@ -7418,12 +8224,571 @@ pub(crate) fn config_entry_keys(view: &crate::gateway_edit::ConfigView) -> Vec<S
     keys
 }
 
-/// The config entry rows as focus stops, in card order.
+/// The read `ConfigView` the shunt card's config section renders from.
+pub(crate) fn config_view(app: &App) -> Option<&crate::gateway_edit::ConfigView> {
+    match &app.services.shunt_config {
+        Some(ShuntConfigRead::Ok(view)) => Some(view.as_ref()),
+        _ => None,
+    }
+}
+
+/// The config entry rows as focus stops, in card order (the render tests'
+/// entry-only walk).
+#[cfg(test)]
 pub(crate) fn config_entry_stops(view: &crate::gateway_edit::ConfigView) -> Vec<ShuntFocus> {
     config_entry_keys(view)
         .into_iter()
         .map(|key| ShuntFocus::Entry { key })
         .collect()
+}
+
+/// The entry a [`ShuntEntryKey`] names, resolved by the key's own rule
+/// (name-or-id plus its occurrence index, route position) — the one lookup the
+/// render and the field model both go through, so a key and the row it names
+/// can never disagree.
+pub(crate) enum ConfigEntryRef<'a> {
+    Upstream(&'a crate::gateway_edit::UpstreamView),
+    Model(&'a crate::gateway_edit::ModelView),
+    Route(&'a crate::gateway_edit::RouteView),
+}
+
+pub(crate) fn entry_for_key<'a>(
+    view: &'a crate::gateway_edit::ConfigView,
+    key: &ShuntEntryKey,
+) -> Option<ConfigEntryRef<'a>> {
+    match key {
+        ShuntEntryKey::Upstream { name, occurrence } => view
+            .upstreams
+            .iter()
+            .filter(|u| entry_name(u.name.as_ref()) == *name)
+            .nth(*occurrence)
+            .map(ConfigEntryRef::Upstream),
+        ShuntEntryKey::Model { id, occurrence } => view
+            .models
+            .iter()
+            .filter(|m| entry_name(m.id.as_ref()) == *id)
+            .nth(*occurrence)
+            .map(ConfigEntryRef::Model),
+        ShuntEntryKey::Route(position) => view
+            .routes
+            .iter()
+            .find(|r| r.position == *position)
+            .map(ConfigEntryRef::Route),
+    }
+}
+
+/// The field rows one expanded entry renders, in render order — the single row
+/// model the render and the focus walk both derive from, so they cannot
+/// disagree for any view. The auth sub-rows follow the MODE (never the auth's
+/// spelling): `api_key` takes `auth env` + `auth header`, the four pool OAuth
+/// modes (`claude_oauth`, `chatgpt_oauth`, `kimi_oauth`, `antigravity_oauth`)
+/// take `account` (only when set) + `accounts`, every other mode or none takes
+/// neither. A model's `upstream_model` rows are keyed by their provider.
+pub(crate) fn entry_field_keys(
+    view: &crate::gateway_edit::ConfigView,
+    key: &ShuntEntryKey,
+) -> Vec<ShuntFieldKey> {
+    match entry_for_key(view, key) {
+        Some(ConfigEntryRef::Upstream(u)) => upstream_field_keys(key, u),
+        Some(ConfigEntryRef::Model(m)) => model_field_keys(key, m),
+        Some(ConfigEntryRef::Route(r)) => route_field_keys(r),
+        None => Vec::new(),
+    }
+}
+
+fn upstream_field_keys(
+    key: &ShuntEntryKey,
+    u: &crate::gateway_edit::UpstreamView,
+) -> Vec<ShuntFieldKey> {
+    let ShuntEntryKey::Upstream { name, occurrence } = key else {
+        unreachable!("an upstream field key names an upstream entry");
+    };
+    let at = |field| ShuntFieldKey::Upstream {
+        name: name.clone(),
+        occurrence: *occurrence,
+        field,
+    };
+    let mut keys = vec![
+        at(UpstreamFieldKind::Name),
+        at(UpstreamFieldKind::Provider),
+        at(UpstreamFieldKind::Kind),
+        at(UpstreamFieldKind::BaseUrl),
+        at(UpstreamFieldKind::AuthMode),
+    ];
+    if let Some(auth) = &u.auth {
+        match auth.mode.as_ref().map(written_display).as_deref() {
+            Some("api_key") => {
+                keys.push(at(UpstreamFieldKind::AuthEnv));
+                keys.push(at(UpstreamFieldKind::AuthHeader));
+            }
+            Some("claude_oauth" | "chatgpt_oauth" | "kimi_oauth" | "antigravity_oauth") => {
+                if auth.account.is_some() {
+                    keys.push(at(UpstreamFieldKind::AuthAccount));
+                }
+                keys.push(at(UpstreamFieldKind::Accounts));
+            }
+            _ => {}
+        }
+    }
+    keys.push(at(UpstreamFieldKind::Effort));
+    keys.push(at(UpstreamFieldKind::ServiceTier));
+    keys
+}
+
+fn model_field_keys(key: &ShuntEntryKey, m: &crate::gateway_edit::ModelView) -> Vec<ShuntFieldKey> {
+    let ShuntEntryKey::Model { id, occurrence } = key else {
+        unreachable!("a model field key names a model entry");
+    };
+    let mut keys = vec![
+        ShuntFieldKey::Model {
+            id: id.clone(),
+            occurrence: *occurrence,
+            field: ModelFieldKind::Id,
+        },
+        ShuntFieldKey::Model {
+            id: id.clone(),
+            occurrence: *occurrence,
+            field: ModelFieldKind::DisplayName,
+        },
+    ];
+    if let Some(map) = &m.upstream_model {
+        keys.extend(map.iter().map(|(provider, _)| ShuntFieldKey::Model {
+            id: id.clone(),
+            occurrence: *occurrence,
+            field: ModelFieldKind::UpstreamModel(provider.clone()),
+        }));
+    }
+    keys
+}
+
+fn route_field_keys(r: &crate::gateway_edit::RouteView) -> Vec<ShuntFieldKey> {
+    [
+        RouteFieldKind::Model,
+        RouteFieldKind::Provider,
+        RouteFieldKind::UpstreamModel,
+        RouteFieldKind::Effort,
+        RouteFieldKind::ServiceTier,
+    ]
+    .into_iter()
+    .map(|field| ShuntFieldKey::Route {
+        position: r.position,
+        field,
+    })
+    .collect()
+}
+
+/// The config section's focus stops in render order — the one row model both
+/// the render and the focus walk derive from: the `bind` row (only while not
+/// overridden and the env file read), `default_provider`, then each entry row
+/// and, when expanded, its field rows. The legacy `providers` row and its note
+/// and the eyebrows are read-only and never take focus.
+pub(crate) fn config_field_stops(
+    view: &crate::gateway_edit::ConfigView,
+    expanded: &HashSet<ShuntEntryKey>,
+) -> Vec<ShuntFocus> {
+    let mut stops = Vec::new();
+    if matches!(
+        view.server.bind_override,
+        crate::gateway_edit::BindOverride::None
+    ) {
+        stops.push(ShuntFocus::Field {
+            key: ShuntFieldKey::Bind,
+        });
+    }
+    stops.push(ShuntFocus::Field {
+        key: ShuntFieldKey::DefaultProvider,
+    });
+    for key in config_entry_keys(view) {
+        stops.push(ShuntFocus::Entry { key: key.clone() });
+        if expanded.contains(&key) {
+            stops.extend(
+                entry_field_keys(view, &key)
+                    .into_iter()
+                    .map(|field| ShuntFocus::Field { key: field }),
+            );
+        }
+    }
+    stops
+}
+
+/// The value a field row renders and its editor opens on: the decoded string,
+/// else the file's own TOML text; the inner `None` = unset (renders `—`). The
+/// outer `None` = the key names no editable field.
+pub(crate) fn shunt_field_value(
+    view: &crate::gateway_edit::ConfigView,
+    key: &ShuntFieldKey,
+) -> Option<Option<String>> {
+    match key {
+        ShuntFieldKey::Bind => Some(written_value(view.server.bind.as_ref())),
+        ShuntFieldKey::DefaultProvider => {
+            Some(written_value(view.server.default_provider.as_ref()))
+        }
+        ShuntFieldKey::Upstream {
+            name,
+            occurrence,
+            field,
+        } => {
+            let key = ShuntEntryKey::Upstream {
+                name: name.clone(),
+                occurrence: *occurrence,
+            };
+            let ConfigEntryRef::Upstream(u) = entry_for_key(view, &key)? else {
+                unreachable!("an upstream field key resolves to an upstream");
+            };
+            Some(match field {
+                UpstreamFieldKind::Name => written_value(u.name.as_ref()),
+                UpstreamFieldKind::Provider => written_value(u.provider.as_ref()),
+                UpstreamFieldKind::Kind => written_value(u.kind.as_ref()),
+                UpstreamFieldKind::BaseUrl => written_value(u.base_url.as_ref()),
+                UpstreamFieldKind::AuthMode => {
+                    written_value(u.auth.as_ref().and_then(|a| a.mode.as_ref()))
+                }
+                UpstreamFieldKind::AuthAccount => {
+                    written_value(u.auth.as_ref().and_then(|a| a.account.as_ref()))
+                }
+                UpstreamFieldKind::Accounts => u
+                    .auth
+                    .as_ref()
+                    .and_then(|a| a.accounts.as_ref())
+                    .map(|accounts| accounts_joined(accounts))
+                    .filter(|names| !names.is_empty()),
+                UpstreamFieldKind::AuthEnv => {
+                    written_value(u.auth.as_ref().and_then(|a| a.env.as_ref()))
+                }
+                UpstreamFieldKind::AuthHeader => {
+                    written_value(u.auth.as_ref().and_then(|a| a.header.as_ref()))
+                }
+                UpstreamFieldKind::Effort => written_value(u.effort.as_ref()),
+                UpstreamFieldKind::ServiceTier => written_value(u.service_tier.as_ref()),
+            })
+        }
+        ShuntFieldKey::Model {
+            id,
+            occurrence,
+            field,
+        } => {
+            let key = ShuntEntryKey::Model {
+                id: id.clone(),
+                occurrence: *occurrence,
+            };
+            let ConfigEntryRef::Model(m) = entry_for_key(view, &key)? else {
+                unreachable!("a model field key resolves to a model");
+            };
+            Some(match field {
+                ModelFieldKind::Id => written_value(m.id.as_ref()),
+                ModelFieldKind::DisplayName => written_value(m.display_name.as_ref()),
+                ModelFieldKind::UpstreamModel(provider) => m
+                    .upstream_model
+                    .as_ref()
+                    .and_then(|map| map.iter().find(|(k, _)| k == provider))
+                    .map(|(_, slug)| written_value(Some(slug)))
+                    .unwrap_or(None),
+            })
+        }
+        ShuntFieldKey::Route { position, field } => {
+            let ConfigEntryRef::Route(r) = entry_for_key(view, &ShuntEntryKey::Route(*position))?
+            else {
+                unreachable!("a route field key resolves to a route");
+            };
+            Some(match field {
+                RouteFieldKind::Model => written_value(r.model.as_ref()),
+                RouteFieldKind::Provider => written_value(r.provider.as_ref()),
+                RouteFieldKind::UpstreamModel => written_value(r.upstream_model.as_ref()),
+                RouteFieldKind::Effort => written_value(r.effort.as_ref()),
+                RouteFieldKind::ServiceTier => written_value(r.service_tier.as_ref()),
+            })
+        }
+    }
+}
+
+/// A `Written` as its render value: the decoded string, else the raw TOML text.
+fn written_value(w: Option<&crate::gateway_edit::Written>) -> Option<String> {
+    w.map(written_display)
+}
+
+/// The `Edit` one field key's save produces, from the typed text (the picked
+/// value for a cycle row's pending pick). A typed field's empty text unsets the
+/// key; a rename's empty text renames to the empty string (the check refuses);
+/// an emptied accounts list removes the key.
+pub(crate) fn edit_for_field(
+    view: &crate::gateway_edit::ConfigView,
+    key: &ShuntFieldKey,
+    typed: &str,
+) -> Option<crate::gateway_edit::Edit> {
+    use crate::gateway_edit::{Edit, ModelField, RouteField, ServerField, UpstreamField};
+    let unset = |text: &str| (!text.is_empty()).then(|| text.to_string());
+    match key {
+        ShuntFieldKey::Bind => Some(Edit::Server {
+            field: ServerField::Bind,
+            value: unset(typed),
+        }),
+        ShuntFieldKey::DefaultProvider => Some(Edit::Server {
+            field: ServerField::DefaultProvider,
+            value: unset(typed),
+        }),
+        ShuntFieldKey::Upstream { name, field, .. } => match field {
+            UpstreamFieldKind::Name => Some(Edit::RenameUpstream {
+                name: name.clone(),
+                to: typed.to_string(),
+            }),
+            UpstreamFieldKind::Accounts => Some(Edit::SetAccounts {
+                name: name.clone(),
+                accounts: split_accounts(typed),
+            }),
+            UpstreamFieldKind::Provider => Some(Edit::Upstream {
+                name: name.clone(),
+                field: UpstreamField::Provider,
+                value: unset(typed),
+            }),
+            UpstreamFieldKind::Kind => Some(Edit::Upstream {
+                name: name.clone(),
+                field: UpstreamField::Kind,
+                value: unset(typed),
+            }),
+            UpstreamFieldKind::BaseUrl => Some(Edit::Upstream {
+                name: name.clone(),
+                field: UpstreamField::BaseUrl,
+                value: unset(typed),
+            }),
+            UpstreamFieldKind::AuthMode => Some(Edit::Upstream {
+                name: name.clone(),
+                field: UpstreamField::AuthMode,
+                value: unset(typed),
+            }),
+            UpstreamFieldKind::AuthAccount => Some(Edit::Upstream {
+                name: name.clone(),
+                field: UpstreamField::AuthAccount,
+                value: unset(typed),
+            }),
+            UpstreamFieldKind::AuthEnv => Some(Edit::Upstream {
+                name: name.clone(),
+                field: UpstreamField::AuthEnv,
+                value: unset(typed),
+            }),
+            UpstreamFieldKind::AuthHeader => Some(Edit::Upstream {
+                name: name.clone(),
+                field: UpstreamField::AuthHeader,
+                value: unset(typed),
+            }),
+            UpstreamFieldKind::Effort => Some(Edit::Upstream {
+                name: name.clone(),
+                field: UpstreamField::Effort,
+                value: unset(typed),
+            }),
+            UpstreamFieldKind::ServiceTier => Some(Edit::Upstream {
+                name: name.clone(),
+                field: UpstreamField::ServiceTier,
+                value: unset(typed),
+            }),
+        },
+        ShuntFieldKey::Model { id, field, .. } => match field {
+            ModelFieldKind::Id => Some(Edit::RenameModel {
+                id: id.clone(),
+                to: typed.to_string(),
+            }),
+            ModelFieldKind::DisplayName => Some(Edit::Model {
+                id: id.clone(),
+                field: ModelField::DisplayName,
+                value: unset(typed),
+            }),
+            ModelFieldKind::UpstreamModel(provider) => Some(Edit::Model {
+                id: id.clone(),
+                field: ModelField::UpstreamModel(provider.clone()),
+                value: unset(typed),
+            }),
+        },
+        ShuntFieldKey::Route { position, field } => {
+            let route = match entry_for_key(view, &ShuntEntryKey::Route(*position))? {
+                ConfigEntryRef::Route(r) => r.clone(),
+                _ => unreachable!("a route field key resolves to a route"),
+            };
+            let field = match field {
+                RouteFieldKind::Model => RouteField::Model,
+                RouteFieldKind::Provider => RouteField::Provider,
+                RouteFieldKind::UpstreamModel => RouteField::UpstreamModel,
+                RouteFieldKind::Effort => RouteField::Effort,
+                RouteFieldKind::ServiceTier => RouteField::ServiceTier,
+            };
+            Some(Edit::Route {
+                route,
+                field,
+                value: unset(typed),
+            })
+        }
+    }
+}
+
+/// Split a typed accounts list: comma-separated, each name trimmed, empties
+/// dropped, order kept.
+fn split_accounts(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The account names a `accounts` field renders, comma-joined.
+fn accounts_joined(accounts: &[crate::gateway_edit::AccountView]) -> String {
+    accounts
+        .iter()
+        .filter_map(account_display)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One account's name as it renders; `None` for a selection with no name.
+fn account_display(a: &crate::gateway_edit::AccountView) -> Option<String> {
+    match a {
+        crate::gateway_edit::AccountView::Name(w) => Some(escape_control(&written_display(w))),
+        crate::gateway_edit::AccountView::Selection { name: Some(w), .. } => {
+            Some(escape_control(&written_display(w)))
+        }
+        crate::gateway_edit::AccountView::Selection { name: None, .. } => None,
+    }
+}
+
+/// The cycle options of a cycle field, in shunt's own order (off shunt
+/// 532f5c7's config types): the upstream `provider` presets, `kind` minus the
+/// deprecated `antigravity_cli`, the `auth mode` enum, the `auth header` enum,
+/// and `service_tier`'s three normalized values. Empty = not a cycle row.
+pub(crate) fn cycle_options(key: &ShuntFieldKey) -> &'static [&'static str] {
+    match key {
+        ShuntFieldKey::Upstream {
+            field: UpstreamFieldKind::Provider,
+            ..
+        } => &UPSTREAM_PROVIDERS,
+        ShuntFieldKey::Upstream {
+            field: UpstreamFieldKind::Kind,
+            ..
+        } => &KINDS,
+        ShuntFieldKey::Upstream {
+            field: UpstreamFieldKind::AuthMode,
+            ..
+        } => &AUTH_MODES,
+        ShuntFieldKey::Upstream {
+            field: UpstreamFieldKind::AuthHeader,
+            ..
+        } => &AUTH_HEADERS,
+        ShuntFieldKey::Upstream {
+            field: UpstreamFieldKind::ServiceTier,
+            ..
+        }
+        | ShuntFieldKey::Route {
+            field: RouteFieldKind::ServiceTier,
+            ..
+        } => &SERVICE_TIERS,
+        _ => &[],
+    }
+}
+
+/// The upstream `provider` presets, in the order shunt's own preset table
+/// declares them.
+pub(crate) const UPSTREAM_PROVIDERS: [&str; 11] = [
+    "anthropic",
+    "codex",
+    "openai",
+    "xai",
+    "grok",
+    "kimi",
+    "cursor",
+    "kimi-code",
+    "zhipu",
+    "minimax-cn",
+    "opencode",
+];
+
+/// The `kind` values, `antigravity_cli` omitted (deprecated).
+pub(crate) const KINDS: [&str; 5] = ["anthropic", "responses", "cursor", "gemini", "antigravity"];
+
+/// The `auth` mode names, in the order shunt's `AuthMode` enum declares them.
+pub(crate) const AUTH_MODES: [&str; 10] = [
+    "passthrough",
+    "api_key",
+    "chatgpt_oauth",
+    "claude_oauth",
+    "xai_oauth",
+    "cursor_oauth",
+    "kimi_oauth",
+    "google_oauth",
+    "antigravity_oauth",
+    "none",
+];
+
+/// The `auth.header` names, in the order shunt's `ApiKeyHeader` enum declares
+/// them.
+pub(crate) const AUTH_HEADERS: [&str; 2] = ["bearer", "x_api_key"];
+
+/// The `service_tier` values, in the order `normalize_service_tier_value`
+/// reads them (the `fast` alias normalizes to `priority` and is not a pick).
+pub(crate) const SERVICE_TIERS: [&str; 3] = ["priority", "flex", "default"];
+
+/// Whether `key` is a cycle row (`space` moves the pick; `↵` at rest opens the
+/// typed custom-value editor).
+pub(crate) fn is_cycle_field(key: &ShuntFieldKey) -> bool {
+    !cycle_options(key).is_empty()
+}
+
+/// The field key a successful rename moves focus to: the renamed entry's
+/// name/id field under the new name, with the occurrence the rename gives it
+/// (rename never reorders, so the new occurrence is the count of same-named
+/// entries before it). Non-rename keys map to themselves.
+pub(crate) fn renamed_field_key(
+    view: &crate::gateway_edit::ConfigView,
+    key: &ShuntFieldKey,
+    to: &str,
+) -> Option<ShuntFieldKey> {
+    match key {
+        ShuntFieldKey::Upstream {
+            name,
+            occurrence,
+            field: UpstreamFieldKind::Name,
+        } => {
+            let idx = view
+                .upstreams
+                .iter()
+                .enumerate()
+                .filter(|(_, u)| entry_name(u.name.as_ref()) == *name)
+                .nth(*occurrence)
+                .map(|(i, _)| i)?;
+            let new_occurrence = view
+                .upstreams
+                .iter()
+                .take(idx)
+                .filter(|u| entry_name(u.name.as_ref()) == *to)
+                .count();
+            Some(ShuntFieldKey::Upstream {
+                name: to.to_string(),
+                occurrence: new_occurrence,
+                field: UpstreamFieldKind::Name,
+            })
+        }
+        ShuntFieldKey::Model {
+            id,
+            occurrence,
+            field: ModelFieldKind::Id,
+        } => {
+            let idx = view
+                .models
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| entry_name(m.id.as_ref()) == *id)
+                .nth(*occurrence)
+                .map(|(i, _)| i)?;
+            let new_occurrence = view
+                .models
+                .iter()
+                .take(idx)
+                .filter(|m| entry_name(m.id.as_ref()) == *to)
+                .count();
+            Some(ShuntFieldKey::Model {
+                id: to.to_string(),
+                occurrence: new_occurrence,
+                field: ModelFieldKind::Id,
+            })
+        }
+        _ => Some(key.clone()),
+    }
 }
 
 /// Drop every expanded key whose entry is not in `view` (an entry that left the
@@ -7446,8 +8811,15 @@ pub(crate) fn entry_name(w: Option<&crate::gateway_edit::Written>) -> String {
 /// A `Written` as it renders: the decoded string when it is one, else the
 /// file's own text (a `${…}` reference stays unresolved, a number keeps its
 /// spelling).
+pub(crate) fn written_display(w: &crate::gateway_edit::Written) -> String {
+    w.value.clone().unwrap_or_else(|| w.raw.clone())
+}
+
+/// A `Written` as it renders: the decoded string when it is one, else the
+/// file's own text (a `${…}` reference stays unresolved, a number keeps its
+/// spelling).
 fn written_text(w: Option<&crate::gateway_edit::Written>) -> Option<String> {
-    w.map(|w| w.value.clone().unwrap_or_else(|| w.raw.clone()))
+    w.map(written_display)
 }
 
 /// A path rendered inside a verbatim card line (a MOVE PLAN row): control and
@@ -7533,6 +8905,80 @@ fn run_shunt_action(job: ShuntActionJob) -> ShuntActionOutcome {
                 error: error_toast_detail(&e),
             },
         },
+        ShuntActionJob::ConfigEdit {
+            record,
+            edit,
+            key,
+            confirmed,
+        } => run_config_edit(&record, &edit, key, confirmed),
+    }
+}
+
+/// Save one config field through the E1 engine, classifying the failure the
+/// card's rules name: an [`EditRefusal`] keeps its own sentence, a
+/// [`ConfigEditRefusal::CheckFailed`] its compact line + held stderr, anything
+/// else the error chain (root cause first).
+fn run_config_edit(
+    record: &crate::gateway::GatewayRecord,
+    edit: &crate::gateway_edit::Edit,
+    key: ShuntFieldKey,
+    confirmed: bool,
+) -> ShuntActionOutcome {
+    use crate::gateway::ConfigEditRefusal;
+    match crate::gateway_edit::apply_edit(record, edit) {
+        Ok(applied) => ShuntActionOutcome::ConfigSaved {
+            key,
+            written: applied.written,
+            restart_only: applied.restart_only,
+            value: edit_save_value(edit),
+            confirmed,
+        },
+        Err(e) => {
+            if let Some(refusal) = e.downcast_ref::<crate::gateway_edit::EditRefusal>() {
+                return ShuntActionOutcome::ConfigRefused {
+                    key,
+                    sentence: refusal.to_string(),
+                };
+            }
+            if let Some(ConfigEditRefusal::CheckFailed {
+                binary,
+                config,
+                code,
+                stderr,
+            }) = e.downcast_ref::<ConfigEditRefusal>()
+            {
+                return ShuntActionOutcome::ConfigCheckFailed {
+                    error: check_refused_line(binary, config, code, "save"),
+                    check_output: Some(stderr.clone()),
+                    config: record.config().to_path_buf(),
+                };
+            }
+            ShuntActionOutcome::ConfigFailed {
+                error: error_toast_detail(&e),
+            }
+        }
+    }
+}
+
+/// The value a field save writes, for the saving row's shimmer and the bind
+/// restart toast: the new value, the rename target, the accounts list, or
+/// `None` for an unset.
+fn edit_save_value(edit: &crate::gateway_edit::Edit) -> Option<String> {
+    use crate::gateway_edit::Edit;
+    match edit {
+        Edit::Server { value, .. }
+        | Edit::Upstream { value, .. }
+        | Edit::Model { value, .. }
+        | Edit::Route { value, .. } => value.clone(),
+        Edit::RenameUpstream { to, .. } | Edit::RenameModel { to, .. } => Some(to.clone()),
+        Edit::SetAccounts { accounts, .. } => Some(accounts.join(", ")),
+        Edit::AddUpstream(_)
+        | Edit::AddModel(_)
+        | Edit::AddRoute(_)
+        | Edit::RemoveUpstream { .. }
+        | Edit::RemoveModel { .. }
+        | Edit::RemoveRoute { .. }
+        | Edit::RequireClientTokens => None,
     }
 }
 
@@ -7659,11 +9105,6 @@ fn run_move(
 /// tail may clip on a 38-cell terminal while the outcome stays in view.
 fn admin_refusal_line(refusal: &crate::gateway::ConfigEditRefusal) -> String {
     use crate::gateway::{AdminNeed, ConfigEditRefusal as R};
-    let file = |path: &std::path::Path| {
-        path.file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string())
-    };
     match refusal {
         R::Needs(AdminNeed::AdminTable) => {
             "the config has no [server.admin] table; adding one enables shunt's admin API and is its own step".to_string()
@@ -7690,30 +9131,19 @@ fn admin_refusal_line(refusal: &crate::gateway::ConfigEditRefusal) -> String {
             )
         }
         R::Symlink { path } => {
-            format!("{} is a symlink · clauth would replace the link by renaming over it", file(path))
+            format!("{} is a symlink · clauth would replace the link by renaming over it", file_basename(path))
         }
         R::ShuntMissing { binary } => {
-            format!("cannot run {}: no such file · install shunt or point the gateway at its binary", file(binary))
+            format!("cannot run {}: no such file · install shunt or point the gateway at its binary", file_basename(binary))
         }
         R::CheckFailed {
             binary,
             config,
             code,
             ..
-        } => {
-            let status = match code {
-                Some(code) => format!("exit {code}"),
-                None => "killed by a signal".to_string(),
-            };
-            format!(
-                "`{} check` refused the edit ({status}) · {} unchanged · {} check output on the shunt card",
-                file(binary),
-                file(config),
-                prose::key("↵"),
-            )
-        }
+        } => check_refused_line(binary, config, code, "edit"),
         R::ChangedDuringEdit { path } => {
-            format!("{} changed during the check · nothing was written · run the edit again", file(path))
+            format!("{} changed during the check · nothing was written · run the edit again", file_basename(path))
         }
         R::CheckTimedOut {
             binary,
@@ -7721,12 +9151,41 @@ fn admin_refusal_line(refusal: &crate::gateway::ConfigEditRefusal) -> String {
             after,
         } => format!(
             "`{} check` ran past {after:?} and was stopped · {} unchanged · run `{} check --config {}` to see why it does not finish, then try again",
-            file(binary),
-            file(config),
-            file(binary),
+            file_basename(binary),
+            file_basename(config),
+            file_basename(binary),
             config.display(),
         ),
     }
+}
+
+/// A path's basename for a compact toast line, the path itself when it has no
+/// file name.
+fn file_basename(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// The compact `shunt check` refusal line shared by the admin edit and a field
+/// save: outcome first, files by basename, the `↵ check output` pointer. `op`
+/// names the refused operation (`edit` / `save`).
+fn check_refused_line(
+    binary: &std::path::Path,
+    config: &std::path::Path,
+    code: &Option<i32>,
+    op: &str,
+) -> String {
+    let status = match code {
+        Some(code) => format!("exit {code}"),
+        None => "killed by a signal".to_string(),
+    };
+    format!(
+        "`{} check` refused the {op} ({status}) · {} unchanged · {} check output on the shunt card",
+        file_basename(binary),
+        file_basename(config),
+        prose::key("↵"),
+    )
 }
 
 /// Add clauth's admin write key (or a whole `[server.admin]` table) behind the
@@ -10929,11 +12388,7 @@ fn dispatch_shunt_verb(app: &mut App, picked: ActionMenuAction) {
 fn open_shunt_stop_confirm(app: &mut App) {
     const DRAIN: &str =
         "in-flight requests drain, then the gateway stays off until the daemon restarts.";
-    let detail = match gateway_session_count(app) {
-        Some(1) => format!("1 live session uses it; {DRAIN}"),
-        Some(n) if n > 1 => format!("{n} live sessions use it; {DRAIN}"),
-        Some(_) | None => DRAIN.to_string(),
-    };
+    let detail = format!("{}{DRAIN}", live_sessions_clause(app));
     app.disarm_quit();
     app.open_modal(Modal::Confirm(ConfirmState {
         message: "stop shunt?".to_string(),
@@ -14196,6 +15651,12 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             if shunt_verb_at_pick(app, ActionMenuAction::StopShunt).is_some() {
                 app.services.shunt_action.start(ShuntActionJob::Hold);
             }
+        }
+        ConfirmAction::RestartBind { key, edit } => {
+            start_field_save(app, key, *edit, true);
+        }
+        ConfirmAction::RenameField { key, edit } => {
+            start_field_save(app, key, *edit, false);
         }
         ConfirmAction::Acknowledge => {}
     }

@@ -3542,3 +3542,131 @@ fn overview_more_line_styles_the_arrow_as_a_key() {
         }
     }
 }
+
+/// A hybrid's Overview bar text equals the
+/// provider-derived percentage — `apply_usage` fills `Profile.usage` from the
+/// picker, so the Overview shows 10% (the provider bar), never the OAuth 100%.
+#[test]
+fn a_hybrids_overview_bar_shows_the_provider_percentage() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let name = ProfileName::from("h");
+    let mut hybrid = crate::testutil::blank_profile(&name);
+    hybrid.base_url = Some("https://example.com".to_string());
+    hybrid.api_key = Some("key".to_string());
+    hybrid.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    assert!(
+        hybrid.usage_cache_is_third_party(),
+        "fixture classifies third-party"
+    );
+    let config = config_with(vec![hybrid], Some("h"), vec!["h"]);
+    let mut app = App::new(config);
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("h".into(), oauth_usage(100.0));
+    app.third_party_usage_store
+        .lock()
+        .unwrap()
+        .insert("h".into(), tp_bar(10.0));
+    app.apply_usage();
+    let widths = OverviewWidths::new(80, &app);
+    let line = render_overview_row(&app, 0, &widths, false, true);
+    let text = line_text(&line);
+    assert_eq!(
+        text, "  ● h             API                [█░░░░░░░░░]  10%      —              ",
+        "the hybrid's Overview row renders the provider percentage"
+    );
+}
+
+fn oauth_usage(pct: f64) -> crate::usage::UsageInfo {
+    crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: pct,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        ..crate::usage::UsageInfo::default()
+    }
+}
+
+fn tp_bar(pct: f64) -> crate::providers::ThirdPartyStats {
+    crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: Vec::new(),
+        bars: vec![crate::providers::UsageBar {
+            label: "5h".to_string(),
+            pct,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+            used: None,
+            total: None,
+        }],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    }
+}
+
+/// A hybrid active has no projected-switch ETA: its provider window has no OAuth
+/// burn history to pair with, so `projected_switch` renders nothing even when a
+/// burn series exists under the name (maintainer ruling 2026-09-10).
+#[test]
+fn a_hybrid_has_no_projected_switch_eta() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let name = ProfileName::from("h");
+    let mut hybrid = crate::testutil::blank_profile(&name);
+    hybrid.base_url = Some("https://example.com".to_string());
+    hybrid.api_key = Some("key".to_string());
+    hybrid.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    assert!(
+        hybrid.usage_cache_is_third_party(),
+        "fixture classifies third-party"
+    );
+    let spare = profile("spare", 95.0, 10.0, 3600);
+    let config = config_with(vec![hybrid, spare], Some("h"), vec!["h", "spare"]);
+    let mut app = App::new(config);
+    // The provider's live 5h bar at 92% — below the static threshold, but a
+    // burn series would project it past.
+    app.third_party_usage_store
+        .lock()
+        .unwrap()
+        .insert("h".into(), tp_bar(92.0));
+    app.apply_usage();
+    let now = crate::usage::now_ms();
+    app.history_cache.insert(
+        "h".into(),
+        vec![
+            (now - 360_000, oauth_usage(32.0)),
+            (now - 240_000, oauth_usage(52.0)),
+            (now - 120_000, oauth_usage(72.0)),
+        ],
+    );
+    let cfg = app.config();
+    assert_eq!(
+        projected_switch(&app, &cfg, &HashSet::new()),
+        None,
+        "a hybrid active has no projected-switch ETA"
+    );
+}

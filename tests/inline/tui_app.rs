@@ -28658,3 +28658,422 @@ fn overview_more_line_routes_to_the_fallback_tab() {
         "the last of the 28 members is selectable"
     );
 }
+
+mod usage_picker {
+    use super::*;
+    use crate::profile::ProfileName;
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    fn live_iso() -> String {
+        crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + 3600)
+    }
+
+    fn bar(pct: f64) -> crate::providers::ThirdPartyStats {
+        crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: Vec::new(),
+            bars: vec![crate::providers::UsageBar {
+                label: "5h".to_string(),
+                pct,
+                resets_at: Some(live_iso()),
+                used: None,
+                total: None,
+            }],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        }
+    }
+
+    fn oauth(pct: f64) -> UsageInfo {
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: pct,
+                resets_at: Some(live_iso()),
+            }),
+            ..UsageInfo::default()
+        }
+    }
+
+    fn creds() -> crate::profile::ClaudeCredentials {
+        crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-probe".into(),
+                refresh_token: Some("rt-probe".into()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        }
+    }
+
+    fn shown_5h(app: &App, name: &ProfileName) -> Option<f64> {
+        app.config()
+            .find(name)
+            .and_then(|p| p.usage.as_ref())
+            .and_then(|u| u.five_hour.as_ref())
+            .map(|w| w.utilization)
+    }
+
+    /// A hybrid's TUI reading is the picker's provider windows (10%), never
+    /// the OAuth leg's 100% the merged store holds.
+    #[test]
+    fn a_hybrids_tui_reading_is_the_pickers_provider_windows() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("h");
+        let mut p = crate::testutil::blank_profile(&name);
+        p.credentials = Some(creds());
+        p.base_url = Some("https://example.com".into());
+        p.api_key = Some("key".into());
+        assert!(
+            p.usage_cache_is_third_party(),
+            "fixture classifies third-party"
+        );
+        let mut app = app_with(vec![p]);
+        app.usage_store
+            .lock()
+            .unwrap()
+            .insert("h".into(), oauth(100.0));
+        app.third_party_usage_store
+            .lock()
+            .unwrap()
+            .insert("h".into(), bar(10.0));
+        app.apply_usage();
+        assert_eq!(
+            shown_5h(&app, &name),
+            Some(10.0),
+            "a hybrid's TUI 5h is the provider's"
+        );
+    }
+
+    /// A pure third-party account (base_url + key) whose merged store still
+    /// holds a stale OAuth reading from before a log-out shows the provider's
+    /// 10%, not the stale 100%.
+    #[test]
+    fn a_pure_third_party_account_ignores_a_stale_oauth_entry_in_the_tui() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("t");
+        let mut p = crate::testutil::blank_profile(&name);
+        p.base_url = Some("https://example.com".into());
+        p.api_key = Some("key".into());
+        assert!(
+            p.usage_cache_is_third_party(),
+            "fixture classifies third-party"
+        );
+        let mut app = app_with(vec![p]);
+        app.usage_store
+            .lock()
+            .unwrap()
+            .insert("t".into(), oauth(100.0));
+        crate::testutil::register_names(&["t"]);
+        crate::profile_cache::write_profile_cache(
+            &name,
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            &bar(10.0),
+        );
+        let entries = crate::usage::collect_third_party_entries(&app.config().profiles);
+        assert_eq!(entries.len(), 1, "fixture has a third-party entry");
+        crate::usage::bootstrap_third_party(
+            &app.third_party_usage_store,
+            &app.third_party_status,
+            &app.last_fetched,
+            &entries,
+            300_000,
+        );
+        assert!(
+            app.third_party_usage_store
+                .lock()
+                .unwrap()
+                .contains_key("t"),
+            "HARNESS: bootstrap seeded the provider store"
+        );
+        app.apply_usage();
+        assert_eq!(
+            shown_5h(&app, &name),
+            Some(10.0),
+            "a pure third-party TUI 5h is the provider's"
+        );
+    }
+
+    /// Startup seed order (OAuth then third-party, as `spawn_bootstrap` runs
+    /// them) still leaves a hybrid's TUI reading at the provider's 10%.
+    #[test]
+    fn a_hybrids_tui_reading_survives_the_startup_seed_order() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("h");
+        let mut p = crate::testutil::blank_profile(&name);
+        p.credentials = Some(creds());
+        p.base_url = Some("https://example.com".into());
+        p.api_key = Some("key".into());
+        assert!(
+            p.usage_cache_is_third_party(),
+            "fixture classifies third-party"
+        );
+        let mut app = app_with(vec![p]);
+        crate::testutil::register_names(&["h"]);
+        let mut body = oauth(100.0);
+        body.fetched_at = Some(crate::usage::now_ms());
+        crate::profile_cache::write_profile_cache(
+            &name,
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &body,
+        );
+        crate::profile_cache::write_profile_cache(
+            &name,
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            &bar(10.0),
+        );
+        let (seed_names, entries) = {
+            let cfg = app.config();
+            (
+                crate::usage::collect_oauth_seed_names(&cfg),
+                crate::usage::collect_third_party_entries(&cfg.profiles),
+            )
+        };
+        crate::usage::bootstrap_fetch(
+            &app.usage_store,
+            &app.usage_status,
+            &app.last_fetched,
+            &seed_names,
+            300_000,
+        );
+        crate::usage::bootstrap_third_party(
+            &app.third_party_usage_store,
+            &app.third_party_status,
+            &app.last_fetched,
+            &entries,
+            300_000,
+        );
+        assert!(
+            app.usage_store.lock().unwrap().contains_key("h"),
+            "HARNESS: OAuth seed landed"
+        );
+        assert!(
+            app.third_party_usage_store
+                .lock()
+                .unwrap()
+                .contains_key("h"),
+            "HARNESS: provider seed landed"
+        );
+        app.apply_usage();
+        assert_eq!(
+            shown_5h(&app, &name),
+            Some(10.0),
+            "a hybrid's TUI 5h survives the startup seed order"
+        );
+    }
+
+    /// `burn_rate_for` refuses a hybrid's OAuth burn history, so
+    /// the Overview ETA and the startup one-shot never pair the OAuth series
+    /// with the provider window (maintainer ruling 2026-09-10).
+    #[test]
+    fn a_hybrids_burn_rate_is_none_despite_its_oauth_history() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("h");
+        let mut p = crate::testutil::blank_profile(&name);
+        p.credentials = Some(creds());
+        p.base_url = Some("https://example.com".into());
+        p.api_key = Some("key".into());
+        assert!(
+            p.usage_cache_is_third_party(),
+            "fixture classifies third-party"
+        );
+        let now = crate::usage::now_ms();
+        // A monotonic climb to the current 60%, so no reset boundary slices the
+        // series and the in-memory rate actually computes.
+        let series = vec![
+            (now - 360_000, oauth(20.0)),
+            (now - 240_000, oauth(35.0)),
+            (now - 120_000, oauth(50.0)),
+        ];
+        let mut app = app_with(vec![p.clone()]);
+        app.history_cache.insert("h".into(), series.clone());
+        assert_eq!(
+            app.burn_rate_for(&p, &oauth(60.0)),
+            None,
+            "a hybrid's OAuth burn history must not pair with its provider window"
+        );
+
+        // Control: the same series on a pure OAuth profile yields a rate, so
+        // the hybrid `None` is the guard, not empty history.
+        let o_name = ProfileName::from("o");
+        let mut o = crate::testutil::blank_profile(&o_name);
+        o.credentials = Some(creds());
+        assert!(!o.usage_cache_is_third_party(), "control classifies OAuth");
+        let mut oauth_app = app_with(vec![o.clone()]);
+        oauth_app.history_cache.insert("o".into(), series);
+        assert!(
+            oauth_app.burn_rate_for(&o, &oauth(60.0)).is_some(),
+            "control: an OAuth profile pairs its own history"
+        );
+    }
+
+    /// `apply_usage`'s own contract: a poisoned store lock keeps the prior
+    /// reading rather than blanking it.
+    #[test]
+    fn a_poisoned_usage_store_keeps_the_prior_reading() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("o");
+        let mut p = crate::testutil::blank_profile(&name);
+        p.usage = Some(crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 50.0,
+                resets_at: None,
+            }),
+            ..crate::usage::UsageInfo::default()
+        });
+        assert!(!p.usage_cache_is_third_party(), "fixture classifies OAuth");
+        let mut app = app_with(vec![p]);
+        let poisoner = Arc::clone(&app.usage_store);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = poisoner.lock().expect("lock the store");
+            panic!("deliberate: poison the usage store");
+        }));
+        assert!(poisoned.is_err(), "HARNESS: poisoned");
+        app.apply_usage();
+        let got = app
+            .config()
+            .find(&name)
+            .and_then(|p| p.usage.as_ref())
+            .and_then(|u| u.five_hour.as_ref())
+            .map(|w| w.utilization);
+        assert_eq!(
+            got,
+            Some(50.0),
+            "a poisoned usage store keeps the prior reading"
+        );
+    }
+
+    fn hybrid_with_prior_reading(name: &ProfileName) -> crate::profile::Profile {
+        let mut p = crate::testutil::blank_profile(name);
+        p.credentials = Some(creds());
+        p.base_url = Some("https://example.com".into());
+        p.api_key = Some("key".into());
+        p.usage = Some(crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 40.0,
+                resets_at: None,
+            }),
+            ..crate::usage::UsageInfo::default()
+        });
+        p.fetch_status = Some(crate::usage::FetchStatus::Cached);
+        assert!(
+            p.usage_cache_is_third_party(),
+            "the fixture's hybrid classifies third-party"
+        );
+        p
+    }
+
+    /// A poisoned provider store keeps a third-party account's prior reading,
+    /// the same contract the OAuth side keeps.
+    #[test]
+    fn a_poisoned_provider_store_keeps_a_hybrids_prior_reading() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("h");
+        let mut app = app_with(vec![hybrid_with_prior_reading(&name)]);
+        let poisoner = Arc::clone(&app.third_party_usage_store);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = poisoner.lock().expect("lock the provider store");
+            panic!("deliberate: poison the provider store");
+        }));
+        assert!(poisoned.is_err(), "the provider store is poisoned");
+        app.apply_usage();
+        let got = app
+            .config()
+            .find(&name)
+            .and_then(|p| p.usage.as_ref())
+            .and_then(|u| u.five_hour.as_ref())
+            .map(|w| w.utilization);
+        assert_eq!(
+            got,
+            Some(40.0),
+            "a poisoned provider store keeps the prior reading"
+        );
+    }
+
+    /// A poisoned provider status store keeps a third-party account's prior
+    /// fetch status rather than clearing it.
+    #[test]
+    fn a_poisoned_provider_status_keeps_a_hybrids_prior_fetch_status() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("h");
+        let mut app = app_with(vec![hybrid_with_prior_reading(&name)]);
+        let poisoner = Arc::clone(&app.third_party_status);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = poisoner.lock().expect("lock the provider status");
+            panic!("deliberate: poison the provider status");
+        }));
+        assert!(poisoned.is_err(), "the provider status is poisoned");
+        app.apply_usage();
+        let got = app.config().find(&name).and_then(|p| p.fetch_status);
+        assert_eq!(
+            got,
+            Some(crate::usage::FetchStatus::Cached),
+            "a poisoned provider status keeps the prior fetch status"
+        );
+    }
+
+    /// `apply_usage`'s freshness follows the picker's side: a hybrid whose OAuth
+    /// leg is stale but whose provider leg is fresh shows the provider status.
+    #[test]
+    fn a_hybrids_fetch_status_reads_the_provider_side() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("h");
+        let mut p = crate::testutil::blank_profile(&name);
+        p.credentials = Some(creds());
+        p.base_url = Some("https://example.com".into());
+        p.api_key = Some("key".into());
+        assert!(
+            p.usage_cache_is_third_party(),
+            "fixture classifies third-party"
+        );
+        let mut app = app_with(vec![p]);
+        app.usage_status
+            .lock()
+            .unwrap()
+            .insert("h".into(), crate::usage::FetchStatus::Cached);
+        app.third_party_status
+            .lock()
+            .unwrap()
+            .insert("h".into(), crate::usage::FetchStatus::Fresh);
+        app.apply_usage();
+        let got = app.config().find(&name).and_then(|p| p.fetch_status);
+        assert_eq!(
+            got,
+            Some(crate::usage::FetchStatus::Fresh),
+            "a hybrid's fetch status reads the provider side"
+        );
+    }
+
+    /// The startup one-shot's rate step refuses a hybrid's OAuth burn history:
+    /// its `Profile.usage` is the provider windows, so no cross-pool projection
+    /// reaches `auto_switch_if_needed` (maintainer ruling 2026-09-10).
+    #[test]
+    fn the_startup_one_shots_rate_step_refuses_a_hybrid() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("h");
+        let mut p = crate::testutil::blank_profile(&name);
+        p.credentials = Some(creds());
+        p.base_url = Some("https://example.com".into());
+        p.api_key = Some("key".into());
+        p.usage = Some(oauth(60.0));
+        assert!(
+            p.usage_cache_is_third_party(),
+            "fixture classifies third-party"
+        );
+        let now = crate::usage::now_ms();
+        let series = vec![
+            (now - 360_000, oauth(20.0)),
+            (now - 240_000, oauth(35.0)),
+            (now - 120_000, oauth(50.0)),
+        ];
+        let mut app = app_with(vec![p.clone()]);
+        app.history_cache.insert("h".into(), series);
+        assert_eq!(
+            app.startup_rate(&p),
+            None,
+            "the startup rate step refuses a hybrid's OAuth burn history"
+        );
+    }
+}

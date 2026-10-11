@@ -1124,7 +1124,9 @@ fn projected_switch(
     let usage = usage_info.five_hour.as_ref()?;
     let threshold = threshold_for(profile);
     // In-memory rate (`app.history_cache`) — no disk read while `cfg` is held.
-    let active_rate = app.active_burn_rate(active_name, usage_info);
+    // A third-party member has no burn history to pair with its provider window
+    // (maintainer ruling 2026-09-10), so no rate and no projection.
+    let active_rate = app.burn_rate_for(profile, usage_info);
     let eta_secs = burn_rate_eta(active_rate, usage.utilization, threshold)?;
     let reset_secs = super::format::reset_in_secs(usage);
     if reset_secs.is_some_and(|reset| eta_secs >= reset) {

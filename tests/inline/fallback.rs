@@ -1122,12 +1122,12 @@ fn walk_order_soonest_recovery_orders_both_passes_unless_preferred_wins() {
         ("a", recovered_usage(reset_in(2 * 3600))),
     ]);
     assert_eq!(
-        find_recovered_member(&chain, &store, &[], WalkOrder::Chain),
+        find_recovered_member_for_test(&chain, &store, &[], WalkOrder::Chain),
         Some("b".to_string()),
         "chain mode keeps today's first-recovered-in-chain-order pick"
     );
     assert_eq!(
-        find_recovered_member(&chain, &store, &[], WalkOrder::SoonestWeeklyReset),
+        find_recovered_member_for_test(&chain, &store, &[], WalkOrder::SoonestWeeklyReset),
         Some("a".to_string()),
         "no preferred: the sooner-resetting recovered member wins"
     );
@@ -1135,7 +1135,7 @@ fn walk_order_soonest_recovery_orders_both_passes_unless_preferred_wins() {
     // sooner-resetting a (+2h) — the recovery short-circuit is never reordered.
     let pref_chain = vec![member("b", true), member("a", false)];
     assert_eq!(
-        find_recovered_member(&pref_chain, &store, &[], WalkOrder::SoonestWeeklyReset),
+        find_recovered_member_for_test(&pref_chain, &store, &[], WalkOrder::SoonestWeeklyReset),
         Some("b".to_string()),
         "the preferred short-circuit outranks the reset ordering"
     );
@@ -2033,18 +2033,18 @@ fn walk_order_most_headroom_orders_recovery_unless_preferred_wins() {
     let store = store_with_infos(vec![("b", recovered(60.0)), ("a", recovered(10.0))]);
     let chain = vec![headroom_member("b", false), headroom_member("a", false)];
     assert_eq!(
-        find_recovered_member(&chain, &store, &[], WalkOrder::Chain),
+        find_recovered_member_for_test(&chain, &store, &[], WalkOrder::Chain),
         Some("b".to_string()),
         "chain mode keeps the first recovered member in chain order"
     );
     assert_eq!(
-        find_recovered_member(&chain, &store, &[], WalkOrder::MostWeeklyHeadroom),
+        find_recovered_member_for_test(&chain, &store, &[], WalkOrder::MostWeeklyHeadroom),
         Some("a".to_string()),
         "no preferred: the least-used recovered week wins"
     );
     let pref_chain = vec![headroom_member("b", true), headroom_member("a", false)];
     assert_eq!(
-        find_recovered_member(&pref_chain, &store, &[], WalkOrder::MostWeeklyHeadroom),
+        find_recovered_member_for_test(&pref_chain, &store, &[], WalkOrder::MostWeeklyHeadroom),
         Some("b".to_string()),
         "the preferred short-circuit outranks the headroom ordering"
     );
@@ -2129,11 +2129,11 @@ fn find_recovered_returns_first_member_below_threshold() {
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 40.0)]);
     assert_eq!(
-        find_recovered_member(&members, &store, &[], WalkOrder::Chain),
+        find_recovered_member_for_test(&members, &store, &[], WalkOrder::Chain),
         Some("b".to_string()),
     );
     assert_eq!(
-        find_recovered_member(
+        find_recovered_member_for_test(
             &members,
             &store,
             &[ProfileName::from("b")],
@@ -2171,7 +2171,7 @@ fn find_recovered_skips_exhausted_members() {
     ];
     let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
     assert_eq!(
-        find_recovered_member(&members, &store, &[], WalkOrder::Chain),
+        find_recovered_member_for_test(&members, &store, &[], WalkOrder::Chain),
         None
     );
 }
@@ -2202,7 +2202,7 @@ fn find_recovered_returns_none_when_no_member_has_data() {
     ];
     let store = store_with_utils(&[]); // no usage data for any member
     assert_eq!(
-        find_recovered_member(&members, &store, &[], WalkOrder::Chain),
+        find_recovered_member_for_test(&members, &store, &[], WalkOrder::Chain),
         None
     );
 }
@@ -2233,7 +2233,7 @@ fn find_recovered_uses_threshold_per_member() {
     ];
     let store = store_with_utils(&[("a", 95.0), ("b", 94.0)]);
     assert_eq!(
-        find_recovered_member(&members, &store, &[], WalkOrder::Chain),
+        find_recovered_member_for_test(&members, &store, &[], WalkOrder::Chain),
         Some("b".to_string()),
     );
 }
@@ -2258,7 +2258,7 @@ fn find_recovered_recovers_when_window_expired() {
         usage_info(Some(window(100.0, Some(expired_reset())))),
     )]);
     assert_eq!(
-        find_recovered_member(&members, &store, &[], WalkOrder::Chain),
+        find_recovered_member_for_test(&members, &store, &[], WalkOrder::Chain),
         Some("a".to_string()),
     );
 }
@@ -2279,7 +2279,7 @@ fn find_recovered_recovers_when_windowless() {
     }];
     let store = store_with_infos(vec![("a", usage_info(None))]);
     assert_eq!(
-        find_recovered_member(&members, &store, &[], WalkOrder::Chain),
+        find_recovered_member_for_test(&members, &store, &[], WalkOrder::Chain),
         Some("a".to_string()),
     );
 }
@@ -2300,7 +2300,7 @@ fn find_recovered_treats_missing_resets_at_as_lapsed() {
     }];
     let store = store_with_infos(vec![("a", usage_info(Some(window(100.0, None))))]);
     assert_eq!(
-        find_recovered_member(&members, &store, &[], WalkOrder::Chain),
+        find_recovered_member_for_test(&members, &store, &[], WalkOrder::Chain),
         Some("a".to_string()),
     );
 }
@@ -4572,7 +4572,7 @@ fn weekly_dead_member_never_recovers() {
         usage_both(None, Some(window(100.0, Some(live_reset())))),
     )]);
     assert_eq!(
-        find_recovered_member(&members, &dead, &[], WalkOrder::Chain),
+        find_recovered_member_for_test(&members, &dead, &[], WalkOrder::Chain),
         None
     );
     // Same member with the weekly reset in the past HAS recovered.
@@ -4581,7 +4581,7 @@ fn weekly_dead_member_never_recovers() {
         usage_both(None, Some(window(100.0, Some(expired_reset())))),
     )]);
     assert_eq!(
-        find_recovered_member(&members, &renewed, &[], WalkOrder::Chain),
+        find_recovered_member_for_test(&members, &renewed, &[], WalkOrder::Chain),
         Some("b".to_string())
     );
 }
@@ -5733,7 +5733,7 @@ fn next_auto_switch_target_ignores_store_mutation_after_snapshot() {
 
     // Snapshot evaluation against the PRE-mutation clone: To(B) FREE.
     let result_with_pre_snapshot =
-        super::next_auto_switch_target_with_usage(&snapshot, &pre_mutation);
+        super::next_auto_switch_target_with_usage(&snapshot, &pre_mutation, &HashSet::new());
     assert_eq!(
         result_with_pre_snapshot,
         Some(SwitchAction::To("b".to_string())),
@@ -6389,7 +6389,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
         ("c", usage_with_scoped(5.0, 30.0, vec![])),
     ]);
     assert_eq!(
-        find_recovered_member(&chain, &store, &[], WalkOrder::Chain),
+        find_recovered_member_for_test(&chain, &store, &[], WalkOrder::Chain),
         Some("c".to_string()),
         "recovery relinks the fully-clear member first"
     );
@@ -6413,7 +6413,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
         check_scoped: true,
     }];
     assert_eq!(
-        find_recovered_member(&chain_b, &store, &[], WalkOrder::Chain),
+        find_recovered_member_for_test(&chain_b, &store, &[], WalkOrder::Chain),
         Some("b".to_string()),
     );
 }
@@ -6458,7 +6458,7 @@ fn find_recovered_prefers_the_preferred_member_over_a_scoped_clear_one() {
         ("c", usage_with_scoped(5.0, 30.0, vec![])),
     ]);
     assert_eq!(
-        find_recovered_member(&chain, &store, &[], WalkOrder::Chain),
+        find_recovered_member_for_test(&chain, &store, &[], WalkOrder::Chain),
         Some("b".to_string()),
         "an aggregate-recovered preferred wins over a lower-priority scoped-clear member"
     );
@@ -6470,7 +6470,7 @@ fn find_recovered_prefers_the_preferred_member_over_a_scoped_clear_one() {
         ("c", usage_with_scoped(5.0, 30.0, vec![])),
     ]);
     assert_eq!(
-        find_recovered_member(&chain, &store_b_dead, &[], WalkOrder::Chain),
+        find_recovered_member_for_test(&chain, &store_b_dead, &[], WalkOrder::Chain),
         Some("c".to_string()),
         "a preferred that has not recovered does not block a clear member from relinking"
     );
@@ -6505,19 +6505,19 @@ fn recovery_respects_each_members_gates() {
         ("c", usage_with_scoped(0.0, 99.0, vec![])),
     ]);
     assert_eq!(
-        find_recovered_member(&chain, &store, &[], WalkOrder::Chain),
+        find_recovered_member_for_test(&chain, &store, &[], WalkOrder::Chain),
         Some("b".to_string()),
     );
     // c alone: its weekly-gate-off soft-band week recovers; at the hard cap
     // it never does.
     let chain_c = vec![member("c", false, true)];
     assert_eq!(
-        find_recovered_member(&chain_c, &store, &[], WalkOrder::Chain),
+        find_recovered_member_for_test(&chain_c, &store, &[], WalkOrder::Chain),
         Some("c".to_string()),
     );
     let store = store_with_infos(vec![("c", usage_with_scoped(0.0, 100.0, vec![]))]);
     assert_eq!(
-        find_recovered_member(&chain_c, &store, &[], WalkOrder::Chain),
+        find_recovered_member_for_test(&chain_c, &store, &[], WalkOrder::Chain),
         None
     );
 }
@@ -7811,5 +7811,229 @@ fn an_alibaba_member_without_a_console_is_not_key_rejected() {
         start_block(&config, &member, profile, None, false, false, None),
         None,
         "a console-lapsed Alibaba member is not refused by the start walk"
+    );
+}
+
+/// A hybrid (an OAuth pair behind a `base_url` + key) for the picker tests: its
+/// figures live in the third-party store per `usage_cache_is_third_party`.
+fn hybrid_profile(name: &str, threshold: Option<f64>) -> Profile {
+    let mut p = profile_with_util(name, threshold, None);
+    p.base_url = Some("https://example.com".to_string());
+    p.api_key = Some("key".to_string());
+    p.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    p
+}
+
+/// A third-party store entry whose provider publishes one live 5h bar at `pct`.
+fn tp_stats(pct: f64) -> crate::providers::ThirdPartyStats {
+    use crate::providers::UsageBar;
+    crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: Vec::new(),
+        bars: vec![UsageBar {
+            label: "5h".to_string(),
+            pct,
+            resets_at: Some(live_reset()),
+            used: None,
+            total: None,
+        }],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    }
+}
+
+/// The in-memory picker (`usage_snapshot_for_chain`) is the walk's twin of
+/// `profile_json::windows_of`: a hybrid member's windows come from the provider
+/// reading in the third-party store, never from the OAuth reading the merged
+/// store holds — the fix for "whichever leg wrote last wins".
+#[test]
+fn the_picker_reads_a_hybrids_provider_windows_over_its_oauth_reading() {
+    use crate::usage::ThirdPartyUsageStore;
+
+    let store = store_with_utils(&[("hybrid", 100.0), ("b", 10.0)]);
+    let tp_store: ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "hybrid".to_string(),
+        tp_stats(10.0),
+    )])));
+    let members = vec![
+        headroom_member("hybrid", false),
+        headroom_member("b", false),
+    ];
+    let third_party_names: HashSet<ProfileName> = HashSet::from([ProfileName::from("hybrid")]);
+
+    let usage = usage_snapshot_for_chain(&store, &tp_store, &third_party_names, &members);
+    assert_eq!(
+        usage
+            .get("hybrid")
+            .and_then(|u| u.five_hour.as_ref())
+            .map(|w| w.utilization),
+        Some(10.0),
+        "a hybrid's provider windows win over its OAuth reading in the merged store"
+    );
+    assert_eq!(
+        usage
+            .get("b")
+            .and_then(|u| u.five_hour.as_ref())
+            .map(|w| w.utilization),
+        Some(10.0),
+        "an OAuth sibling still reads the merged store"
+    );
+}
+
+/// A pure third-party member's provider windows reach the walk through the
+/// picker.
+#[test]
+fn the_picker_reads_a_pure_third_party_members_provider_windows() {
+    use crate::usage::ThirdPartyUsageStore;
+
+    let store = store_with_infos(Vec::new());
+    let tp_store: ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "tp".to_string(),
+        tp_stats(20.0),
+    )])));
+    let members = vec![headroom_member("tp", false)];
+    let third_party_names: HashSet<ProfileName> = HashSet::from([ProfileName::from("tp")]);
+
+    let usage = usage_snapshot_for_chain(&store, &tp_store, &third_party_names, &members);
+    assert_eq!(
+        usage
+            .get("tp")
+            .and_then(|u| u.five_hour.as_ref())
+            .map(|w| w.utilization),
+        Some(20.0),
+        "a pure third-party member's windows come from the provider store"
+    );
+}
+
+/// A provider whose derivation declines (`best_effort` → `to_usage_info` → `None`) must not
+/// keep answering the walk with a frozen figure.
+#[test]
+fn the_picker_removes_a_member_whose_provider_stopped_publishing() {
+    use crate::usage::ThirdPartyUsageStore;
+
+    let store = store_with_utils(&[("tp", 50.0)]);
+    let mut stats = tp_stats(50.0);
+    stats.best_effort = true;
+    let tp_store: ThirdPartyUsageStore =
+        Arc::new(RankedMutex::new(HashMap::from([("tp".to_string(), stats)])));
+    let members = vec![headroom_member("tp", false)];
+    let third_party_names: HashSet<ProfileName> = HashSet::from([ProfileName::from("tp")]);
+
+    let usage = usage_snapshot_for_chain(&store, &tp_store, &third_party_names, &members);
+    assert!(
+        !usage.contains_key("tp"),
+        "a provider that stopped publishing windows has no walk entry"
+    );
+}
+
+/// The walk/fallback decision drives the picker: a hybrid active whose OAuth
+/// reading is exhausted but whose provider windows have headroom stays put:
+/// the walk judges the provider side, never the OAuth reading.
+#[test]
+fn a_hybrid_active_walks_on_its_provider_windows() {
+    use crate::usage::ThirdPartyUsageStore;
+
+    let config = config_with_chain(
+        vec![
+            hybrid_profile("a", Some(95.0)),
+            profile_with_util("b", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    let store = store_with_utils(&[("a", 100.0), ("b", 10.0)]);
+    let tp_store: ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        tp_stats(10.0),
+    )])));
+    let third_party_names: HashSet<ProfileName> = HashSet::from([ProfileName::from("a")]);
+
+    let usage = usage_snapshot_for_chain(&store, &tp_store, &third_party_names, &snap.chain);
+    assert_eq!(
+        next_auto_switch_target_with_usage(&snap, &usage, &third_party_names),
+        None,
+        "a hybrid active with provider headroom must not switch on its stale OAuth reading"
+    );
+}
+
+/// A hybrid active under burn-aware switching never pairs
+/// its OAuth burn history with its provider window — the static threshold
+/// decides (maintainer ruling 2026-09-10). Gamma (third-party) at 92% with a 600 %/h OAuth
+/// climb must NOT be walked off, where the burn branch would project past 100.
+#[test]
+fn burn_aware_never_projects_a_hybrids_provider_window_from_its_oauth_burn() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let member = |name: &str| ChainMember {
+        name: name.into(),
+        threshold: 95.0,
+        last_resort: false,
+        preferred: false,
+        max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
+    };
+    let snap = ChainSnapshot {
+        active: "gamma".into(),
+        chain: vec![member("alpha"), member("beta"), member("gamma")],
+        switch_off_when_spent: false,
+        broken: vec![],
+        burn_aware: true,
+        walk_order: WalkOrder::Chain,
+        interval_ms: 60_000,
+        burn_floor_pct: 90.0,
+        burn_horizon_cap_ms: 60_000,
+        spend_budget: false,
+        switch_off_when_budget_spent: false,
+        kick_rejected: vec![],
+        reading_dead: vec![],
+        fresh: vec!["gamma".into(), "alpha".into(), "beta".into()],
+    };
+    // The OAuth leg's burn history: 32 → 92 over 6 minutes = 600 %/h.
+    let now = crate::usage::now_ms();
+    write_history(
+        "gamma",
+        &[
+            (
+                now - 360_000,
+                usage_info(Some(window(32.0, Some(live_reset())))),
+            ),
+            (
+                now - 240_000,
+                usage_info(Some(window(52.0, Some(live_reset())))),
+            ),
+            (
+                now - 120_000,
+                usage_info(Some(window(72.0, Some(live_reset())))),
+            ),
+        ],
+    );
+    let clear = usage_both(
+        Some(window(10.0, Some(live_reset()))),
+        Some(window(10.0, Some(reset_in(3 * 86_400)))),
+    );
+    let usage = HashMap::from([
+        ("alpha".to_string(), clear.clone()),
+        ("beta".to_string(), clear),
+        (
+            "gamma".to_string(),
+            usage_info(Some(window(92.0, Some(live_reset())))),
+        ),
+    ]);
+    let third_party_names: HashSet<ProfileName> = HashSet::from([ProfileName::from("gamma")]);
+    assert_eq!(
+        next_auto_switch_target_with_usage(&snap, &usage, &third_party_names),
+        None,
+        "a hybrid's provider window never pairs its OAuth burn history"
     );
 }

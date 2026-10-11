@@ -1348,17 +1348,14 @@ fn render_nudge(f: &NudgeFigures) -> Option<String> {
 /// active: a pinned runtime session can resolve to a member a switch never
 /// moves, and a walk anchored on the global active would answer "the chain
 /// would act" about that switch
-/// ([`crate::fallback::snapshot_chain_from`]). Same call the leg makes,
-/// `fallback::next_auto_switch_target`, fed a store hydrated from the caches
-/// the daemon's own store is persisted to and hydrated from — OAuth caches and
-/// third-party caches alike, the latter through the same `to_usage_info`
-/// derivation the scheduler's mirror runs, so a provider window judges this
-/// replay exactly as it judges the live leg. A member with no cached usage
-/// reads exactly as it reads in the real store (absent entry = headroom). The `Arc<RankedMutex>` wrapper is the entry point's
-/// signature, not shared state: the mutex is process-private, never
-/// contended, locked only for the walk's own snapshot clone, and taken while
-/// this process holds no other rank — so no rank in the global order is
-/// acquired in a context that could invert it. The walk's `fresh` and
+/// ([`crate::fallback::snapshot_chain_from`]). Same walk the leg runs,
+/// `fallback::next_auto_switch_target_with_usage`, fed each member's windows
+/// off its own disk cache by the same `usage_cache_is_third_party` split the
+/// live leg's picker makes (`profile_windows_for`): OAuth caches as they are,
+/// third-party caches through `to_usage_info`, and the third-party names
+/// passed along so a burn-aware walk never projects a provider window from
+/// OAuth burn history here either. A member with no cached usage reads
+/// exactly as it reads in the live leg (absent entry = headroom). The walk's `fresh` and
 /// `kick_rejected` channels stay empty, which the snapshot type documents as
 /// "not config state": freshness is a preference the any-fresh pass renders
 /// moot, and a kick-rejected member reads as headroom here where the live
@@ -1382,31 +1379,30 @@ fn chain_would_act(
     // replay that reads it as headroom would answer "the chain would act"
     // about a switch nothing will make.
     snapshot.broken.extend(key_rejected);
-    let usage: std::collections::HashMap<String, crate::usage::UsageInfo> = snapshot
-        .chain
-        .iter()
-        .filter_map(|m| {
-            let derived = match crate::profile_json::profile_windows_for(&m.name) {
-                crate::profile_json::ProfileWindows::Oauth {
-                    usage: Some(usage), ..
-                } => *usage,
-                // A third-party member's provider windows are windows the live
-                // leg walks on — the scheduler mirrors this same derivation
-                // into its own store — so the replay must judge them too. An
-                // OAuth-only replay reads the member as windowless headroom
-                // and answers "the chain would act" about a switch the live
-                // leg refuses.
-                crate::profile_json::ProfileWindows::ThirdParty {
-                    stats: Some(stats), ..
-                } => stats.to_usage_info()?,
-                _ => return None,
-            };
-            Some((m.name.to_string(), derived))
-        })
-        .collect();
-    let store: crate::usage::UsageStore =
-        std::sync::Arc::new(crate::lockorder::RankedMutex::new(usage));
-    crate::fallback::next_auto_switch_target(&snapshot, &store).is_some()
+    let mut usage = std::collections::HashMap::new();
+    let mut third_party_names = std::collections::HashSet::new();
+    for m in &snapshot.chain {
+        match crate::profile_json::profile_windows_for(&m.name) {
+            crate::profile_json::ProfileWindows::Oauth {
+                usage: Some(info), ..
+            } => {
+                usage.insert(m.name.to_string(), *info);
+            }
+            crate::profile_json::ProfileWindows::Oauth { usage: None, .. } => {}
+            // A third-party member's provider windows are windows the live leg
+            // walks on, so the replay judges them too: an OAuth-only replay
+            // reads the member as windowless headroom and answers "the chain
+            // would act" about a switch the live leg refuses.
+            crate::profile_json::ProfileWindows::ThirdParty { stats, .. } => {
+                third_party_names.insert(m.name.clone());
+                if let Some(info) = stats.as_ref().and_then(|s| s.to_usage_info()) {
+                    usage.insert(m.name.to_string(), info);
+                }
+            }
+        }
+    }
+    crate::fallback::next_auto_switch_target_with_usage(&snapshot, &usage, &third_party_names)
+        .is_some()
 }
 
 /// The nudge verdict against the state this scope remembers.

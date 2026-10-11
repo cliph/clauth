@@ -6,12 +6,12 @@ use crate::actions::{switch_off_locked, switch_profile_locked};
 use crate::lock::with_state_lock;
 use crate::profile::{AppConfig, Profile, ProfileName, WalkOrder};
 use crate::usage::{
-    FetchStatus, UsageInfo, UsageStore, UsageWindow, five_hour_live, iso_to_epoch_secs,
-    now_epoch_secs, seven_day_live,
+    FetchStatus, ThirdPartyUsageStore, UsageInfo, UsageStore, UsageWindow, five_hour_live,
+    iso_to_epoch_secs, now_epoch_secs, seven_day_live,
 };
 
 // Test-only per-thread counter: increments each time an evaluator entry point
-// (`next_auto_switch_target` or `next_auto_switch_decision`) takes the
+// (`next_auto_switch_target`) takes the
 // `UsageStore` lock. The snapshot refactor takes it exactly once per
 // evaluation; the pre-snapshot shape (which locked per predicate: headroom walk
 // pass 1a + 1b, serving-sink active + sibling, spend-armed active + sibling,
@@ -1299,6 +1299,7 @@ fn is_canceled_from_usage(name: &ProfileName, usage: &HashMap<String, UsageInfo>
 /// (cloned under the one lock), so the (disk-only, unlocked) burn rate lookup
 /// below runs with no store lock held — same property the pre-snapshot shape
 /// upheld per predicate.
+#[allow(clippy::too_many_arguments)]
 fn is_exhausted_active_from_usage(
     member: &ChainMember,
     burn_aware: bool,
@@ -1307,6 +1308,7 @@ fn is_exhausted_active_from_usage(
     line: f64,
     floor_pct: f64,
     horizon_cap_ms: u64,
+    third_party: bool,
 ) -> bool {
     let now = now_epoch_secs();
     let Some(info) = usage.get(member.name.as_str()) else {
@@ -1322,7 +1324,11 @@ fn is_exhausted_active_from_usage(
     else {
         return false;
     };
-    if !burn_aware {
+    if !burn_aware || third_party {
+        // A third-party member's provider window has no burn history to pair
+        // (no third-party leg appends `usage_history.jsonl`), so the static
+        // threshold decides — never a cross-pool projection of the OAuth leg's
+        // burn onto the provider window (maintainer ruling 2026-09-10).
         return window.utilization >= member.threshold;
     }
     let rate = burn_rate_for_profile(&member.name, &window);
@@ -1979,27 +1985,67 @@ fn usage_snapshot(store: &UsageStore) -> HashMap<String, UsageInfo> {
     }
 }
 
+/// The per-member choice behind the picker, shared by the walk's snapshot
+/// builder ([`usage_snapshot_for_chain`]) and the TUI's `apply_usage`, so the
+/// two cannot drift: a third-party-classified member takes its provider stats'
+/// `to_usage_info()` (or none), any other member keeps the merged store's
+/// entry. `third_party` is `Profile::usage_cache_is_third_party`, the same
+/// predicate the disk readers key on.
+pub(crate) fn picked_usage(
+    third_party: bool,
+    oauth: Option<&UsageInfo>,
+    stats: Option<&crate::providers::ThirdPartyStats>,
+) -> Option<UsageInfo> {
+    if third_party {
+        stats.and_then(crate::providers::ThirdPartyStats::to_usage_info)
+    } else {
+        oauth.cloned()
+    }
+}
+
+/// The in-memory twin of `profile_json::windows_of`: the chain walk's usage
+/// snapshot, with each member's windows picked from its own half — the OAuth
+/// (or codex) reading in the merged store, or a third-party member's
+/// provider-derived windows in the third-party store. `third_party_names` is
+/// the set the caller derived from `Profile::usage_cache_is_third_party`, the
+/// same predicate the disk readers key on, so no reader re-derives "third
+/// party" from a neighbouring predicate. `None` REMOVES the entry — a provider
+/// that stopped publishing windows must not keep answering the walk with a
+/// frozen figure. Each store is locked once and released before any pass runs, so
+/// no two tracked locks are ever held together.
+pub(crate) fn usage_snapshot_for_chain(
+    store: &UsageStore,
+    third_party: &ThirdPartyUsageStore,
+    third_party_names: &HashSet<ProfileName>,
+    members: &[ChainMember],
+) -> HashMap<String, UsageInfo> {
+    let mut usage = usage_snapshot(store);
+    let third_party_map = third_party.lock().ok().map(|s| s.clone());
+    for member in members {
+        let picked = picked_usage(
+            third_party_names.contains(&member.name),
+            usage.get(member.name.as_str()),
+            third_party_map
+                .as_ref()
+                .and_then(|s| s.get(member.name.as_str())),
+        );
+        match picked {
+            Some(info) => {
+                usage.insert(member.name.to_string(), info);
+            }
+            None => {
+                usage.remove(member.name.as_str());
+            }
+        }
+    }
+    usage
+}
+
 pub(crate) fn next_auto_switch_target(
     snapshot: &ChainSnapshot,
     store: &UsageStore,
 ) -> Option<SwitchAction> {
-    next_auto_switch_target_with_usage(snapshot, &usage_snapshot(store))
-}
-
-/// The richer evaluator entry point: the action PLUS whether the active's key
-/// rejection was necessary for it. `with_snapshot` folds the active's key
-/// rejection in (its `broken` and every member's `preferred`), and
-/// `without_snapshot` is the SAME complete snapshot built from the same config
-/// with only the active removed from the key-rejected set — so every member's
-/// home/preferred judgment, not only the active's, is recomputed and a
-/// sibling's bare `preferred` flag stands down exactly as a real snapshot
-/// without the rejection would.
-pub(crate) fn next_auto_switch_decision(
-    with_snapshot: &ChainSnapshot,
-    without_snapshot: &ChainSnapshot,
-    store: &UsageStore,
-) -> Option<AutoSwitchDecision> {
-    next_auto_switch_decision_with_usage(with_snapshot, without_snapshot, &usage_snapshot(store))
+    next_auto_switch_target_with_usage(snapshot, &usage_snapshot(store), &HashSet::new())
 }
 
 /// Snapshot-driven core of [`next_auto_switch_target`]: every predicate reads
@@ -2011,17 +2057,20 @@ pub(crate) fn next_auto_switch_target_for_test(
     snapshot: &ChainSnapshot,
     usage: &HashMap<String, UsageInfo>,
 ) -> Option<SwitchAction> {
-    next_auto_switch_target_with_usage(snapshot, usage)
+    next_auto_switch_target_with_usage(snapshot, usage, &HashSet::new())
 }
 
 /// The simple (no-cause) "with key rejection" evaluation: the active's effective
 /// broken/preferred read straight off the snapshot, where the caller already
-/// folded key rejection into `broken` and `preferred`.
-fn next_auto_switch_target_with_usage(
+/// folded key rejection into `broken` and `preferred`. `third_party_names` is
+/// the picker's classification, carried so the burn-aware active check never
+/// pairs a third-party member's provider window with the OAuth burn history.
+pub(crate) fn next_auto_switch_target_with_usage(
     snapshot: &ChainSnapshot,
     usage: &HashMap<String, UsageInfo>,
+    third_party_names: &HashSet<ProfileName>,
 ) -> Option<SwitchAction> {
-    next_auto_switch_target_core(snapshot, usage)
+    next_auto_switch_target_core(snapshot, usage, third_party_names)
 }
 
 /// Evaluate twice and compare: once on `with_snapshot` (key rejection folded
@@ -2030,13 +2079,14 @@ fn next_auto_switch_target_with_usage(
 /// rejection was necessary for the exact action — an independently produced
 /// exhaustion/scoped/home/overlap move comes out identical and carries no
 /// cause.
-fn next_auto_switch_decision_with_usage(
+pub(crate) fn next_auto_switch_decision_with_usage(
     with_snapshot: &ChainSnapshot,
     without_snapshot: &ChainSnapshot,
     usage: &HashMap<String, UsageInfo>,
+    third_party_names: &HashSet<ProfileName>,
 ) -> Option<AutoSwitchDecision> {
-    let with = next_auto_switch_target_core(with_snapshot, usage)?;
-    let without = next_auto_switch_target_core(without_snapshot, usage);
+    let with = next_auto_switch_target_core(with_snapshot, usage, third_party_names)?;
+    let without = next_auto_switch_target_core(without_snapshot, usage, third_party_names);
     let key_rejection_necessary = Some(&with) != without.as_ref();
     Some(AutoSwitchDecision {
         action: with,
@@ -2050,6 +2100,7 @@ fn next_auto_switch_decision_with_usage(
 fn next_auto_switch_target_core(
     snapshot: &ChainSnapshot,
     usage: &HashMap<String, UsageInfo>,
+    third_party_names: &HashSet<ProfileName>,
 ) -> Option<SwitchAction> {
     let active_idx = snapshot
         .chain
@@ -2100,6 +2151,7 @@ fn next_auto_switch_target_core(
         active.weekly_line,
         snapshot.burn_floor_pct,
         snapshot.burn_horizon_cap_ms,
+        third_party_names.contains(&active.name),
     );
 
     let skip = |i: usize| {
@@ -2341,6 +2393,7 @@ fn next_auto_switch_target_core(
             WEEKLY_HARD_BLOCK_PCT,
             snapshot.burn_floor_pct,
             snapshot.burn_horizon_cap_ms,
+            third_party_names.contains(&active.name),
         )
     {
         return Some(SwitchAction::Off);
@@ -2385,22 +2438,26 @@ fn fully_clear_target(
 /// how idle its cached window reads, so it never recovers either. Auth-broken
 /// members carry no plan/usage marker to catch here — the caller filters them
 /// out of `chain` before this runs (mirrors the `is_disabled` filter).
-pub(crate) fn find_recovered_member(
+#[cfg(test)]
+pub(crate) fn find_recovered_member_for_test(
     chain: &[ChainMember],
     store: &UsageStore,
     kick_rejected: &[ProfileName],
     walk_order: WalkOrder,
 ) -> Option<String> {
+    find_recovered_member(chain, &usage_snapshot(store), kick_rejected, walk_order)
+}
+
+/// The recovery walk over an already-resolved usage snapshot — the scheduler's
+/// recovery scan builds the picker snapshot once ([`usage_snapshot_for_chain`])
+/// and shares it with the dead-reading pass.
+pub(crate) fn find_recovered_member(
+    chain: &[ChainMember],
+    usage: &HashMap<String, UsageInfo>,
+    kick_rejected: &[ProfileName],
+    walk_order: WalkOrder,
+) -> Option<String> {
     let now = now_epoch_secs();
-    // One lock window for the whole evaluation (the `next_auto_switch_target`
-    // discipline): both the ordering key and the recovered predicate read the
-    // same clone, so a fetch landing mid-pass cannot reorder the walk or flip
-    // a member's verdict between passes. Poisoned → empty map, which reads
-    // every member undecidable — the aggregate of the old per-member `Err` path.
-    let usage: HashMap<String, UsageInfo> = match store.lock() {
-        Ok(s) => s.clone(),
-        Err(_) => HashMap::new(),
-    };
     let recovered = |member: &ChainMember, require_scoped_clear: bool| -> Option<bool> {
         if kick_rejected.iter().any(|k| k == &member.name) {
             return Some(false);

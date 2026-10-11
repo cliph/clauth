@@ -4517,7 +4517,6 @@ impl App {
             );
             bootstrap_third_party(
                 &h.third_party_usage_store,
-                &h.usage_store,
                 &h.third_party_status,
                 &h.last_fetched,
                 &third_party,
@@ -4587,6 +4586,28 @@ impl App {
         .flatten()
     }
 
+    /// The in-memory burn rate for `profile`, or `None` when the profile is
+    /// third-party-classified — a hybrid never pairs its OAuth burn history with
+    /// its provider window (maintainer ruling 2026-09-10), so its windows are judged by the
+    /// static threshold, never a cross-pool projection. The one guard the
+    /// Overview ETA and the startup one-shot both read.
+    pub(crate) fn burn_rate_for(&self, profile: &Profile, usage_info: &UsageInfo) -> Option<f64> {
+        if profile.usage_cache_is_third_party() {
+            return None;
+        }
+        self.active_burn_rate(&profile.name, usage_info)
+    }
+
+    /// The startup one-shot's burn rate for `profile`: its `Profile.usage`
+    /// reading, or `None` when there is none. The one-shot reads its rate
+    /// through this step, never `active_burn_rate` directly — a
+    /// third-party-classified profile still refuses the OAuth burn pairing via
+    /// [`Self::burn_rate_for`] (maintainer ruling 2026-09-10).
+    fn startup_rate(&self, profile: &Profile) -> Option<f64> {
+        let usage = profile.usage.as_ref()?;
+        self.burn_rate_for(profile, usage)
+    }
+
     /// The funded wallet's burn rate for `profile`, computed from the
     /// in-memory `wallet_cache` — never touches disk. The wallet twin of
     /// [`Self::active_burn_rate`]: the Usage tab's balance row and the
@@ -4643,10 +4664,7 @@ impl App {
             if active_fresh {
                 // In-memory rate only (`history_cache`) — never a disk read
                 // while the config guard is held; see `active_burn_rate`.
-                let rate = active_profile.and_then(|p| {
-                    let usage = p.usage.as_ref()?;
-                    self.active_burn_rate(&p.name, usage)
-                });
+                let rate = active_profile.and_then(|p| self.startup_rate(p));
                 drop(cfg);
                 auto_switch_if_needed(&self.config, rate).ok().flatten()
             } else {
@@ -4734,11 +4752,40 @@ impl App {
             let interval_ms = cfg.state.refresh_interval_ms;
             let refresh_spent_accounts = cfg.state.refresh_spent_accounts;
             for p in &mut cfg.profiles {
-                if let Some(s) = info_map.as_ref() {
-                    p.usage = s.get(p.name.as_str()).cloned();
+                // The TUI's per-account reading is the picker's whole record,
+                // the same dichotomy the walk's picker and the disk readers
+                // key on (`usage_cache_is_third_party`): a third-party account
+                // (pure or hybrid) takes its provider stats' `to_usage_info()`
+                // — never the OAuth leg's entry, so a stale OAuth reading under
+                // a logged-out hybrid's name cannot survive, and no OAuth plan
+                // or spend reaches a hybrid's `Profile.usage`. Assign only when
+                // the store the classification needs is present — a poisoned
+                // lock keeps the prior reading.
+                let side_ok = if p.usage_cache_is_third_party() {
+                    third_party_map.is_some()
+                } else {
+                    info_map.is_some()
+                };
+                if side_ok {
+                    p.usage = crate::fallback::picked_usage(
+                        p.usage_cache_is_third_party(),
+                        info_map.as_ref().and_then(|s| s.get(p.name.as_str())),
+                        third_party_map
+                            .as_ref()
+                            .and_then(|s| s.get(p.name.as_str())),
+                    );
                 }
-                // OAuth fetch_status takes precedence; third-party only when no OAuth status.
-                if let Some(s) = status_map.as_ref()
+                // Fetch_status follows the picker's side too, so the TUI's
+                // freshness (the startup one-shot gate and the status pill)
+                // agrees with the scheduler's `decision_fresh_any`: a
+                // third-party-classified account reads its third-party status;
+                // every other account is OAuth-first with the third-party
+                // fallback.
+                if p.usage_cache_is_third_party() {
+                    if let Some(s) = third_party_status_map.as_ref() {
+                        p.fetch_status = s.get(p.name.as_str()).copied();
+                    }
+                } else if let Some(s) = status_map.as_ref()
                     && s.contains_key(p.name.as_str())
                 {
                     p.fetch_status = s.get(p.name.as_str()).copied();
@@ -4749,18 +4796,6 @@ impl App {
                     && s.contains_key(p.name.as_str())
                 {
                     p.third_party_usage = s.get(p.name.as_str()).cloned();
-                }
-                // A third-party member's bars are its usage snapshot. The
-                // scheduler writes the snapshot and mirrors its derived window
-                // into the usage store as two separate acquisitions, so an
-                // apply landing between them still owes this account a figure:
-                // derive it off the snapshot. The `is_none` guard keeps that a
-                // fallback — the store's own entry, whichever leg wrote it,
-                // always wins.
-                if p.usage.is_none()
-                    && let Some(stats) = p.third_party_usage.as_ref()
-                {
-                    p.usage = stats.to_usage_info();
                 }
 
                 // #74 degraded cue: cache age past the derived threshold reads

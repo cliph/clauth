@@ -585,12 +585,22 @@ fn drain_pending_switch_executes_a_producer_ordinary_record_after_same_name_conv
         .expect("broken")
         .insert("tp".to_string(), tp_fp);
     let now = crate::usage::now_epoch_secs();
-    let spent = crate::usage::UsageInfo {
-        five_hour: Some(crate::usage::UsageWindow {
-            utilization: 100.0,
+    // The picker reads a third-party member's provider windows from the
+    // third-party store, so the spent hybrid's reading lives there (a 5h bar at
+    // 100%) rather than in the merged store.
+    let spent = crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: Vec::new(),
+        bars: vec![crate::providers::UsageBar {
+            label: "5h".to_string(),
+            pct: 100.0,
             resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3600)),
-        }),
-        ..Default::default()
+            used: None,
+            total: None,
+        }],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
     };
     let clear = crate::usage::UsageInfo {
         five_hour: Some(crate::usage::UsageWindow {
@@ -600,9 +610,9 @@ fn drain_pending_switch_executes_a_producer_ordinary_record_after_same_name_conv
         ..Default::default()
     };
     daemon
-        .usage_store
+        .third_party_usage_store
         .lock()
-        .expect("usage")
+        .expect("third-party usage")
         .insert("tp".to_string(), spent);
     daemon
         .usage_store
@@ -620,6 +630,7 @@ fn drain_pending_switch_executes_a_producer_ordinary_record_after_same_name_conv
     crate::usage::scan_auto_switch(
         &daemon.config,
         &daemon.usage_store,
+        &daemon.third_party_usage_store,
         &daemon.usage_status,
         &daemon.third_party_status,
         &daemon.third_party_streaks,
@@ -727,6 +738,7 @@ fn drain_pending_switch_drops_a_day_claim_repair_after_key_rejection() {
     crate::usage::scan_auto_switch(
         &daemon.config,
         &daemon.usage_store,
+        &daemon.third_party_usage_store,
         &daemon.usage_status,
         &daemon.third_party_status,
         &daemon.third_party_streaks,

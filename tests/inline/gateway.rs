@@ -3090,9 +3090,16 @@ fn the_masking_set_reads_the_tokens_file() {
     let tok = dir.join("tokens.txt");
     write(&tok, "  ops:tok.en+val.ue  \n");
     let config = home.home().join("etc").join("shunt.toml");
+    // `toml_edit::value` quotes the path so TOML reads it back byte for byte:
+    // a Windows path spliced raw into a TOML basic string reads its `\U…`
+    // bytes as an escape, the parse fails, and the masking set comes back
+    // empty.
     write(
         &config,
-        &format!("[server.admin]\ntokens_file = \"{}\"\n", tok.display()),
+        &format!(
+            "[server.admin]\ntokens_file = {}\n",
+            toml_edit::value(tok.to_string_lossy().as_ref())
+        ),
     );
     let env = GatewayEnv::default();
     let inherited: Vec<(OsString, OsString)> = Vec::new();
@@ -3101,6 +3108,22 @@ fn the_masking_set_reads_the_tokens_file() {
         values.iter().any(|v| v == "ops:tok.en+val.ue"),
         "{values:?}"
     );
+
+    // A backslashed relative name keeps the file inside the sandbox: one file
+    // whose name holds `\c` (an invalid TOML escape) on unix, nested
+    // directories under `etc\Users` (`\U`) on Windows, so every platform puts
+    // a backslash path through the fixture's quoting.
+    let win_tok = dir.join("Users\\cu\\tokens.txt");
+    write(&win_tok, "win.tok+value\n");
+    write(
+        &config,
+        &format!(
+            "[server.admin]\ntokens_file = {}\n",
+            toml_edit::value(win_tok.to_string_lossy().as_ref())
+        ),
+    );
+    let values = check_masking_values(&config, &env, &inherited);
+    assert!(values.iter().any(|v| v == "win.tok+value"), "{values:?}");
 }
 
 /// A check that writes more than the cap plus the pipe buffer and then

@@ -20,7 +20,7 @@ mod fetch;
         reason = "#110: the usage probe reads it once the usage-store rework lands"
     )
 )]
-mod probe;
+mod inference;
 mod scheduler;
 
 pub(crate) use burn::{

@@ -1,15 +1,15 @@
 use super::reading_from_headers;
-use crate::usage::probe::{ProbeReading, ProbeStatus, ProbeWindow};
+use crate::usage::inference::{InferenceReading, InferenceWindow, LimitStatus};
 
-fn read(pairs: &[(&str, &str)]) -> Option<ProbeReading> {
+fn read(pairs: &[(&str, &str)]) -> Option<InferenceReading> {
     reading_from_headers(pairs.iter().copied())
 }
 
-fn names(reading: &ProbeReading) -> Vec<&str> {
+fn names(reading: &InferenceReading) -> Vec<&str> {
     reading.windows.iter().map(|w| w.name.as_str()).collect()
 }
 
-fn window<'r>(reading: &'r ProbeReading, name: &str) -> &'r ProbeWindow {
+fn window<'r>(reading: &'r InferenceReading, name: &str) -> &'r InferenceWindow {
     reading
         .windows
         .iter()
@@ -44,18 +44,18 @@ fn a_fable_probe_reads_5h_7d_and_7d_oi() {
     assert_eq!(names(&reading), ["5h", "7d", "7d_oi"]);
     assert_eq!(
         window(&reading, "5h"),
-        &ProbeWindow {
+        &InferenceWindow {
             name: "5h".into(),
             utilization: 0.0,
             resets_at: Some(1_791_397_800),
-            status: Some(ProbeStatus::Allowed),
+            status: Some(LimitStatus::Allowed),
         }
     );
     let week = window(&reading, "7d");
     assert_eq!(week.utilization, 20.0);
     assert_eq!(week.resets_at, Some(1_791_648_000));
     assert_eq!(window(&reading, "7d_oi").resets_at, Some(1_791_648_000));
-    assert_eq!(reading.status, Some(ProbeStatus::Allowed));
+    assert_eq!(reading.status, Some(LimitStatus::Allowed));
     assert_eq!(reading.resets_at, Some(1_791_397_800));
 }
 
@@ -83,12 +83,12 @@ fn a_window_exhaustion_429_is_a_reading() {
     let five = window(&reading, "5h");
     assert_eq!(five.utilization, 100.0);
     assert_eq!(five.resets_at, Some(1_791_400_000));
-    assert_eq!(five.status, Some(ProbeStatus::Rejected));
+    assert_eq!(five.status, Some(LimitStatus::Rejected));
     let week = window(&reading, "7d");
     assert_eq!(week.utilization, 62.0, "0.62 reads as exactly 62");
     assert_eq!(week.resets_at, Some(1_791_700_000));
-    assert_eq!(week.status, Some(ProbeStatus::Allowed));
-    assert_eq!(reading.status, Some(ProbeStatus::Rejected));
+    assert_eq!(week.status, Some(LimitStatus::Allowed));
+    assert_eq!(reading.status, Some(LimitStatus::Rejected));
     assert_eq!(reading.resets_at, Some(1_791_400_000));
 }
 
@@ -118,7 +118,7 @@ fn a_window_nobody_has_seen_yet_arrives_as_its_own_window() {
     assert_eq!(slow.status, None, "it sent no status of its own");
     assert_eq!(
         reading.status,
-        Some(ProbeStatus::Allowed),
+        Some(LimitStatus::Allowed),
         "the lane's state is not the response's status"
     );
 }
@@ -152,10 +152,10 @@ fn every_status_claude_code_knows_reads_and_others_do_not() {
         .windows[0]
             .status
     };
-    assert_eq!(status_of("allowed"), Some(ProbeStatus::Allowed));
-    assert_eq!(status_of("allowed_warning"), Some(ProbeStatus::Warning));
-    assert_eq!(status_of("rejected"), Some(ProbeStatus::Rejected));
-    assert_eq!(status_of("Rejected"), Some(ProbeStatus::Rejected));
+    assert_eq!(status_of("allowed"), Some(LimitStatus::Allowed));
+    assert_eq!(status_of("allowed_warning"), Some(LimitStatus::Warning));
+    assert_eq!(status_of("rejected"), Some(LimitStatus::Rejected));
+    assert_eq!(status_of("Rejected"), Some(LimitStatus::Rejected));
     assert_eq!(status_of("throttled"), None, "an unknown status is none");
 }
 
@@ -210,7 +210,7 @@ fn header_names_match_in_any_case() {
     let five = window(&reading, "5h");
     assert_eq!(five.utilization, 50.0);
     assert_eq!(five.resets_at, Some(1_791_397_800));
-    assert_eq!(five.status, Some(ProbeStatus::Allowed));
+    assert_eq!(five.status, Some(LimitStatus::Allowed));
 }
 
 #[test]
@@ -235,7 +235,7 @@ fn an_unusable_value_drops_only_its_own_field() {
     assert_eq!(week.utilization, 25.0);
     assert_eq!(week.resets_at, None, "an unparseable reset is no reset");
     assert_eq!(week.status, None, "an unknown status is no status");
-    assert_eq!(reading.status, Some(ProbeStatus::Allowed));
+    assert_eq!(reading.status, Some(LimitStatus::Allowed));
 }
 
 /// One window per name, from the first copy, as `HeaderMap::get` reads it,

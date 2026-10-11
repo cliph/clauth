@@ -13,7 +13,7 @@ pub(crate) mod anthropic;
 
 /// One rate-limit window an inference response reported.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ProbeWindow {
+pub(crate) struct InferenceWindow {
     /// The provider's own name for the window (`5h`, `7d`, `7d_oi` on
     /// Anthropic), lowercased like the header it came from. Kept as sent so a
     /// window the provider adds later arrives without a code change.
@@ -25,13 +25,13 @@ pub(crate) struct ProbeWindow {
     /// kept for the caller to judge.
     pub(crate) resets_at: Option<i64>,
     /// The provider's status for this window alone.
-    pub(crate) status: Option<ProbeStatus>,
+    pub(crate) status: Option<LimitStatus>,
 }
 
 /// Whether a provider let a request through, for one window or for the
 /// response as a whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProbeStatus {
+pub(crate) enum LimitStatus {
     Allowed,
     /// Let through, close to the limit.
     Warning,
@@ -40,11 +40,14 @@ pub(crate) enum ProbeStatus {
 
 /// Everything one inference response said about the account's usage.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ProbeReading {
-    /// Every window the response reported, in the order it reported them.
-    pub(crate) windows: Vec<ProbeWindow>,
+pub(crate) struct InferenceReading {
+    /// Every window the response reported, in the order the header set handed
+    /// them over. Where the caller hands over a `HeaderMap`, whose `iter()`
+    /// order is arbitrary, that need not be the order they arrived in on the
+    /// wire.
+    pub(crate) windows: Vec<InferenceWindow>,
     /// The response-wide status.
-    pub(crate) status: Option<ProbeStatus>,
+    pub(crate) status: Option<LimitStatus>,
     /// The response-wide reset, in epoch seconds, as sent (see the provider
     /// module for what it means there).
     pub(crate) resets_at: Option<i64>,

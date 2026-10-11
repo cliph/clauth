@@ -18,16 +18,25 @@
 //! The response-wide `-reset` is the binding window's reset; on a 429 it is an
 //! upper bound only (the limiter has relented early, see `KickRateLimit`).
 //!
-//! Not read: `-representative-claim`, `-fallback-percentage`,
-//! `-upgrade-paths`, `-<name>-surpassed-threshold`, any field of a name that
-//! carries no `-utilization` (a 429's `overage-status`, say), and the
+//! Not read: `-representative-claim`, `-upgrade-paths`,
+//! `-fallback-percentage` and the response-wide `-fallback` Claude Code
+//! knows beside it, `-<name>-surpassed-threshold`, and every field of a
+//! name that carries no `-utilization` (the recorded 429's `overage-status`,
+//! say, which came without one). Of a name that does carry one, only its
+//! `-reset` and `-status` join it: Claude Code knows an
+//! `-overage-utilization`, so where that arrives `overage` is a window, and
+//! the `-overage-in-use`, `-overage-scope`, `-overage-disabled-reason` and
+//! `-overage-period` fields stay out all the same. Out too is the
 //! low-priority lane's own state (`-slow-status`, `-slow-offer`,
-//! `-slow-max-wait`, `-slow-retry-after`), which is no window and waits for the
-//! probe that asks for that lane. A status without any window is no reading
-//! either: the kick's 429 handling (`kick_rate_limit_at`) owns that verdict,
-//! together with `retry-after`.
+//! `-slow-max-wait`, `-slow-retry-after`), which is no window and waits for
+//! the probe that asks for that lane. The `-overage-period-*` sub-pools are
+//! another matter: they carry a `-utilization` each, so they arrive as windows
+//! of their own, and keeping them out of the store's limits is the mapping's
+//! job. A status without any window is no reading either: the kick's 429
+//! handling (`kick_rate_limit_at`) owns that verdict, together with
+//! `retry-after`.
 
-use super::{ProbeReading, ProbeStatus, ProbeWindow};
+use super::{InferenceReading, InferenceWindow, LimitStatus};
 
 const PREFIX: &str = "anthropic-ratelimit-unified-";
 const UTILIZATION: &str = "-utilization";
@@ -39,7 +48,7 @@ const UTILIZATION: &str = "-utilization";
 /// reading. Pure: the caller owns the response.
 pub(crate) fn reading_from_headers<'h>(
     headers: impl IntoIterator<Item = (&'h str, &'h str)>,
-) -> Option<ProbeReading> {
+) -> Option<InferenceReading> {
     // Header names are case-insensitive on the wire. The first of a repeated
     // name wins, usable or not, as `HeaderMap::get` would have it.
     let mut unified: Vec<(String, &str)> = Vec::new();
@@ -57,11 +66,11 @@ pub(crate) fn reading_from_headers<'h>(
             .find(|(name, _)| name == key)
             .map(|(_, value)| *value)
     };
-    let windows: Vec<ProbeWindow> = unified
+    let windows: Vec<InferenceWindow> = unified
         .iter()
         .filter_map(|(name, value)| {
             let window = name.strip_suffix(UTILIZATION).filter(|w| !w.is_empty())?;
-            Some(ProbeWindow {
+            Some(InferenceWindow {
                 name: window.to_string(),
                 utilization: percent(value)?,
                 resets_at: field(&format!("{window}-reset")).and_then(epoch_secs),
@@ -72,7 +81,7 @@ pub(crate) fn reading_from_headers<'h>(
     if windows.is_empty() {
         return None;
     }
-    Some(ProbeReading {
+    Some(InferenceReading {
         windows,
         status: field("status").and_then(status),
         resets_at: field("reset").and_then(epoch_secs),
@@ -94,11 +103,11 @@ fn epoch_secs(value: &str) -> Option<i64> {
 
 /// The three statuses Claude Code 2.1.294 knows. Any other value reads as no
 /// status rather than as one of them.
-fn status(value: &str) -> Option<ProbeStatus> {
+fn status(value: &str) -> Option<LimitStatus> {
     [
-        ("allowed", ProbeStatus::Allowed),
-        ("allowed_warning", ProbeStatus::Warning),
-        ("rejected", ProbeStatus::Rejected),
+        ("allowed", LimitStatus::Allowed),
+        ("allowed_warning", LimitStatus::Warning),
+        ("rejected", LimitStatus::Rejected),
     ]
     .into_iter()
     .find(|(word, _)| value.eq_ignore_ascii_case(word))
@@ -106,5 +115,5 @@ fn status(value: &str) -> Option<ProbeStatus> {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/inline/usage_probe_anthropic.rs"]
+#[path = "../../../tests/inline/usage_inference_anthropic.rs"]
 mod tests;

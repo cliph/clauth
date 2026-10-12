@@ -1627,9 +1627,10 @@ fn problem_index(check: &Check, line: usize) -> Option<usize> {
 /// under itself into its full facts and run directory. The delegates check's
 /// one `key: value` detail line (the rate-limit warning) rides above the list
 /// when it applies; the steer line pins as a footnote under the list. While
-/// the selector holds focus the list renders blurred (no selection, no
-/// expansion, top-anchored); while the detail is descended, the selection's
-/// row expands and the list scrolls to follow it.
+/// the selector holds focus the list renders blurred: top-anchored with no
+/// selection before the first descent, after it the last-selected row's tint
+/// and offset with no caret and no expansion. While the detail is descended,
+/// the selection's row expands and the list scrolls to follow it.
 fn draw_delegates_detail(frame: &mut Frame<'_>, inner: Rect, app: &App) {
     if inner.height == 0 {
         return;

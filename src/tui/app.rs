@@ -6150,10 +6150,10 @@ fn trigger_status_refresh(app: &mut App) {
 }
 
 /// Services tab keymap. List focus: ↑↓ moves the cursor (wrapping), ⏎ descends
-/// to the detail pane (the `delegates` detail binds no key, so ⏎ does not
-/// descend into it), `f` applies the selected row's fix. Detail focus: the
-/// plugin detail walks its fixable problems, the herdr detail walks its
-/// options rows, every other detail scrolls (clamped by the render pass);
+/// to the detail pane (the `delegates` detail only while it lists a job), `f`
+/// applies the selected row's fix. Detail focus: the plugin detail walks its
+/// fixable problems, the herdr detail walks its options rows, the delegates
+/// detail walks its jobs, every other detail scrolls (clamped by the render pass);
 /// `f` still fixes the focused problem.
 fn handle_services_key(app: &mut App, key: KeyEvent) {
     match app.services.focus {

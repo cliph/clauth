@@ -669,8 +669,9 @@ const CARD_COL_W: u16 = 56;
 fn dash_rects(area: Rect) -> DashRects {
     // Phone width: every card pair stacks — a 45-col terminal has no room for
     // side-by-side cards (the TODAY card alone needs ~20 content cells). Rows
-    // are the abundant resource there; a short terminal clips the trailing
-    // charts (hour/activity) rather than crushing every card.
+    // are the abundant resource there; a terminal too short for the stack
+    // scrolls it by whole cards (`dash_rects_natural`) rather than crushing
+    // every card.
     if super::panes::narrow(area.width) {
         let mut constraints: Vec<Constraint> = NARROW_ROWS[..6]
             .iter()

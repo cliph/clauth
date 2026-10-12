@@ -652,7 +652,7 @@ pub(crate) fn is_exhausted_active(
 /// member is the one exception: it can't be proven exhausted at all, so it
 /// still bails the WHOLE result to `None` rather than being skipped around
 /// (see the loop's `config.find` below). Reuses
-/// [`is_exhausted`]'s wall-clock gates (`five_hour_live` and the weekly
+/// [`is_exhausted_hard`]'s wall-clock gates (`five_hour_live` and the weekly
 /// `seven_day_live` block) for every OTHER member: one exhausted in neither
 /// window already has headroom — `find_recovered_member` / `scan_recovery`
 /// would relink it on the very next tick — so THAT member's presence bails

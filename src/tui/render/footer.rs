@@ -631,6 +631,14 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             {
                 hints.push(("↵", "remove"));
             }
+            Some(ShuntFocus::Token { key })
+                if !app.services.saving(&ShuntSaveKey::Token(key.clone())) =>
+            {
+                hints.push(("↵", "remove"));
+            }
+            Some(ShuntFocus::AddToken) if !app.services.saving(&ShuntSaveKey::AddToken) => {
+                hints.push(("↵", "add"));
+            }
             _ => {}
         }
         hints.extend(next_fix);

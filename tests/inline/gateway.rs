@@ -703,6 +703,56 @@ fn a_base_url_names_the_gateway_by_its_probe_address_and_port() {
     }
 }
 
+/// `gateway_base_url` reads the displayed bind's probe address — a concrete
+/// loopback, a wildcard swapped to loopback, an IPv6 wildcard to `[::1]`, and an
+/// env-file `SHUNT_SERVER__BIND` override — and every result round-trips
+/// through `url_names_bind`.
+#[test]
+fn gateway_base_url_reads_the_bind_and_round_trips_through_url_names_bind() {
+    let home = HomeSandbox::new();
+    let cases: [(&str, Option<&str>, &str); 4] = [
+        (
+            "[server]\nbind = \"127.0.0.1:3067\"\n",
+            None,
+            "http://127.0.0.1:3067",
+        ),
+        (
+            "[server]\nbind = \"0.0.0.0:3001\"\n",
+            None,
+            "http://127.0.0.1:3001",
+        ),
+        (
+            "[server]\nbind = \"[::]:3001\"\n",
+            None,
+            "http://[::1]:3001",
+        ),
+        (
+            "[server]\nbind = \"127.0.0.1:3067\"\n",
+            Some("SHUNT_SERVER__BIND=127.0.0.1:4040\n"),
+            "http://127.0.0.1:4040",
+        ),
+    ];
+    for (i, (config_text, env_text, expected)) in cases.iter().enumerate() {
+        let etc = home.home().join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        let config = etc.join(format!("shunt-{i}.toml"));
+        std::fs::write(&config, config_text).unwrap();
+        let mut record = GatewayRecord::new(config).unwrap();
+        if let Some(env_text) = env_text {
+            let env_file = home.home().join(format!("bind-{i}.env"));
+            std::fs::write(&env_file, env_text).unwrap();
+            record.env_file = Some(env_file);
+        }
+        let url = gateway_base_url(&record).expect("the base url resolves");
+        assert_eq!(url, *expected, "config {config_text:?}, env {env_text:?}");
+        let bind = displayed_gateway_bind(&record).expect("the bind resolves");
+        assert!(
+            url_names_bind(&url, &bind),
+            "the base url round-trips through url_names_bind for {expected}"
+        );
+    }
+}
+
 /// The displayed bind honours a `SHUNT_SERVER__BIND` the running daemon
 /// recorded, matched to the singleton holder by pid; with no daemon, or a
 /// record naming another pid, the adopted files alone decide.

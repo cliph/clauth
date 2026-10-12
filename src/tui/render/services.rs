@@ -38,6 +38,7 @@ use super::super::app::{
 use super::super::theme;
 use super::format::{middle_truncate, spinner_frame};
 use super::header::pulse_name_spans;
+use super::modals::danger_button;
 use super::panes::{
     bold_when, chunk_graphemes, cycle_row_lines, draw_following_list, draw_scrollbar,
     draw_scrolled_lines, draw_scrolled_lines_with_footnote, empty_state, empty_state_lines,
@@ -424,10 +425,11 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
     }
 
     // The config section: one blank line after the card's last line, then the
-    // SERVER / UPSTREAMS / MODELS / ROUTES groups (or one `config  not read`
-    // line). Entry rows join `stop_rendered` in `check.shunt_focus` order;
-    // `eyebrows` records each group header's line for the underline pass.
-    let mut eyebrows: [Option<usize>; 4] = [None; 4];
+    // SERVER / UPSTREAMS / MODELS / ROUTES / CLIENT TOKENS groups (or one
+    // `config  not read` line). Entry rows join `stop_rendered` in
+    // `check.shunt_focus` order; `eyebrows` records each group header's line
+    // for the underline pass.
+    let mut eyebrows: [Option<usize>; 5] = [None; 5];
     match &app.services.shunt_config {
         Some(ShuntConfigRead::Ok(view)) => {
             lines.push(Line::from(""));
@@ -513,6 +515,7 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
         ShuntFocus::Field { key } => Some(field_group(key)),
         ShuntFocus::Add { kind } | ShuntFocus::SaveAdd { kind } => Some(kind.group()),
         ShuntFocus::Remove { key } => Some(entry_group(key)),
+        ShuntFocus::Token { .. } | ShuntFocus::AddToken => Some(4),
         _ => None,
     });
     if detail_focused
@@ -610,6 +613,24 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
                     }
                 }
             }
+            ShuntFocus::Token { key } => {
+                // A token row is an action-chip row: the caret + inverse
+                // `remove` block carry focus, no `BG_HOVER` row tint, and a
+                // refusal's `└` line trails untinted.
+                let rows = token_row_lines(key, detail_focused, app, width);
+                if let Some(rendered) = rendered {
+                    for (i, row) in rows.into_iter().enumerate() {
+                        if rendered + i < lines.len() {
+                            lines[rendered + i] = row;
+                        }
+                    }
+                }
+            }
+            ShuntFocus::AddToken => {
+                if let Some(rendered) = rendered {
+                    lines[rendered] = highlight_row(add_token_line(detail_focused, app), width);
+                }
+            }
             _ => {
                 let Some(line) = focus.line() else {
                     unreachable!("only a config row lacks a detail line");
@@ -671,12 +692,14 @@ fn field_group(key: &ShuntFieldKey) -> usize {
     }
 }
 
-/// The group eyebrow word for an entry group.
+/// The group eyebrow word for a group index (SERVER, UPSTREAMS, MODELS,
+/// ROUTES, CLIENT TOKENS).
 fn eyebrow_name(group: usize) -> &'static str {
     match group {
         1 => "UPSTREAMS",
         2 => "MODELS",
         3 => "ROUTES",
+        4 => "CLIENT TOKENS",
         _ => "SERVER",
     }
 }
@@ -692,17 +715,18 @@ struct ConfigRows<'a> {
 
 /// The config groups, after the card's existing lines and one blank line: the
 /// SERVER field rows, then the UPSTREAMS / MODELS / ROUTES disclosure rows,
-/// each entry expanding in place. Field rows join the focus walk (in
-/// [`config_field_stops`]'s order) and take the caret; the bind row is read-only
-/// while overridden or the env file is unread, the legacy `providers` row and
-/// its note and the eyebrows never take focus. The entries and fields derive
-/// from [`config_entry_keys`] / [`entry_field_keys`] / [`draft_field_keys`] —
-/// the same row model the focus walk builds its stops from — so the two cannot
-/// disagree for any view.
+/// each entry expanding in place, then the CLIENT TOKENS group. Field rows and
+/// token rows join the focus walk (in [`config_field_stops`]'s order) and take
+/// the caret; the bind row is read-only while overridden or the env file is
+/// unread, the legacy `providers` row, its note, the eyebrows and the unmanaged
+/// token rows never take focus. The entries, fields and token rows derive from
+/// [`config_entry_keys`] / [`entry_field_keys`] / [`draft_field_keys`] /
+/// [`config_field_stops`] — the same row model the focus walk builds its stops
+/// from — so the two cannot disagree for any view.
 fn render_shunt_config(
     lines: &mut Vec<Line<'static>>,
     stop_rendered: &mut Vec<usize>,
-    eyebrows: &mut [Option<usize>; 4],
+    eyebrows: &mut [Option<usize>; 5],
     view: &ConfigView,
     expanded: &HashSet<ShuntEntryKey>,
     app: &App,
@@ -713,7 +737,7 @@ fn render_shunt_config(
     // The one row model both the render and the focus walk derive from: a
     // field's focusability is `config_field_stops`' membership, never a
     // predicate copied beside it.
-    let field_stops = config_field_stops(view, expanded, drafts);
+    let field_stops = config_field_stops(view, expanded, drafts, &app.services.shunt_tokens);
     let mut rows = ConfigRows {
         lines,
         stop_rendered,
@@ -763,6 +787,11 @@ fn render_shunt_config(
         push_entry(&mut rows, view, key, expanded, app, width);
     }
     push_add(&mut rows, view, ShuntAddKind::Route, app, width);
+
+    eyebrows[4] = Some(rows.lines.len());
+    rows.lines
+        .push(Line::from(Span::styled("CLIENT TOKENS", theme::label())));
+    push_token_rows(&mut rows, app, width);
 }
 
 /// The `+ add <kind>` row ending its group (a first-class `+ add` row, `ACCENT`
@@ -790,6 +819,133 @@ fn push_add(
         rows.lines.extend(save_add_lines(kind, false, app, width));
         rows.stop_rendered.push(save_start);
     }
+}
+
+/// The `CLIENT TOKENS` group's rows: one action-chip row per stored token (the
+/// profile's name, chip `remove`), the unmanaged token names after them (faint,
+/// never a walk stop) or the `tokens  not read` / `other clients  not read` /
+/// `<variable>  not parsed` faint line (a read failure's sentence wrapped on a
+/// `└` line under the first two), then `+ add token` (a walk stop). The stored
+/// rows and `+ add token` derive from [`config_field_stops`] — the same row
+/// model the focus walk builds its stops from.
+fn push_token_rows(rows: &mut ConfigRows<'_>, app: &App, width: usize) {
+    let tokens = &app.services.shunt_tokens;
+    if let Some(reason) = &tokens.error {
+        rows.lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("tokens  not read", theme::faint()),
+        ]));
+        rows.lines.extend(help_tooltip_lines_at(
+            &escape_control(reason),
+            width,
+            CARET_GUTTER,
+        ));
+    } else {
+        for name in &tokens.stored {
+            let start = rows.lines.len();
+            rows.lines.extend(token_row_lines(name, false, app, width));
+            rows.stop_rendered.push(start);
+        }
+        if let Some(reason) = &tokens.unmanaged_error {
+            // The store read fine, so its rows stay; only the unmanaged names
+            // are hidden behind one `other clients  not read` line.
+            rows.lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("other clients  not read", theme::faint()),
+            ]));
+            rows.lines.extend(help_tooltip_lines_at(
+                &escape_control(reason),
+                width,
+                CARET_GUTTER,
+            ));
+        } else {
+            for (name, source) in &tokens.unmanaged {
+                rows.lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(escape_control(name).to_string(), theme::faint()),
+                    Span::styled("  ", Style::default()),
+                    Span::styled(source.word(), theme::dim()),
+                ]));
+            }
+            if let Some((variable, _)) = &tokens.unparsed {
+                rows.lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{}  not parsed", escape_control(variable)),
+                        theme::faint(),
+                    ),
+                ]));
+            }
+        }
+    }
+    let add_start = rows.lines.len();
+    rows.lines.push(add_token_line(false, app));
+    rows.stop_rendered.push(add_start);
+}
+
+/// One stored token's action-chip row: the caret gutter, the profile name (the
+/// label), then the `remove` chip — `DANGER` blurred, a `DANGER` inverse block
+/// focused, the spinner in the caret slot and a dim `checking` trail while its
+/// remove checks. A refusal (the last-token guard) renders on the `└` line
+/// under it. The label stays `TEXT_DIM` even focused; the caret and the chip
+/// carry focus alone (no `BG_HOVER` row tint).
+fn token_row_lines(name: &str, selected: bool, app: &App, width: usize) -> Vec<Line<'static>> {
+    let saving = app.services.saving(&ShuntSaveKey::Token(name.to_string()));
+    let ok = app.services.shunt_ok.as_ref().is_some_and(|(k, at)| {
+        matches!(k, ShuntOkKey::Token(held) if held == name)
+            && at.elapsed().as_millis() < SHUNT_OK_MS as u128
+    });
+    let caret = if ok {
+        Span::styled("✓ ", theme::success())
+    } else if saving {
+        Span::styled(
+            format!("{} ", spinner_frame(app.tick_count)),
+            theme::accent(),
+        )
+    } else if selected {
+        Span::styled("❯ ", theme::accent().bold())
+    } else {
+        Span::styled("  ", Style::default())
+    };
+    let mut spans = vec![
+        caret,
+        Span::styled(escape_control(name).to_string(), theme::dim()),
+        Span::raw("  "),
+    ];
+    if saving {
+        spans.push(Span::styled("checking", theme::dim()));
+    } else {
+        spans.push(danger_button(" remove ", selected));
+    }
+    let mut rows = vec![Line::from(spans)];
+    if let Some((profile, sentence)) = app.services.shunt_token_refusal.borrow().as_ref()
+        && profile == name
+    {
+        rows.extend(invalid_tooltip_lines(sentence, width));
+    }
+    rows
+}
+
+/// The `+ add token` row: a first-class `+ add` row — `ACCENT` label, bold
+/// while selected, the spinner in the caret slot while its add checks.
+fn add_token_line(selected: bool, app: &App) -> Line<'static> {
+    let saving = app.services.saving(&ShuntSaveKey::AddToken);
+    let caret = if saving {
+        Span::styled(
+            format!("{} ", spinner_frame(app.tick_count)),
+            theme::accent(),
+        )
+    } else if selected {
+        Span::styled("❯ ", theme::accent().bold())
+    } else {
+        Span::styled("  ", Style::default())
+    };
+    let label = if selected {
+        theme::accent().bold()
+    } else {
+        theme::accent()
+    };
+    Line::from(vec![caret, Span::styled("+ add token", label)])
 }
 
 /// Draw one entry row (and its expanded fields when expanded), publishing each
@@ -1563,6 +1719,10 @@ fn shunt_focus_line(focus: &ShuntFocus, text: &str, selected: bool, app: &App) -
         }
         ShuntFocus::Remove { .. } => {
             unreachable!("the `remove <kind>` row renders through remove_lines")
+        }
+        ShuntFocus::Token { .. } => unreachable!("a token row renders through token_row_lines"),
+        ShuntFocus::AddToken => {
+            unreachable!("the `+ add token` row renders through add_token_line")
         }
     }
 }

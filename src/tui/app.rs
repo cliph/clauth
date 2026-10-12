@@ -952,6 +952,23 @@ pub(crate) enum ConfirmAction {
         key: ShuntEntryKey,
         edit: Box<crate::gateway_edit::Edit>,
     },
+    /// `remove <profile>'s client token?`'s `remove`: revoke the profile's
+    /// client token through the save worker. `record` is the adopted gateway
+    /// read when the confirm opened.
+    RemoveToken {
+        record: crate::gateway::GatewayRecord,
+        profile: String,
+    },
+    /// `point <profile> at the shunt gateway?`'s `overwrite`: mint the profile's
+    /// client token, then point the profile at the gateway (`url`). `replace`
+    /// is the confirm's third body line (`None` = nothing to replace), built
+    /// when the confirm opened.
+    AddToken {
+        record: crate::gateway::GatewayRecord,
+        profile: String,
+        url: String,
+        replace: Option<String>,
+    },
 }
 
 /// One-field name prompt shared by the Setup menu's two naming actions. The
@@ -1107,6 +1124,23 @@ impl DivergenceForm {
 #[derive(Debug, Clone)]
 pub(crate) struct DivergenceTargetForm {
     pub(crate) targets: Vec<String>,
+    pub(crate) cursor: usize,
+    pub(crate) scroll: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
+}
+
+/// The `+ add token` profile picker: one row per claude profile, in roster
+/// order, each carrying its `(name, has_token)` — whether the profile already
+/// holds a token, so the row reads `alice  has a token`. C1 has no synthetic
+/// `+ new profile` row, so the cursor is the profile's own index
+/// (`0..targets.len()`); C2 adds `+ new profile` as row 0 and shifts every
+/// profile down one.
+#[derive(Debug, Clone)]
+pub(crate) struct TokenPickerForm {
+    pub(crate) targets: Vec<(String, bool)>,
     pub(crate) cursor: usize,
     pub(crate) scroll: std::cell::Cell<usize>,
     pub(crate) viewport: std::cell::Cell<usize>,
@@ -1385,6 +1419,8 @@ pub(crate) enum Modal {
     PresetPicker(PresetPickerForm),
     /// Divergence "save elsewhere": pick which profile the live login lands in.
     DivergenceTarget(DivergenceTargetForm),
+    /// `+ add token`: pick which claude profile gets a client token.
+    TokenPicker(TokenPickerForm),
     Help,
     /// Context-sensitive action menu opened by `a`.
     ActionMenu(ActionMenuState),
@@ -1829,6 +1865,11 @@ pub(crate) enum ShuntFocus {
     /// The `remove <kind>` row ending an expanded entry, whose `↵` opens the
     /// remove confirm.
     Remove { key: ShuntEntryKey },
+    /// A client-token action-chip row, whose `↵` opens the remove confirm.
+    Token { key: String },
+    /// The `+ add token` row ending the client-token group, whose `↵`/`space`
+    /// opens the profile picker.
+    AddToken,
 }
 
 impl ShuntFocus {
@@ -1843,7 +1884,9 @@ impl ShuntFocus {
             | ShuntFocus::Field { .. }
             | ShuntFocus::Add { .. }
             | ShuntFocus::SaveAdd { .. }
-            | ShuntFocus::Remove { .. } => None,
+            | ShuntFocus::Remove { .. }
+            | ShuntFocus::Token { .. }
+            | ShuntFocus::AddToken => None,
         }
     }
 
@@ -1857,7 +1900,9 @@ impl ShuntFocus {
             | ShuntFocus::Field { .. }
             | ShuntFocus::Add { .. }
             | ShuntFocus::SaveAdd { .. }
-            | ShuntFocus::Remove { .. } => None,
+            | ShuntFocus::Remove { .. }
+            | ShuntFocus::Token { .. }
+            | ShuntFocus::AddToken => None,
         }
     }
 
@@ -1871,6 +1916,8 @@ impl ShuntFocus {
             ShuntFocus::Add { kind } => ShuntFocusLine::Add(*kind),
             ShuntFocus::SaveAdd { kind } => ShuntFocusLine::SaveAdd(*kind),
             ShuntFocus::Remove { key } => ShuntFocusLine::Remove(key.clone()),
+            ShuntFocus::Token { key } => ShuntFocusLine::Token(key.clone()),
+            ShuntFocus::AddToken => ShuntFocusLine::AddToken,
             ShuntFocus::Fix {
                 fix: ServiceFix::AdoptConfig(_),
                 ..
@@ -1917,6 +1964,10 @@ pub(crate) enum ShuntFocusLine {
     SaveAdd(ShuntAddKind),
     /// A `remove <kind>` row, by its entry's identity.
     Remove(ShuntEntryKey),
+    /// A client-token row, by the profile name.
+    Token(String),
+    /// The `+ add token` row.
+    AddToken,
 }
 
 /// A config-section entry's identity: the group (the variant) plus the
@@ -2232,6 +2283,10 @@ pub(crate) enum ShuntSaveKey {
     Field(ShuntFieldKey),
     SaveAdd(ShuntAddKind),
     Remove(ShuntEntryKey),
+    /// A client-token row's remove, keyed by the profile name.
+    Token(String),
+    /// The `+ add token` row's add.
+    AddToken,
 }
 
 /// The row whose caret slot shows the `SUCCESS` `✓` after a successful save:
@@ -2240,6 +2295,8 @@ pub(crate) enum ShuntSaveKey {
 pub(crate) enum ShuntOkKey {
     Field(ShuntFieldKey),
     Entry(ShuntEntryKey),
+    /// A client-token row, keyed by the profile name (an add's new row).
+    Token(String),
 }
 
 /// One config save in flight: the row's key (so the render spinner/shimmer the
@@ -2257,6 +2314,41 @@ pub(crate) struct ShuntSave {
     /// pre-save view). The outcome drain reads this, never the draft or the
     /// live view, so a fold or a recompute mid-check cannot move the `✓`.
     pub(crate) entry: Option<ShuntEntryKey>,
+}
+
+/// Where an unmanaged client-token value came from, for the card's dim source
+/// word trailing an unmanaged token row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShuntTokenSource {
+    EnvFile,
+    DaemonEnv,
+}
+
+impl ShuntTokenSource {
+    /// The dim source word: `env file` / `daemon env`.
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            ShuntTokenSource::EnvFile => "env file",
+            ShuntTokenSource::DaemonEnv => "daemon env",
+        }
+    }
+}
+
+/// The client-token section's data, read beside the config view on the
+/// recompute and cached on the card state: the stored tokens in name order,
+/// the unmanaged client names and where they came from, the variable when the
+/// unmanaged value does not parse, the store read failure's sentence (`error`,
+/// the group then renders `tokens  not read` + the sentence), and the unmanaged
+/// (client-auth) read failure's sentence (`unmanaged_error`, the stored rows
+/// stay and the group renders `other clients  not read` + the sentence). Each
+/// keeps `+ add token`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ShuntTokens {
+    pub(crate) stored: Vec<String>,
+    pub(crate) unmanaged: Vec<(String, ShuntTokenSource)>,
+    pub(crate) unparsed: Option<(String, ShuntTokenSource)>,
+    pub(crate) error: Option<String>,
+    pub(crate) unmanaged_error: Option<String>,
 }
 
 /// The shunt card's open field editor: which field, its edit state, and a
@@ -2512,6 +2604,18 @@ impl Default for PoolOutcome {
     }
 }
 
+/// A [`ConfigHandle`] carried through the action worker to a token add's
+/// endpoint write. `RankedMutex` has no `Debug`, so the wrapper prints a
+/// placeholder; the job's `Debug` names every other field.
+#[derive(Clone)]
+pub(crate) struct JobConfig(pub(crate) ConfigHandle);
+
+impl std::fmt::Debug for JobConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JobConfig(<config>)")
+    }
+}
+
 /// One confirmed shunt-card action, handed to the action worker so the slow
 /// call never holds a frame.
 #[derive(Debug, Clone)]
@@ -2543,6 +2647,20 @@ pub(crate) enum ShuntActionJob {
         edit: Box<crate::gateway_edit::Edit>,
         key: ShuntSaveKey,
         confirmed: bool,
+    },
+    /// Revoke one profile's client token through the engine, off the UI thread.
+    RemoveToken {
+        record: crate::gateway::GatewayRecord,
+        profile: String,
+    },
+    /// Mint a client token for `profile`, then point it at the gateway (`url`),
+    /// off the UI thread. `config` is the shared handle the endpoint write
+    /// locks.
+    AddToken {
+        record: crate::gateway::GatewayRecord,
+        profile: String,
+        url: String,
+        config: JobConfig,
     },
 }
 
@@ -2626,6 +2744,39 @@ pub(crate) enum ShuntActionOutcome {
     },
     /// An engine bug or an untyped failure: `save failed` + the error chain.
     ConfigFailed {
+        error: String,
+    },
+    /// A client-token remove landed (`removed` = true) or was already gone.
+    TokenRemoved {
+        profile: String,
+        removed: bool,
+    },
+    /// The remove refused (the last-token guard or a read failure): the
+    /// refusal's own sentence, on the `└` line while the row is in view, else
+    /// a `remove failed` toast.
+    TokenRemoveRefused {
+        profile: String,
+        sentence: String,
+    },
+    /// A remove failed untyped: `remove failed` + the error chain.
+    TokenRemoveFailed {
+        error: String,
+    },
+    /// A client-token add landed: the profile's row appears, focus on it.
+    TokenAdded {
+        profile: String,
+    },
+    /// The add refused (a bad name, a name the base uses, an unparsed base, or
+    /// an untyped failure): `add failed` + the message.
+    TokenAddRefused {
+        error: String,
+    },
+    /// The mint landed but the profile write failed: the token row stays,
+    /// `add failed` + either `the token is stored but <profile> was not
+    /// changed: <e:#>` (the disk profile still has its old base url) or
+    /// `<profile> points at the gateway, but <e:#>` (the save landed and only
+    /// the active-profile settings write failed).
+    TokenAddedProfileFailed {
         error: String,
     },
 }
@@ -2763,6 +2914,13 @@ pub(crate) struct ServicesState {
     /// focus setter (which takes `&self`, the render's contract) can retire it
     /// the moment focus leaves the remove row.
     pub(crate) shunt_remove_refusal: std::cell::RefCell<Option<ShuntRemoveRefusal>>,
+    /// The client-token section's data, read beside the config view on the
+    /// recompute (the render reads this cache, never the store per frame).
+    pub(crate) shunt_tokens: ShuntTokens,
+    /// A token remove's refusal (the last-token guard), as `(profile,
+    /// sentence)`, rendered on the `└` line under the token row. RefCell so the
+    /// focus setter can retire it the moment focus leaves the row.
+    pub(crate) shunt_token_refusal: std::cell::RefCell<Option<(String, String)>>,
     /// The cached standalone-store move plan (`None` = not yet planned). The
     /// plan runs on a worker — it spawns `ps`/`powershell` on macOS/Windows —
     /// on tab entry, on `r`, and after any shunt-card action lands.
@@ -2906,6 +3064,8 @@ impl Default for ServicesState {
             shunt_ok: None,
             shunt_drafts: ShuntDrafts::default(),
             shunt_remove_refusal: std::cell::RefCell::new(None),
+            shunt_tokens: ShuntTokens::default(),
+            shunt_token_refusal: std::cell::RefCell::new(None),
             move_plan: None,
             move_plan_probe: ProbeWorker::new(move_plan_probe),
             admin_need: None,
@@ -3034,6 +3194,16 @@ impl ServicesState {
             });
         if left_row {
             self.shunt_remove_refusal.take();
+        }
+        let left_token = self
+            .shunt_token_refusal
+            .borrow()
+            .as_ref()
+            .is_some_and(|(profile, _)| {
+                kind.as_ref() != Some(&ShuntFocusLine::Token(profile.clone()))
+            });
+        if left_token {
+            self.shunt_token_refusal.take();
         }
     }
 
@@ -6531,6 +6701,11 @@ fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
                 let key = key.clone();
                 confirm_shunt_remove(app, &key);
             }
+            Some(ShuntFocus::Token { key }) => {
+                let key = key.clone();
+                confirm_shunt_remove_token(app, &key);
+            }
+            Some(ShuntFocus::AddToken) => open_token_picker(app),
             Some(ShuntFocus::Fix { .. }) => apply_service_fix(app),
             None => {}
         },
@@ -6552,7 +6727,10 @@ fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
                 }
             }
             Some(ShuntFocus::Add { kind }) => toggle_shunt_add(app, *kind),
-            Some(ShuntFocus::SaveAdd { .. }) | Some(ShuntFocus::Remove { .. }) => {}
+            Some(ShuntFocus::AddToken) => open_token_picker(app),
+            Some(ShuntFocus::SaveAdd { .. })
+            | Some(ShuntFocus::Remove { .. })
+            | Some(ShuntFocus::Token { .. }) => {}
             Some(ShuntFocus::Fix { .. }) | None => {}
         },
         _ => {}
@@ -6820,6 +6998,7 @@ fn rebuild_shunt_config_stops(app: &mut App) {
             view,
             &app.services.shunt_expanded,
             &app.services.shunt_drafts,
+            &app.services.shunt_tokens,
         )
     }) else {
         return;
@@ -7468,14 +7647,17 @@ fn show_field_refusal(app: &mut App, key: &ShuntFieldKey, err: &anyhow::Error) {
     }
 }
 
-/// Start the save worker for one row (its own worker; the outcome drains on
-/// the tick). One save at a time — the worker's own `running` is the guard —
-/// and a field's editor stays open with the typed text until the outcome lands.
-fn start_shunt_save(
+/// Start `job` on the one save worker under the one-save guard (the same slot
+/// every config save, token add and token remove shares; a second toasts the
+/// guard). `value`/`entry` are the [`ShuntSave`] fields the config-save path
+/// carries for its row; token jobs pass none. A field's editor stays open with
+/// the typed text until the outcome lands.
+fn start_on_save_worker(
     app: &mut App,
     key: ShuntSaveKey,
-    edit: crate::gateway_edit::Edit,
-    confirmed: bool,
+    value: Option<String>,
+    entry: Option<ShuntEntryKey>,
+    job: ShuntActionJob,
 ) {
     if app.services.shunt_save_worker.running {
         app.toast(
@@ -7484,24 +7666,78 @@ fn start_shunt_save(
         );
         return;
     }
+    app.services.shunt_save = Some(ShuntSave {
+        key,
+        started: Instant::now(),
+        value,
+        entry,
+    });
+    app.services.shunt_save_worker.start(job);
+}
+
+/// Start the save worker for one config row (the outcome drains on the tick).
+fn start_shunt_save(
+    app: &mut App,
+    key: ShuntSaveKey,
+    edit: crate::gateway_edit::Edit,
+    confirmed: bool,
+) {
     let Some(record) = app.services.shunt_record.clone() else {
         return;
     };
     let entry = add_edit_entry_key(&edit, config_view(app));
-    app.services.shunt_save = Some(ShuntSave {
-        key: key.clone(),
-        started: Instant::now(),
-        value: edit_save_value(&edit),
+    start_on_save_worker(
+        app,
+        key.clone(),
+        edit_save_value(&edit),
         entry,
-    });
-    app.services
-        .shunt_save_worker
-        .start(ShuntActionJob::ConfigEdit {
+        ShuntActionJob::ConfigEdit {
             record,
             edit: Box::new(edit),
             key,
             confirmed,
-        });
+        },
+    );
+}
+
+/// Start a token remove on the one save worker (the same one-save slot every
+/// config save, add, remove and token op shares; a second toasts the guard).
+fn start_shunt_token_save(
+    app: &mut App,
+    key: ShuntSaveKey,
+    record: crate::gateway::GatewayRecord,
+    profile: String,
+) {
+    start_on_save_worker(
+        app,
+        key,
+        None,
+        None,
+        ShuntActionJob::RemoveToken { record, profile },
+    );
+}
+
+/// Start a token add on the one save worker: the `+ add token` row holds the
+/// save slot while the mint and the profile write run.
+fn start_shunt_token_add(
+    app: &mut App,
+    record: crate::gateway::GatewayRecord,
+    profile: String,
+    url: String,
+) {
+    let config = JobConfig(Arc::clone(&app.config));
+    start_on_save_worker(
+        app,
+        ShuntSaveKey::AddToken,
+        None,
+        None,
+        ShuntActionJob::AddToken {
+            record,
+            profile,
+            url,
+            config,
+        },
+    );
 }
 
 /// Ascend off the shunt detail: close any open field editor, retire a remove
@@ -7514,6 +7750,7 @@ fn start_shunt_save(
 fn leave_shunt_detail(app: &mut App) {
     app.services.shunt_field_edit = None;
     app.services.shunt_remove_refusal.take();
+    app.services.shunt_token_refusal.take();
     app.services.focus = ServicesFocus::List;
 }
 
@@ -8340,6 +8577,15 @@ pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, sh
             Err(e) => classify_shunt_config_read(&e),
         }
     });
+    // The client-token section's data, read beside the config view (the same
+    // per-tick cadence, the same "never spawn a process" UI-thread reads) and
+    // cached so the render draws from it, never the store per frame.
+    app.services.shunt_tokens = app
+        .services
+        .shunt_record
+        .as_ref()
+        .map(read_shunt_tokens)
+        .unwrap_or_default();
     if let Some(ShuntConfigRead::Ok(view)) = &app.services.shunt_config {
         prune_shunt_expanded(view, &mut app.services.shunt_expanded);
     }
@@ -8434,6 +8680,7 @@ pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, sh
             view,
             &app.services.shunt_expanded,
             &app.services.shunt_drafts,
+            &app.services.shunt_tokens,
         ));
     }
     checks.push(shunt);
@@ -8591,15 +8838,28 @@ fn drain_service_probes(app: &mut App) {
         handle_shunt_action_outcome(app, outcome);
     }
     if let Some(outcome) = save {
-        // The save worker runs only `ConfigEdit`, which never yields `NoOp`,
-        // so a `NoOp` here is a panicked save: it drains as a failed outcome
-        // that clears the guard and keeps the editor open. A panic can land
-        // only before the staged rename (the rename is the write's last step
-        // and everything after it is pure), so nothing was written holds.
+        // The save worker runs `ConfigEdit`, `RemoveToken` and `AddToken`,
+        // none of which yields `NoOp`, so a `NoOp` here is a panicked save: it
+        // drains as a failed outcome that clears the guard. A config edit's
+        // panic can land only before the staged rename (the rename is the
+        // write's last step and everything after it is pure), so nothing was
+        // written holds there; a token job's panic can land after the store
+        // write (a minted add), so its copy never claims nothing was written.
         let outcome = match outcome {
-            ShuntActionOutcome::NoOp => ShuntActionOutcome::ConfigFailed {
-                error: "the save stopped unexpectedly; nothing was written".to_string(),
-            },
+            ShuntActionOutcome::NoOp => {
+                let token_job = app.services.shunt_save.as_ref().is_some_and(|s| {
+                    matches!(s.key, ShuntSaveKey::Token(_) | ShuntSaveKey::AddToken)
+                });
+                if token_job {
+                    ShuntActionOutcome::ConfigFailed {
+                        error: "the save stopped unexpectedly; check the card".to_string(),
+                    }
+                } else {
+                    ShuntActionOutcome::ConfigFailed {
+                        error: "the save stopped unexpectedly; nothing was written".to_string(),
+                    }
+                }
+            }
             other => other,
         };
         handle_shunt_action_outcome(app, outcome);
@@ -8867,6 +9127,9 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
                         app.services.set_shunt_focus(focus);
                     }
                 }
+                ShuntSaveKey::Token(_) | ShuntSaveKey::AddToken => {
+                    unreachable!("a token save never yields ConfigSaved")
+                }
             }
         }
         ShuntActionOutcome::ConfigRefused { key, sentence } => {
@@ -8932,6 +9195,9 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
                         );
                     }
                 }
+                ShuntSaveKey::Token(_) | ShuntSaveKey::AddToken => {
+                    unreachable!("a token save never yields ConfigRefused")
+                }
             }
         }
         ShuntActionOutcome::ConfigCheckFailed {
@@ -8951,6 +9217,90 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
             app.toast(
                 ToastKind::Danger,
                 format!("save failed\n{}", escape_control(&error)),
+            );
+        }
+        ShuntActionOutcome::TokenRemoved { profile, removed } => {
+            app.services.shunt_save = None;
+            if removed {
+                app.toast(
+                    ToastKind::Success,
+                    format!(
+                        "removed {}'s client token\nthe gateway restarts once",
+                        escape_control(&profile)
+                    ),
+                );
+            }
+            // The row leaves and focus lands on the next token row, else the
+            // previous one, else `+ add token` — only while focus still rests
+            // on the removed row.
+            if focus_on_removed_token(app, &profile) {
+                let focus = token_remove_focus_target(app, &profile);
+                app.services.set_shunt_focus(focus);
+            }
+        }
+        ShuntActionOutcome::TokenRemoveRefused { profile, sentence } => {
+            app.services.shunt_save = None;
+            // The refusal sits on the `└` line under the token row only while
+            // that row is on the focused card — the Services tab, the detail
+            // pane, the `shunt` row, and the focus still on the token row.
+            // Landing anywhere else, it has no row to show under — it toasts
+            // like the field and remove arms instead.
+            let on_row = focus_on_removed_token(app, &profile);
+            if refusal_row_visible(app, on_row) {
+                app.services
+                    .shunt_token_refusal
+                    .replace(Some((profile, sentence)));
+            } else {
+                app.toast(
+                    ToastKind::Danger,
+                    format!("remove failed\n{}", escape_control(&sentence)),
+                );
+            }
+        }
+        ShuntActionOutcome::TokenRemoveFailed { error } => {
+            app.services.shunt_save = None;
+            app.toast(
+                ToastKind::Danger,
+                format!("remove failed\n{}", escape_control(&error)),
+            );
+        }
+        ShuntActionOutcome::TokenAdded { profile } => {
+            app.services.shunt_save = None;
+            // A repointed credential retires the old provider's verdict pill
+            // and throttle streak — the shared clear every credential-replacing
+            // path runs (the `commit_endpoint` precedent), and the token
+            // collection re-reads so the fetch leg schedules the re-keyed
+            // profile's first fetch same-frame.
+            app.refresh_tokens();
+            clear_profile_status_chrome(app, &ProfileName::from(profile.as_str()));
+            // The new token row appears in store order; focus lands on it with
+            // the `✓` for `SHUNT_OK_MS`.
+            app.services.shunt_ok = Some((ShuntOkKey::Token(profile.clone()), Instant::now()));
+            app.services
+                .set_shunt_focus(Some(ShuntFocusLine::Token(profile.clone())));
+            app.toast(
+                ToastKind::Success,
+                format!(
+                    "{} uses the gateway\nthe gateway restarts once to read its token",
+                    escape_control(&profile)
+                ),
+            );
+        }
+        ShuntActionOutcome::TokenAddRefused { error } => {
+            app.services.shunt_save = None;
+            app.toast(
+                ToastKind::Danger,
+                format!("add failed\n{}", escape_control(&error)),
+            );
+        }
+        ShuntActionOutcome::TokenAddedProfileFailed { error } => {
+            // The token is stored, so the row stays; the copy already names
+            // which of the two failure shapes it was (the disk profile read in
+            // `run_add_client_token` decides), so the arm just toasts it.
+            app.services.shunt_save = None;
+            app.toast(
+                ToastKind::Danger,
+                format!("add failed\n{}", escape_control(&error)),
             );
         }
     }
@@ -9078,6 +9428,169 @@ fn focus_on_removed_entry(app: &App, removed: &ShuntEntryKey) -> bool {
         })
 }
 
+/// Whether focus still rests on the token row whose remove landed.
+fn focus_on_removed_token(app: &App, removed: &str) -> bool {
+    app.services.shunt_focus_kind() == Some(ShuntFocusLine::Token(removed.to_string()))
+}
+
+/// The focus target after a successful token remove: the next stored token row,
+/// else the previous one, else `+ add token` — read off the PRE-remove cached
+/// list, so the removed row's neighbours are its neighbours as it left.
+fn token_remove_focus_target(app: &App, removed: &str) -> Option<ShuntFocusLine> {
+    let stored = &app.services.shunt_tokens.stored;
+    let idx = stored.iter().position(|name| name == removed)?;
+    if let Some(next) = stored.get(idx + 1) {
+        return Some(ShuntFocusLine::Token(next.clone()));
+    }
+    if idx > 0 {
+        return Some(ShuntFocusLine::Token(stored[idx - 1].clone()));
+    }
+    Some(ShuntFocusLine::AddToken)
+}
+
+/// `↵` on a token row: open the token-remove confirm. A locked row opens no
+/// second confirm (ruling 2): the row is inert while its own remove checks.
+fn confirm_shunt_remove_token(app: &mut App, profile: &str) {
+    if app
+        .services
+        .saving(&ShuntSaveKey::Token(profile.to_string()))
+    {
+        return;
+    }
+    let Some(record) = app.services.shunt_record.clone() else {
+        return;
+    };
+    app.disarm_quit();
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message: format!("remove {}'s client token?", escape_control(profile)),
+        detail: Some(format!(
+            "{} keeps its api key, which stops working once the gateway restarts.",
+            escape_control(profile)
+        )),
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::RemoveToken {
+            record,
+            profile: profile.to_string(),
+        },
+    }));
+}
+
+/// `↵`/`space` on `+ add token`: open the profile picker, one row per claude
+/// profile in roster order (the Overview's roster; codex profiles live in their
+/// own store, never here). An empty roster opens nothing: the `n` hint names
+/// the way to make one.
+fn open_token_picker(app: &mut App) {
+    if app.services.saving(&ShuntSaveKey::AddToken) {
+        return;
+    }
+    let stored = &app.services.shunt_tokens.stored;
+    let targets: Vec<(String, bool)> = {
+        let cfg = app.config();
+        cfg.profiles
+            .iter()
+            .map(|p| {
+                let name = p.name.to_string();
+                let has = stored.iter().any(|held| held == &name);
+                (name, has)
+            })
+            .collect()
+    };
+    if targets.is_empty() {
+        app.toast(
+            ToastKind::Info,
+            "no claude profile to give a token\npress n to create one",
+        );
+        return;
+    }
+    app.disarm_quit();
+    app.open_modal(Modal::TokenPicker(TokenPickerForm {
+        targets,
+        cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    }));
+}
+
+/// A picker pick: open the overwrite confirm naming what it replaces. The
+/// gateway base url is read here (a bind read failure toasts `add failed`, no
+/// confirm); the `replace` line follows the profile's current base url — an
+/// api-key endpoint reads `it replaces <base> and its current api key.` (or
+/// `it replaces <base>.` with no key), and a profile with no base url (an OAuth
+/// subscription login) reads the OAuth copy. A profile that vanished from the
+/// roster refuses with `add failed` / `<profile> no longer exists`, no confirm.
+fn open_token_overwrite_confirm(app: &mut App, profile: String) {
+    let Some(record) = app.services.shunt_record.clone() else {
+        app.toast(
+            ToastKind::Danger,
+            format!("add failed\n{NO_ADOPTED_CONFIG}"),
+        );
+        return;
+    };
+    let url = match crate::gateway::gateway_base_url(&record) {
+        Ok(url) => url,
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("add failed\n{}", escape_control(&error_toast_detail(&e))),
+            );
+            return;
+        }
+    };
+    let found = {
+        let cfg = app.config();
+        cfg.profiles
+            .iter()
+            .find(|p| p.name.as_str() == profile)
+            .map(|p| (p.base_url.clone(), p.api_key.is_some()))
+    };
+    let (base_url, has_key) = match found {
+        Some(pair) => pair,
+        None => {
+            // A profile that vanished from the roster (the picker opened over
+            // an older roster) refuses before any confirm, never minting.
+            app.toast(
+                ToastKind::Danger,
+                format!("add failed\n{} no longer exists", escape_control(&profile)),
+            );
+            return;
+        }
+    };
+    let replace = match (base_url.as_deref(), has_key) {
+        (Some(base), true) => Some(format!(
+            "it replaces {} and its current api key.",
+            escape_control(base)
+        )),
+        (Some(base), false) => Some(format!("it replaces {}.", escape_control(base))),
+        // An OAuth profile (no base url): the overwrite turns its subscription
+        // login into a gateway consumer, so the third line names that and the
+        // way back (the owner ruling 2026-10-12).
+        (None, _) => Some(
+            "it stops using its subscription login, which stays stored; clear its base url in Setup to go back."
+                .to_string(),
+        ),
+    };
+    app.disarm_quit();
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message: format!("point {} at the shunt gateway?", escape_control(&profile)),
+        detail: Some(format!(
+            "its base url becomes {} and its api key a new client token.",
+            escape_control(&url)
+        )),
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::AddToken {
+            record,
+            profile,
+            url,
+            replace,
+        },
+    }));
+}
+
 /// Re-key every route-positioned piece of state after removing the route at
 /// `position`: each `Route(n > position)` key moves down by one (the same
 /// route's new position), and `Route(position)` drops (its entry left the
@@ -9158,6 +9671,7 @@ fn shift_ok_key(key: &ShuntOkKey, position: usize) -> Option<ShuntOkKey> {
     match key {
         ShuntOkKey::Entry(entry) => shift_entry_key(entry, position).map(ShuntOkKey::Entry),
         ShuntOkKey::Field(field) => shift_field_key(field, position).map(ShuntOkKey::Field),
+        ShuntOkKey::Token(_) => Some(key.clone()),
     }
 }
 
@@ -9802,6 +10316,69 @@ pub(crate) fn config_view(app: &App) -> Option<&crate::gateway_edit::ConfigView>
     }
 }
 
+/// The `BaseSource` an unmanaged client-token value came from, for the card's
+/// dim source word.
+fn token_source(source: crate::gateway_tokens::BaseSource) -> ShuntTokenSource {
+    match source {
+        crate::gateway_tokens::BaseSource::EnvFile(_) => ShuntTokenSource::EnvFile,
+        crate::gateway_tokens::BaseSource::Inherited => ShuntTokenSource::DaemonEnv,
+    }
+}
+
+/// A token read failure's sentence, for the `└` line under the group's
+/// `tokens  not read` / `other clients  not read` line: a typed refusal's own
+/// sentence, any other error its chain.
+fn token_read_reason(e: &anyhow::Error) -> String {
+    match e.downcast_ref::<crate::gateway_tokens::ClientTokenRefusal>() {
+        Some(refusal) => refusal.to_string(),
+        None => error_toast_detail(e),
+    }
+}
+
+/// The client-token section's data, read beside the config view: the store's
+/// names and the unmanaged client names (with their source) from
+/// [`crate::gateway::client_auth`]. A store read failure records its sentence
+/// in `error` (no stored rows); a client-auth read failure records its
+/// sentence in `unmanaged_error` (the stored rows stay, the unmanaged rows read
+/// `other clients  not read`). Each keeps the `+ add token` row.
+fn read_shunt_tokens(record: &crate::gateway::GatewayRecord) -> ShuntTokens {
+    let stored: Vec<String> = match crate::gateway_tokens::ClientTokens::load() {
+        Ok(tokens) => tokens.names().map(str::to_string).collect(),
+        Err(e) => {
+            return ShuntTokens {
+                error: Some(token_read_reason(&e)),
+                ..ShuntTokens::default()
+            };
+        }
+    };
+    match crate::gateway::client_auth(record) {
+        Ok(auth) => match auth.unmanaged {
+            Some((crate::gateway_tokens::TokensState::Names(names), source)) => ShuntTokens {
+                stored,
+                unmanaged: names
+                    .into_iter()
+                    .map(|name| (name, token_source(source.clone())))
+                    .collect(),
+                ..ShuntTokens::default()
+            },
+            Some((crate::gateway_tokens::TokensState::Unparsed, source)) => ShuntTokens {
+                stored,
+                unparsed: Some((auth.variable, token_source(source))),
+                ..ShuntTokens::default()
+            },
+            Some((crate::gateway_tokens::TokensState::Unset, _)) | None => ShuntTokens {
+                stored,
+                ..ShuntTokens::default()
+            },
+        },
+        Err(e) => ShuntTokens {
+            stored,
+            unmanaged_error: Some(token_read_reason(&e)),
+            ..ShuntTokens::default()
+        },
+    }
+}
+
 /// The config entry rows as focus stops, in card order (the render tests'
 /// entry-only walk).
 #[cfg(test)]
@@ -9975,12 +10552,15 @@ fn route_field_keys(r: &crate::gateway_edit::RouteView) -> Vec<ShuntFieldKey> {
 /// The config section's focus stops in render order — the one row model both
 /// the render and the focus walk derive from: the `bind` row (only while not
 /// overridden and the env file read), `default_provider`, then each entry row
-/// and, when expanded, its field rows. The legacy `providers` row and its note
-/// and the eyebrows are read-only and never take focus.
+/// and, when expanded, its field rows, then the `CLIENT TOKENS` group's stored
+/// token rows and its `+ add token` row. The legacy `providers` row and its
+/// note, the eyebrows and the unmanaged token rows are read-only and never take
+/// focus.
 pub(crate) fn config_field_stops(
     view: &crate::gateway_edit::ConfigView,
     expanded: &HashSet<ShuntEntryKey>,
     drafts: &ShuntDrafts,
+    tokens: &ShuntTokens,
 ) -> Vec<ShuntFocus> {
     let mut stops = Vec::new();
     if matches!(
@@ -10026,6 +10606,16 @@ pub(crate) fn config_field_stops(
             }
         }
     }
+    // The stored token rows in name order, then `+ add token`. The unmanaged
+    // rows never join: they are faint and skipped by the walk.
+    stops.extend(
+        tokens
+            .stored
+            .iter()
+            .cloned()
+            .map(|name| ShuntFocus::Token { key: name }),
+    );
+    stops.push(ShuntFocus::AddToken);
     stops
 }
 
@@ -10794,6 +11384,119 @@ fn run_shunt_action(job: ShuntActionJob) -> ShuntActionOutcome {
             key,
             confirmed,
         } => run_config_edit(&record, &edit, key, confirmed),
+        ShuntActionJob::RemoveToken { record, profile } => {
+            run_remove_client_token(&record, &profile)
+        }
+        ShuntActionJob::AddToken {
+            record,
+            profile,
+            url,
+            config,
+        } => run_add_client_token(&record, &profile, &url, &config),
+    }
+}
+
+/// A token op's error as its message: a [`ClientTokenRefusal`]'s own sentence,
+/// any other error its chain (`{e:#}`).
+fn token_error_message(e: &anyhow::Error) -> String {
+    match e.downcast_ref::<crate::gateway_tokens::ClientTokenRefusal>() {
+        Some(refusal) => refusal.to_string(),
+        None => format!("{e:#}"),
+    }
+}
+
+/// Revoke one profile's client token through the engine, classifying the
+/// failure the card's rules name: a refusal (the last-token guard or a read
+/// failure) keeps its own sentence for the `└` line; anything else is an
+/// untyped failure.
+fn run_remove_client_token(
+    record: &crate::gateway::GatewayRecord,
+    profile: &str,
+) -> ShuntActionOutcome {
+    match crate::gateway_tokens::remove_client_token(record, profile) {
+        Ok(removed) => ShuntActionOutcome::TokenRemoved {
+            profile: profile.to_string(),
+            removed,
+        },
+        Err(e) => {
+            if let Some(refusal) = e.downcast_ref::<crate::gateway_tokens::ClientTokenRefusal>() {
+                ShuntActionOutcome::TokenRemoveRefused {
+                    profile: profile.to_string(),
+                    sentence: refusal.to_string(),
+                }
+            } else {
+                ShuntActionOutcome::TokenRemoveFailed {
+                    error: format!("{e:#}"),
+                }
+            }
+        }
+    }
+}
+
+/// Mint a client token for `profile`, then point it at the gateway through the
+/// one endpoint write path ([`crate::actions::edit_profile_endpoint`], its own
+/// locking). The token never reaches an outcome, a log line or a `Debug`.
+fn run_add_client_token(
+    record: &crate::gateway::GatewayRecord,
+    profile: &str,
+    url: &str,
+    config: &JobConfig,
+) -> ShuntActionOutcome {
+    let profile_name = ProfileName::from(profile);
+    // A profile that vanished between the picker and the job refuses before
+    // any mint: the config lock is taken and dropped ahead of the state flock
+    // `add_client_token` takes (config → flock is the ranked order), so nothing
+    // is minted and the gateway never restarts for a deleted profile.
+    {
+        let cfg = App::lock_config(&config.0);
+        if cfg.find(&profile_name).is_none() {
+            return ShuntActionOutcome::TokenAddRefused {
+                error: format!("{profile} no longer exists"),
+            };
+        }
+    }
+    let token = match crate::gateway_tokens::add_client_token(record, profile) {
+        Ok(token) => token,
+        Err(e) => {
+            return ShuntActionOutcome::TokenAddRefused {
+                error: token_error_message(&e),
+            };
+        }
+    };
+    let mut cfg = App::lock_config(&config.0);
+    match crate::actions::edit_profile_endpoint(
+        &mut cfg,
+        &profile_name,
+        Some(url.to_string()),
+        Some(token.expose().to_string()),
+    ) {
+        Ok(()) => ShuntActionOutcome::TokenAdded {
+            profile: profile.to_string(),
+        },
+        Err(e) => {
+            // Decide the copy from the profile as saved on disk after the
+            // error (the reload's source), never the in-memory copy the write
+            // may already have mutated: the save landed and only the
+            // active-profile settings write failed -> the profile points at
+            // the gateway; the save itself failed -> it was not changed. Both
+            // legs must match: a re-mint of a profile already on the gateway
+            // whose save then failed keeps its OLD key on disk, so it was not
+            // changed even though its base url still matches the gateway. The
+            // token only takes part in this comparison, never a message.
+            let points_at_gateway = crate::profile::load_profile(&profile_name)
+                .ok()
+                .is_some_and(|saved| {
+                    saved.base_url.as_deref() == Some(url)
+                        && saved.api_key.as_deref() == Some(token.expose())
+                });
+            ShuntActionOutcome::TokenAddedProfileFailed {
+                error: if points_at_gateway {
+                    format!("{profile} points at the gateway, but {e:#}")
+                } else {
+                    format!("the token is stored but {profile} was not changed: {e:#}")
+                },
+            }
+        }
     }
 }
 
@@ -13647,6 +14350,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::NamePrompt(_) => handle_name_prompt_key(app, key),
         Modal::PresetPicker(_) => handle_preset_picker_key(app, key),
         Modal::DivergenceTarget(_) => handle_divergence_target_key(app, key),
+        Modal::TokenPicker(_) => handle_token_picker_key(app, key),
         Modal::ActionMenu(_) => handle_action_menu_key(app, key),
         Modal::EnvCollision(_) => handle_env_collision_key(app, key),
         Modal::Login => handle_login_modal_key(app, key),
@@ -17546,6 +18250,18 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             app.services.shunt_remove_refusal.take();
             start_shunt_save(app, ShuntSaveKey::Remove(key), *edit, false);
         }
+        ConfirmAction::RemoveToken { record, profile } => {
+            app.services.shunt_token_refusal.take();
+            start_shunt_token_save(app, ShuntSaveKey::Token(profile.clone()), record, profile);
+        }
+        ConfirmAction::AddToken {
+            record,
+            profile,
+            url,
+            replace: _,
+        } => {
+            start_shunt_token_add(app, record, profile, url);
+        }
         ConfirmAction::Acknowledge => {}
     }
 }
@@ -17822,6 +18538,78 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
                 scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::AdoptDivergence(Box::new(snapshot), target),
             }));
+        }
+        _ => {}
+    }
+}
+
+/// Keys on the `+ add token` profile picker: Up/Down wrap, PageUp/PageDown
+/// page, `esc`/`q` close, `↵`/`space` pick (a pick opens the overwrite
+/// confirm). No synthetic `+ new profile` row in C1, so the cursor is the
+/// profile's own index.
+fn handle_token_picker_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::TokenPicker(form)) = app.modals.last_mut() else {
+        return;
+    };
+    let last = form.targets.len() - 1;
+    match key.code {
+        KeyCode::Up => {
+            form.cursor = if form.cursor == 0 {
+                last
+            } else {
+                form.cursor - 1
+            };
+        }
+        KeyCode::Down => {
+            form.cursor = if form.cursor >= last {
+                0
+            } else {
+                form.cursor + 1
+            };
+        }
+        KeyCode::PageUp => {
+            let starts = form.starts.borrow();
+            let block_ends = form.block_ends.borrow();
+            let next = page_up_cursor_by_rows(
+                form.cursor,
+                &starts,
+                &block_ends,
+                &[],
+                form.viewport.get(),
+                form.scroll.get(),
+                form.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            form.cursor = next;
+        }
+        KeyCode::PageDown => {
+            let starts = form.starts.borrow();
+            let block_ends = form.block_ends.borrow();
+            let next = page_down_cursor_by_rows(
+                form.cursor,
+                &starts,
+                &block_ends,
+                form.viewport.get(),
+                form.scroll.get(),
+                form.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            form.cursor = next;
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.modals.pop();
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let cursor = form.cursor;
+            let Some(Modal::TokenPicker(form)) = app.modals.pop() else {
+                return;
+            };
+            let Some((profile, _)) = form.targets.get(cursor).cloned() else {
+                return;
+            };
+            open_token_overwrite_confirm(app, profile);
         }
         _ => {}
     }

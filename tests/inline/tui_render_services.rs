@@ -4830,7 +4830,10 @@ fn config_view_app(view: ConfigView, expanded: std::collections::HashSet<ShuntEn
     let mut card = crate::tui::app::shunt_check(&shunt_slot_full(), true, None);
     let drafts = crate::tui::app::ShuntDrafts::default();
     card.shunt_focus.extend(crate::tui::app::config_field_stops(
-        &view, &expanded, &drafts,
+        &view,
+        &expanded,
+        &drafts,
+        &crate::tui::app::ShuntTokens::default(),
     ));
     let mut app = app_with(card);
     app.services.shunt_config = Some(ShuntConfigRead::Ok(Box::new(view)));
@@ -4942,6 +4945,8 @@ fn the_shunt_config_renders_upstreams_collapsed() {
             "  + add model",
             "ROUTES",
             "  + add route",
+            "CLIENT TOKENS",
+            "  + add token",
         ],
     );
 }
@@ -5013,6 +5018,8 @@ fn the_shunt_config_renders_one_upstream_expanded_with_accounts() {
             "  + add model",
             "ROUTES",
             "  + add route",
+            "CLIENT TOKENS",
+            "  + add token",
         ],
     );
 }
@@ -5050,6 +5057,8 @@ fn the_shunt_config_renders_the_legacy_form() {
             "  + add model",
             "ROUTES",
             "  + add route",
+            "CLIENT TOKENS",
+            "  + add token",
         ],
     );
 }
@@ -5069,6 +5078,7 @@ fn the_legacy_config_offers_no_upstream_add_or_remove() {
         &view,
         &std::collections::HashSet::new(),
         &crate::tui::app::ShuntDrafts::default(),
+        &crate::tui::app::ShuntTokens::default(),
     );
     assert!(
         !stops.iter().any(|s| matches!(
@@ -5117,6 +5127,8 @@ fn the_shunt_config_renders_the_bind_override_row() {
             "  + add model",
             "ROUTES",
             "  + add route",
+            "CLIENT TOKENS",
+            "  + add token",
         ],
     );
 }
@@ -5165,6 +5177,8 @@ fn the_shunt_config_renders_a_reference_value_as_written() {
             "    service_tier    —",
             "    remove route",
             "  + add route",
+            "CLIENT TOKENS",
+            "  + add token",
         ],
     );
 }
@@ -5207,6 +5221,8 @@ fn the_shunt_config_renders_an_absent_key_as_em_dash() {
             "ROUTES",
             "  ▶ 1  — → —",
             "  + add route",
+            "CLIENT TOKENS",
+            "  + add token",
         ],
     );
 }
@@ -5259,6 +5275,8 @@ fn the_shunt_config_renders_a_model_with_two_upstreams_expanded() {
             "  + add model",
             "ROUTES",
             "  + add route",
+            "CLIENT TOKENS",
+            "  + add token",
         ],
     );
 }
@@ -5301,6 +5319,8 @@ fn the_shunt_config_renders_a_route_row() {
             "ROUTES",
             "  ▶ 3  opus → anthropic",
             "  + add route",
+            "CLIENT TOKENS",
+            "  + add token",
         ],
     );
 }
@@ -5318,7 +5338,10 @@ fn config_draft_app(
 ) -> App {
     let mut card = crate::tui::app::shunt_check(&shunt_slot_full(), true, None);
     card.shunt_focus.extend(crate::tui::app::config_field_stops(
-        &view, &expanded, &drafts,
+        &view,
+        &expanded,
+        &drafts,
+        &crate::tui::app::ShuntTokens::default(),
     ));
     let mut app = app_with(card);
     app.services.shunt_config = Some(ShuntConfigRead::Ok(Box::new(view)));
@@ -5390,6 +5413,8 @@ fn the_shunt_config_renders_an_open_upstream_draft() {
             "  + add model",
             "ROUTES",
             "  + add route",
+            "CLIENT TOKENS",
+            "  + add token",
         ],
     );
 }
@@ -5439,6 +5464,8 @@ fn the_shunt_config_renders_a_model_draft_with_provider_rows() {
             "    save model",
             "ROUTES",
             "  + add route",
+            "CLIENT TOKENS",
+            "  + add token",
         ],
     );
 }
@@ -5518,6 +5545,8 @@ fn the_shunt_config_renders_a_draft_refusal_under_the_save_row() {
             "  + add model",
             "ROUTES",
             "  + add route",
+            "CLIENT TOKENS",
+            "  + add token",
         ],
     );
 }
@@ -5596,6 +5625,8 @@ fn the_shunt_config_renders_a_remove_refusal_under_the_remove_row() {
             "  + add model",
             "ROUTES",
             "  + add route",
+            "CLIENT TOKENS",
+            "  + add token",
         ],
         "the remove refusal renders under its own remove row:\n{}",
         rows.join("\n")
@@ -5965,7 +5996,12 @@ fn the_focus_walk_lands_on_its_own_rows_with_a_read_only_bind() {
     }]);
     let mut app = config_view_app(view.clone(), expanded.clone());
     render_tall(&app);
-    let stops = crate::tui::app::config_field_stops(&view, &expanded, &app.services.shunt_drafts);
+    let stops = crate::tui::app::config_field_stops(
+        &view,
+        &expanded,
+        &app.services.shunt_drafts,
+        &app.services.shunt_tokens,
+    );
 
     // Each stop's own line at rest, in card order (the read-only bind row and
     // the eyebrows render but are not stops).
@@ -5984,6 +6020,7 @@ fn the_focus_walk_lands_on_its_own_rows_with_a_read_only_bind() {
         "  + add upstream",
         "  + add model",
         "  + add route",
+        "  + add token",
     ];
     assert_eq!(
         stops.len(),
@@ -6548,6 +6585,7 @@ fn config_focus_identity_holds_across_a_reorder() {
         &view,
         &app.services.shunt_expanded,
         &app.services.shunt_drafts,
+        &app.services.shunt_tokens,
     ));
     app.services.checks = vec![card];
     app.services.shunt_config = Some(ShuntConfigRead::Ok(Box::new(view)));
@@ -6727,6 +6765,8 @@ fn the_shunt_config_renders_the_env_file_failure_line() {
             "  + add model",
             "ROUTES",
             "  + add route",
+            "CLIENT TOKENS",
+            "  + add token",
         ],
     );
 }
@@ -6780,6 +6820,8 @@ fn the_shunt_config_renders_two_same_id_models_distinctly() {
             "  + add model",
             "ROUTES",
             "  + add route",
+            "CLIENT TOKENS",
+            "  + add token",
         ],
     );
 }
@@ -6880,6 +6922,8 @@ fn the_shunt_config_renders_two_same_name_upstreams_distinctly() {
             "  + add model".to_string(),
             "ROUTES".to_string(),
             "  + add route".to_string(),
+            "CLIENT TOKENS".to_string(),
+            "  + add token".to_string(),
         ],
         "the second same-name upstream draws its own summary and fields"
     );
@@ -6923,6 +6967,8 @@ fn the_shunt_config_renders_two_nameless_upstreams_distinctly() {
             "  + add model".to_string(),
             "ROUTES".to_string(),
             "  + add route".to_string(),
+            "CLIENT TOKENS".to_string(),
+            "  + add token".to_string(),
         ],
         "the second nameless upstream draws its own fields"
     );
@@ -7082,6 +7128,8 @@ fn the_shunt_config_ellipsizes_long_names_summaries_and_route_labels() {
             "ROUTES".to_string(),
             "  ▶ 1  0123456789abcdef… → anthropic".to_string(),
             "  + add route".to_string(),
+            "CLIENT TOKENS".to_string(),
+            "  + add token".to_string(),
         ],
         "long names, summaries and route labels ellipsize at their slot"
     );
@@ -7115,6 +7163,8 @@ fn the_shunt_config_keeps_the_route_provider_when_the_model_shrinks() {
             "ROUTES".to_string(),
             "  ▶ 2  a-really-long-model-slug-for-trunca… → openai".to_string(),
             "  + add route".to_string(),
+            "CLIENT TOKENS".to_string(),
+            "  + add token".to_string(),
         ],
         "the route label shrinks the model, keeping the arrow and provider"
     );
@@ -7148,6 +7198,8 @@ fn the_shunt_config_marks_a_crowded_out_route_model_with_an_ellipsis() {
             "ROUTES".to_string(),
             "  ▶ 2  … → abcdefghijklmnopqrstuvwxyz0123456789ABCD…".to_string(),
             "  + add route".to_string(),
+            "CLIENT TOKENS".to_string(),
+            "  + add token".to_string(),
         ],
         "the crowded-out model keeps a `…` and the provider shrinks by one more cell"
     );
@@ -7180,6 +7232,8 @@ fn the_shunt_config_marks_an_absent_crowded_route_model_with_an_em_dash() {
             "ROUTES".to_string(),
             "  ▶ 2  — → abcdefghijklmnopqrstuvwxyz0123456789ABCD…".to_string(),
             "  + add route".to_string(),
+            "CLIENT TOKENS".to_string(),
+            "  + add token".to_string(),
         ],
         "an absent model keeps its `—` when the provider crowds it out"
     );
@@ -7206,6 +7260,8 @@ fn the_shunt_config_ellipsizes_the_bind_suffix_at_a_narrow_width() {
             "  + add model".to_string(),
             "ROUTES".to_string(),
             "  + add route".to_string(),
+            "CLIENT TOKENS".to_string(),
+            "  + add token".to_string(),
         ],
         "the set-by suffix ellipsizes within the pane"
     );
@@ -7223,6 +7279,8 @@ fn the_shunt_config_ellipsizes_the_bind_suffix_at_a_narrow_width() {
             "  + add model".to_string(),
             "ROUTES".to_string(),
             "  + add route".to_string(),
+            "CLIENT TOKENS".to_string(),
+            "  + add token".to_string(),
         ],
         "the env-file suffix ellipsizes within the pane"
     );
@@ -7241,6 +7299,8 @@ fn the_shunt_config_ellipsizes_the_bind_suffix_at_a_narrow_width() {
             "  + add model".to_string(),
             "ROUTES".to_string(),
             "  + add route".to_string(),
+            "CLIENT TOKENS".to_string(),
+            "  + add token".to_string(),
         ],
         "an overflowing value ellipsizes and the suffix drops whole"
     );
@@ -7386,6 +7446,8 @@ fn the_shunt_config_legacy_form_hides_populated_upstreams() {
             "ROUTES",
             "  ▶ 1  opus → anthropic",
             "  + add route",
+            "CLIENT TOKENS",
+            "  + add token",
         ],
     );
     assert!(matches!(

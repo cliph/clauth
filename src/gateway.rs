@@ -1155,6 +1155,13 @@ pub(crate) fn displayed_gateway_bind(record: &GatewayRecord) -> Result<GatewayBi
     )
 }
 
+/// The gateway's base url for a profile endpoint: `http://<probe>` over the
+/// displayed bind's probe address, so the string [`url_names_bind`] accepts is
+/// the one a profile is pointed at.
+pub(crate) fn gateway_base_url(record: &GatewayRecord) -> Result<String> {
+    Ok(format!("http://{}", displayed_gateway_bind(record)?.probe))
+}
+
 /// The running daemon's recorded env, matched to the singleton holder by pid
 /// alone: the start-time half of [`DaemonIdentity`] spawns `ps` or PowerShell
 /// off linux, which a UI-thread read must not. A record a dead daemon left

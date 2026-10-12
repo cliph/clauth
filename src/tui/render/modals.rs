@@ -12,8 +12,8 @@ use crate::profile::DivergenceChoice;
 use super::super::app::{
     ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceAction, DivergenceForm,
     DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginMethod,
-    LoginStage, Modal, NamePromptForm, PresetPickerForm, StatusFocus, Tab, TokenView,
-    token_model_count,
+    LoginStage, Modal, NamePromptForm, PresetPickerForm, StatusFocus, Tab, TokenPickerForm,
+    TokenView, token_model_count,
 };
 use super::super::theme;
 use super::chain::reason_marker;
@@ -35,6 +35,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         Modal::NamePrompt(form) => draw_name_prompt(frame, area, form),
         Modal::PresetPicker(form) => draw_preset_picker(frame, area, form),
         Modal::DivergenceTarget(form) => draw_divergence_target(frame, area, form),
+        Modal::TokenPicker(form) => draw_token_picker(frame, area, form),
         Modal::Help => draw_help(frame, area, app),
         Modal::ActionMenu(state) => draw_action_menu(frame, area, state),
         Modal::EnvCollision(form) => draw_env_collision(frame, area, form),
@@ -510,6 +511,8 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             | ConfirmAction::StopShunt
             | ConfirmAction::RestartBind { .. }
             | ConfirmAction::RemoveEntry { .. }
+            | ConfirmAction::RemoveToken { .. }
+            | ConfirmAction::AddToken { .. }
     );
 
     // `AddChainCandidate` names the candidate in its confirm button so the
@@ -524,7 +527,10 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         ConfirmAction::StopShunt => "stop".to_string(),
         ConfirmAction::RestartBind { .. } => "restart".to_string(),
         ConfirmAction::RenameField { .. } => "rename".to_string(),
-        ConfirmAction::RemoveEntry { .. } => "remove".to_string(),
+        ConfirmAction::RemoveEntry { .. } | ConfirmAction::RemoveToken { .. } => {
+            "remove".to_string()
+        }
+        ConfirmAction::AddToken { .. } => "overwrite".to_string(),
         _ => "confirm".to_string(),
     };
 
@@ -549,6 +555,13 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             "logfile at ~/.clauth/daemon.log.",
             theme::dim(),
         )));
+    }
+    // The token-add confirm's third line names only what the overwrite
+    // replaces, `None` when the profile had neither a base url nor a key.
+    if let ConfirmAction::AddToken { replace, .. } = &state.on_confirm
+        && let Some(replace) = replace
+    {
+        lines.push(Line::from(prose::spans(replace, theme::dim())));
     }
     // An acknowledge-only notice has nothing to cancel — a single focused `ok`.
     let buttons = if matches!(state.on_confirm, ConfirmAction::Acknowledge) {
@@ -605,7 +618,7 @@ fn modal_button(label: &str, focused: bool) -> Span<'static> {
 
 /// Destructive variant of `modal_button`: DANGER fg unfocused, inverse DANGER block
 /// focused. Same bar-less house style as `modal_button` (no `▐`/`▌`).
-fn danger_button(label: &str, focused: bool) -> Span<'static> {
+pub(super) fn danger_button(label: &str, focused: bool) -> Span<'static> {
     if focused {
         Span::styled(
             label.to_string(),
@@ -732,6 +745,48 @@ fn draw_divergence_target(frame: &mut Frame<'_>, area: Rect, form: &DivergenceTa
             }),
         },
     );
+}
+
+fn draw_token_picker(frame: &mut Frame<'_>, area: Rect, form: &TokenPickerForm) {
+    let cursor = form.cursor.min(form.targets.len().saturating_sub(1));
+
+    let mut lines: Vec<Line<'_>> = vec![
+        Line::from(Span::styled("which profile sends it?", theme::dim())),
+        Line::from(""),
+    ];
+    for (i, (name, has_token)) in form.targets.iter().enumerate() {
+        lines.push(token_picker_row(cursor == i, name, *has_token));
+    }
+
+    draw_modal_focused(
+        frame,
+        area,
+        "ADD TOKEN",
+        lines,
+        cursor + 2..cursor + 3,
+        ModalFollow {
+            saved: &form.scroll,
+            viewport: &form.viewport,
+            geometry: Some(ModalGeometry {
+                base: 2,
+                count: form.targets.len(),
+                starts: &form.starts,
+                block_ends: &form.block_ends,
+                total: &form.total,
+            }),
+        },
+    );
+}
+
+/// One profile row of the token picker: the shared `option_line` shape (the
+/// Divergence/target-picker row), plus a dim `  has a token` suffix for a
+/// profile already holding one.
+fn token_picker_row(selected: bool, name: &str, has_token: bool) -> Line<'static> {
+    let mut line = option_line(selected, name.to_string());
+    if has_token {
+        line.push_span(Span::styled("  has a token", theme::dim()));
+    }
+    line
 }
 
 fn draw_env_collision(frame: &mut Frame<'_>, area: Rect, form: &EnvCollisionForm) {

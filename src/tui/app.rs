@@ -2270,6 +2270,23 @@ pub(crate) struct ShuntRemoveRefusal {
 /// How long a field's caret slot shows the `SUCCESS` `✓` after its save lands.
 pub(crate) const SHUNT_OK_MS: u64 = 1000;
 
+/// Which edit's refused `shunt check` the card's `check output` line holds:
+/// clauth's admin entry turning up present answers an admin edit's refusal,
+/// never a config save's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckOutputSource {
+    AdminEdit,
+    ConfigSave,
+}
+
+/// A refused `shunt check`'s stderr held for the `check output` line, with the
+/// kind of edit it refused.
+#[derive(Debug, Clone)]
+pub(crate) struct HeldCheckOutput {
+    pub(crate) source: CheckOutputSource,
+    pub(crate) stderr: crate::gateway::CheckStderr,
+}
+
 /// The adopted config read through [`crate::gateway_edit::read_view`] on the
 /// recompute. The render draws the card's config section from it.
 #[derive(Debug, Clone)]
@@ -2727,13 +2744,15 @@ pub(crate) struct ServicesState {
     /// parse, the herdr config re-read's shape). `None` = no record, or an
     /// unreadable config (no verb offered).
     pub(crate) admin_need: Option<crate::gateway::AdminNeed>,
-    /// The stderr of the last admin edit THIS TUI ran whose `shunt check`
-    /// refused, held for the shunt card's `check output` modal. Cleared when
-    /// an admin edit succeeds (`AdminAdded`), a later admin failure carries no
-    /// check output or edited another config, `admin_need` reads `Neither` or
-    /// `None`, or the gateway record changes. The daemon's own restart
-    /// refusals never land here.
-    pub(crate) check_output: Option<crate::gateway::CheckStderr>,
+    /// The stderr of the last admin edit or config save THIS TUI ran whose
+    /// `shunt check` refused, held for the shunt card's `check output` modal.
+    /// Cleared when an admin edit succeeds (`AdminAdded`), a later failure of
+    /// either kind edited another config, the gateway record changes, or
+    /// `admin_need` reads `None`; an admin edit's output also when a later
+    /// admin edit fails with no check output or `admin_need` reads `Neither`,
+    /// a config save's when a later save lands.
+    /// The daemon's own restart refusals never land here.
+    pub(crate) check_output: Option<HeldCheckOutput>,
     /// The cached codex-pool read (`None` = not read, or not due). The read
     /// runs on a worker while the slot is `healthy` and `admin_need` is
     /// `Neither`, and can block up to ~24 s.
@@ -7092,10 +7111,10 @@ fn shunt_esc_folds_entry(app: &mut App) -> bool {
 /// real lines, ANSI CSI sequences stripped (shunt's tracing may emit SGR), and
 /// each line control-escaped here; nothing is re-read or re-masked.
 fn open_check_output_modal(app: &mut App) {
-    let Some(output) = app.services.check_output.clone() else {
+    let Some(held) = app.services.check_output.as_ref() else {
         return;
     };
-    let body = stderr_display_lines(output.text()).join("\n");
+    let body = stderr_display_lines(held.stderr.text()).join("\n");
     app.check_output_scroll = 0;
     app.open_modal(Modal::CheckOutput(body));
 }
@@ -7839,13 +7858,22 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool, shunt: ShuntR
         .and_then(|record| crate::gateway::admin_need(record.config()).ok());
     match app.services.admin_need {
         // The admin entry is present (this edit landed, another writer added
-        // it, or a fresh adopt already had it): nothing left to refuse — or
-        // there is no record / the config is unreadable, so no refusal is owed
-        // and the line has no card to sit under.
-        Some(crate::gateway::AdminNeed::Neither) | None => {
-            app.services.check_output = None;
+        // it, or a fresh adopt already had it): no admin refusal is left to
+        // show. A config save's refusal is not answered by it and stays.
+        Some(crate::gateway::AdminNeed::Neither) => {
+            if app
+                .services
+                .check_output
+                .as_ref()
+                .is_some_and(|held| held.source == CheckOutputSource::AdminEdit)
+            {
+                app.services.check_output = None;
+            }
         }
-        Some(_) => {}
+        // No record, or the config is unreadable: the line has no card to sit
+        // under.
+        None => app.services.check_output = None,
+        Some(crate::gateway::AdminNeed::WriteKey | crate::gateway::AdminNeed::AdminTable) => {}
     }
 
     // The store move plan: on a worker, on tab entry, on `r`, and after any
@@ -8149,7 +8177,7 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
                 ToastKind::Danger,
                 format!("admin key failed\n{}", escape_control(&error)),
             );
-            hold_check_output(app, &config, check_output);
+            hold_check_output(app, &config, CheckOutputSource::AdminEdit, check_output);
         }
         ShuntActionOutcome::Held => {
             app.toast(
@@ -8189,6 +8217,17 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
                 .as_ref()
                 .and_then(|save| save.entry.clone());
             app.services.shunt_save = None;
+            // A save landed (or matched the file and wrote nothing): the user
+            // moved past the refused edit, so its output no longer explains
+            // the card.
+            if app
+                .services
+                .check_output
+                .as_ref()
+                .is_some_and(|held| held.source == CheckOutputSource::ConfigSave)
+            {
+                app.services.check_output = None;
+            }
             match key {
                 ShuntSaveKey::Field(field_key) => {
                     // The `✓` shows for about a second on the row that saved; a
@@ -8385,7 +8424,7 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
                 ToastKind::Danger,
                 format!("save failed\n{}", escape_control(&error)),
             );
-            hold_check_output(app, &config, check_output);
+            hold_check_output(app, &config, CheckOutputSource::ConfigSave, check_output);
         }
         ShuntActionOutcome::ConfigFailed { error } => {
             app.services.shunt_save = None;
@@ -8400,10 +8439,11 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
 /// Hold a failed `shunt check`'s stderr on the card, but only for the config
 /// the edit ran against: a re-adopt that landed while the check ran must never
 /// show another gateway's output on this card. A check-output-free refusal (or
-/// a non-typed error) retires the held output the same way.
+/// a non-typed error) retires a held output of its own kind only.
 fn hold_check_output(
     app: &mut App,
     config: &std::path::Path,
+    source: CheckOutputSource,
     check_output: Option<crate::gateway::CheckStderr>,
 ) {
     let current = app
@@ -8411,11 +8451,24 @@ fn hold_check_output(
         .shunt_record
         .as_ref()
         .map(|record| record.config().to_path_buf());
-    app.services.check_output = if Some(config) == current.as_deref() {
-        check_output
-    } else {
-        None
-    };
+    if Some(config) != current.as_deref() {
+        app.services.check_output = None;
+        return;
+    }
+    match check_output {
+        Some(stderr) => app.services.check_output = Some(HeldCheckOutput { source, stderr }),
+        // A refusal with no output answers only its own kind's held output.
+        None => {
+            if app
+                .services
+                .check_output
+                .as_ref()
+                .is_some_and(|held| held.source == source)
+            {
+                app.services.check_output = None;
+            }
+        }
+    }
 }
 
 /// The entry key a `save <kind>` edit lands under, fixed at save START: for an
@@ -9101,8 +9154,10 @@ pub(crate) fn shunt_card(
         Some(crate::gateway::AdminNeed::Neither) | None => {}
     }
 
-    // The failed check's output, right under the admin fix it came from: an
-    // actionable line whose ↵/space opens the read-only masked-stderr modal.
+    // The failed check's output, after the admin fix lines (an admin edit's
+    // sits right under the fix it came from; a config save's follows whatever
+    // fix line the card shows): an actionable line whose ↵/space opens the
+    // read-only masked-stderr modal.
     if check_output {
         let line = check.detail.len();
         check.detail.push("check output".to_string());

@@ -23283,6 +23283,201 @@ fn removing_a_referenced_upstream_goes_the_check_refused_route() {
     );
 }
 
+/// A refused config save's `check output` survives the card's recompute when
+/// clauth's admin key is already in the config (the usual adopted state): the
+/// admin entry being present retires only an admin edit's output. The next
+/// save that lands retires it.
+#[cfg(unix)]
+#[test]
+fn a_refused_save_keeps_its_check_output_while_the_admin_key_is_present() {
+    use super::ShuntEntryKey;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let token = crate::gateway::admin_token_path().unwrap();
+    let key_ref = format!("${{file:{}}}", token.to_string_lossy());
+    let text = format!(
+        "[server]\nbind = \"127.0.0.1:3001\"\n\n[server.admin]\nwrite_keys = [{{ id = \"clauth\", key = {} }}]\n\n[[upstreams]]\nname = \"a\"\nauth = \"claude_oauth\"\n\n[[upstreams]]\nname = \"b\"\nauth = \"claude_oauth\"\n",
+        toml_edit::value(key_ref.as_str())
+    );
+    let mut rig = config_edit_rig(&home, &text);
+    assert_eq!(
+        rig.app.services.admin_need,
+        Some(crate::gateway::AdminNeed::Neither),
+        "precondition: clauth's admin key is in the config"
+    );
+    std::fs::write(rig.stub.join("fail"), "").unwrap();
+    rig.focus_remove(ShuntEntryKey::Upstream {
+        name: "b".into(),
+        occurrence: 0,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    super::recompute_services_checks(&mut rig.app, false, super::ShuntRefresh::Keep);
+    assert_eq!(
+        rig.config_text(),
+        text,
+        "a check-refused remove writes nothing"
+    );
+    assert!(
+        rig.app.services.check_output.is_some(),
+        "the refused save's output survives the recompute"
+    );
+    assert!(
+        shunt_config_rows(&rig.app)
+            .iter()
+            .any(|row| row.trim() == "check output"),
+        "the card shows the check output line the toast points at"
+    );
+
+    std::fs::rename(rig.stub.join("fail"), rig.stub.join("fail.off")).unwrap();
+    rig.focus_remove(ShuntEntryKey::Upstream {
+        name: "b".into(),
+        occurrence: 0,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert!(
+        !rig.config_text().contains("name = \"b\""),
+        "precondition: the second remove landed"
+    );
+    assert!(
+        rig.app.services.check_output.is_none(),
+        "a landed save retires the refused save's output"
+    );
+}
+
+/// A config save's held `check output` outlives an admin edit that fails with
+/// no check output (that answers only an admin edit's own output), and
+/// retires when an admin edit lands (`AdminAdded` retires any).
+#[cfg(unix)]
+#[test]
+fn admin_outcomes_retire_a_config_save_check_output_only_on_a_landed_edit() {
+    use super::ShuntEntryKey;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let text = "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nauth = \"claude_oauth\"\n\n[[upstreams]]\nname = \"b\"\nauth = \"claude_oauth\"\n";
+    let mut rig = config_edit_rig(&home, text);
+    std::fs::write(rig.stub.join("fail"), "").unwrap();
+    rig.focus_remove(ShuntEntryKey::Upstream {
+        name: "b".into(),
+        occurrence: 0,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(
+        rig.app
+            .services
+            .check_output
+            .as_ref()
+            .map(|held| held.source),
+        Some(super::CheckOutputSource::ConfigSave),
+        "precondition: the refused save's output is held"
+    );
+
+    super::handle_shunt_action_outcome(
+        &mut rig.app,
+        super::ShuntActionOutcome::AdminFailed {
+            error: "boom".to_string(),
+            check_output: None,
+            config: rig.config.clone(),
+        },
+    );
+    assert_eq!(
+        rig.app
+            .services
+            .check_output
+            .as_ref()
+            .map(|held| held.source),
+        Some(super::CheckOutputSource::ConfigSave),
+        "an admin failure with no output leaves the save's output"
+    );
+
+    super::handle_shunt_action_outcome(&mut rig.app, super::ShuntActionOutcome::AdminAdded);
+    assert!(
+        rig.app.services.check_output.is_none(),
+        "a landed admin edit retires any held output"
+    );
+
+    // An admin edit's own output does retire on an output-free admin failure
+    // against the same config.
+    let record = rig.app.services.shunt_record.clone().unwrap();
+    let outcome = super::run_admin_edit(&record, crate::gateway::AdminNeed::AdminTable);
+    super::handle_shunt_action_outcome(&mut rig.app, outcome);
+    assert_eq!(
+        rig.app
+            .services
+            .check_output
+            .as_ref()
+            .map(|held| held.source),
+        Some(super::CheckOutputSource::AdminEdit),
+        "precondition: the refused admin edit's output is held"
+    );
+    super::handle_shunt_action_outcome(
+        &mut rig.app,
+        super::ShuntActionOutcome::AdminFailed {
+            error: "boom".to_string(),
+            check_output: None,
+            config: rig.config.clone(),
+        },
+    );
+    assert!(
+        rig.app.services.check_output.is_none(),
+        "an admin failure with no output retires an admin edit's output"
+    );
+}
+
+/// An admin edit's refused `check output` still retires once clauth's admin
+/// entry turns up in the config (another writer added it): only a config
+/// save's output outlives the `Neither` read.
+#[cfg(unix)]
+#[test]
+fn an_admin_edit_check_output_retires_once_the_admin_key_is_present() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, "[server]\nbind = \"127.0.0.1:3001\"\n");
+    std::fs::write(rig.stub.join("fail"), "").unwrap();
+    let record = rig.app.services.shunt_record.clone().unwrap();
+    let outcome = super::run_admin_edit(&record, crate::gateway::AdminNeed::AdminTable);
+    super::handle_shunt_action_outcome(&mut rig.app, outcome);
+    super::recompute_services_checks(&mut rig.app, false, super::ShuntRefresh::Keep);
+    assert_eq!(
+        rig.app
+            .services
+            .check_output
+            .as_ref()
+            .map(|held| held.source),
+        Some(super::CheckOutputSource::AdminEdit),
+        "precondition: the refused admin edit's output is held"
+    );
+
+    let token = crate::gateway::admin_token_path().unwrap();
+    let key_ref = format!("${{file:{}}}", token.to_string_lossy());
+    std::fs::write(
+        &rig.config,
+        format!(
+            "[server]\nbind = \"127.0.0.1:3001\"\n\n[server.admin]\nwrite_keys = [{{ id = \"clauth\", key = {} }}]\n",
+            toml_edit::value(key_ref.as_str())
+        ),
+    )
+    .unwrap();
+    super::recompute_services_checks(&mut rig.app, false, super::ShuntRefresh::Keep);
+    assert_eq!(
+        rig.app.services.admin_need,
+        Some(crate::gateway::AdminNeed::Neither),
+        "precondition: the admin entry now reads present"
+    );
+    assert!(
+        rig.app.services.check_output.is_none(),
+        "the admin edit's output retires once the entry is present"
+    );
+}
+
 /// One save at a time across a field save, a `save <kind>` and a remove: a
 /// second save while one checks toasts `a save is still checking` / `wait for
 /// it, then save again` and starts nothing.
@@ -23588,8 +23783,12 @@ fn a_refused_check_toasts_and_fills_the_check_output_line() {
         "the toast names the save's own op"
     );
     assert_eq!(
-        rig.app.services.check_output.as_ref().map(|c| c.text()),
-        Some("config error: boom"),
+        rig.app
+            .services
+            .check_output
+            .as_ref()
+            .map(|held| (held.source, held.stderr.text())),
+        Some((super::CheckOutputSource::ConfigSave, "config error: boom")),
         "the failed check's stderr is held on the card, by content"
     );
 }

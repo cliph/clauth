@@ -22761,8 +22761,11 @@ fn the_production_recompute_renders_the_config_groups_and_walks_onto_them() {
             "  default_provider  anthropic".to_string(),
             "UPSTREAMS".to_string(),
             "  ▶ anthropic       claude_oauth".to_string(),
+            "  + add upstream".to_string(),
             "MODELS".to_string(),
+            "  + add model".to_string(),
             "ROUTES".to_string(),
+            "  + add route".to_string(),
         ],
         "production card rows:\n{}",
         rows.join("\n")
@@ -22860,7 +22863,9 @@ impl ConfigEditRig {
             super::ShuntFieldKey::Route { position, .. } => {
                 Some(super::ShuntEntryKey::Route(*position))
             }
-            super::ShuntFieldKey::Bind | super::ShuntFieldKey::DefaultProvider => None,
+            super::ShuntFieldKey::Bind
+            | super::ShuntFieldKey::DefaultProvider
+            | super::ShuntFieldKey::Draft { .. } => None,
         };
         if let Some(entry) = entry {
             self.app.services.shunt_expanded.insert(entry);
@@ -22879,6 +22884,47 @@ impl ConfigEditRig {
 
     fn drain(&mut self) {
         drain_shunt_action(&mut self.app);
+    }
+
+    /// Focus one shunt-card row by its identity (an add/save/remove/field row).
+    fn focus_line(&mut self, kind: super::ShuntFocusLine) {
+        self.app.services.focus = super::ServicesFocus::Detail;
+        self.app.services.set_shunt_focus(Some(kind));
+        self.render();
+    }
+
+    /// Focus the `+ add <kind>` row and press `↵` to open the draft.
+    fn open_add(&mut self, kind: super::ShuntAddKind) {
+        self.focus_line(super::ShuntFocusLine::Add(kind));
+        super::handle_key(&mut self.app, crate::testutil::key(KeyCode::Enter));
+    }
+
+    /// Focus one draft field row, ready for `↵`.
+    fn focus_draft_field(&mut self, kind: super::ShuntAddKind, field: super::ShuntDraftField) {
+        self.focus_line(super::ShuntFocusLine::Field(super::ShuntFieldKey::Draft {
+            kind,
+            field,
+        }));
+    }
+
+    /// Type `text` into the open field editor and commit it with `↵` (a draft
+    /// field's commit lands in the draft; a file field's starts a save).
+    fn type_and_commit(&mut self, text: &str) {
+        for c in text.chars() {
+            super::handle_key(&mut self.app, crate::testutil::key(KeyCode::Char(c)));
+        }
+        super::handle_key(&mut self.app, crate::testutil::key(KeyCode::Enter));
+    }
+
+    /// Expand an entry and focus its `remove <kind>` row.
+    fn focus_remove(&mut self, key: super::ShuntEntryKey) {
+        self.app.services.shunt_expanded.insert(key.clone());
+        super::recompute_services_checks(&mut self.app, false, super::ShuntRefresh::Keep);
+        self.app.services.focus = super::ServicesFocus::Detail;
+        self.app
+            .services
+            .set_shunt_focus(Some(super::ShuntFocusLine::Remove(key)));
+        self.render();
     }
 }
 
@@ -22908,6 +22954,366 @@ fn clear_and_save(app: &mut App, text: &str) {
         super::handle_key(app, crate::testutil::key(KeyCode::Backspace));
     }
     type_and_save(app, text);
+}
+
+// ── config add and remove (C3) ───────────────────────────────────────────────
+
+/// A blank required field refuses on the `└` line under `save <kind>` before any
+/// worker runs: the file stays byte-identical and no save starts.
+#[cfg(unix)]
+#[test]
+fn a_blank_required_field_refuses_on_the_save_line_without_a_worker() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(super::ShuntAddKind::Upstream);
+    assert_eq!(
+        rig.config_text(),
+        RIG_TEXT,
+        "opening the draft writes nothing"
+    );
+    rig.focus_line(super::ShuntFocusLine::SaveAdd(
+        super::ShuntAddKind::Upstream,
+    ));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        !rig.app.services.shunt_save_worker.running,
+        "no worker starts for a blank required field"
+    );
+    assert_eq!(
+        rig.app
+            .services
+            .shunt_drafts
+            .refusal(super::ShuntAddKind::Upstream),
+        Some("cannot add upstream: set its name first"),
+        "the refusal lands on the save row by equality"
+    );
+    assert_eq!(rig.config_text(), RIG_TEXT, "nothing written");
+    // The `└` line renders under `save upstream`.
+    let rows = shunt_config_rows(&rig.app);
+    let joined = rows.join("\n");
+    assert!(
+        joined.contains("cannot add upstream: set its name first"),
+        "the refusal renders on the `└` line:\n{joined}"
+    );
+}
+
+/// An upstream, a model and a route added through their drafts land their bytes
+/// in the file (read back by equality), and nothing is written before each
+/// `save <kind>` — every draft commit, cycle pick and `esc` keeps the file
+/// byte-identical.
+#[cfg(unix)]
+#[test]
+fn adding_an_upstream_a_model_and_a_route_lands_their_bytes_once() {
+    use super::{ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+
+    // An upstream: name + provider + effort.
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("work");
+    assert_eq!(rig.config_text(), RIG_TEXT, "a draft commit writes nothing");
+    // A cycle pick (provider) writes nothing before save.
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Provider),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(' ')));
+    assert_eq!(rig.config_text(), RIG_TEXT, "a cycle pick writes nothing");
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Effort),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("high");
+    rig.focus_line(super::ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nauth = \"claude_oauth\"\n\n[[upstreams]]\nname = \"work\"\nprovider = \"anthropic\"\neffort = \"high\"\n",
+        "the added upstream lands its bytes once"
+    );
+
+    // A model: id + display_name + one upstream_model row (blank left out).
+    rig.open_add(ShuntAddKind::Model);
+    rig.focus_draft_field(
+        ShuntAddKind::Model,
+        ShuntDraftField::Model(super::ModelFieldKind::Id),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("opus");
+    rig.focus_draft_field(
+        ShuntAddKind::Model,
+        ShuntDraftField::Model(super::ModelFieldKind::DisplayName),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("Opus");
+    // The `upstream_model` rows follow the config's upstream names in order:
+    // "a", "work" — set the "work" one only, "a" stays blank (left out).
+    rig.focus_draft_field(
+        ShuntAddKind::Model,
+        ShuntDraftField::Model(super::ModelFieldKind::UpstreamModel("work".to_string())),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("claude-opus");
+    rig.focus_line(super::ShuntFocusLine::SaveAdd(ShuntAddKind::Model));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nauth = \"claude_oauth\"\n\n[[upstreams]]\nname = \"work\"\nprovider = \"anthropic\"\neffort = \"high\"\n\n[[models]]\nid = \"opus\"\ndisplay_name = \"Opus\"\nupstream_model = { work = \"claude-opus\" }\n",
+        "the added model lands its bytes once, blank upstream_model rows left out"
+    );
+
+    // A route: model + provider.
+    rig.open_add(ShuntAddKind::Route);
+    rig.focus_draft_field(
+        ShuntAddKind::Route,
+        ShuntDraftField::Route(super::RouteFieldKind::Model),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("opus");
+    rig.focus_draft_field(
+        ShuntAddKind::Route,
+        ShuntDraftField::Route(super::RouteFieldKind::Provider),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("work");
+    rig.focus_line(super::ShuntFocusLine::SaveAdd(ShuntAddKind::Route));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nauth = \"claude_oauth\"\n\n[[upstreams]]\nname = \"work\"\nprovider = \"anthropic\"\neffort = \"high\"\n\n[[models]]\nid = \"opus\"\ndisplay_name = \"Opus\"\nupstream_model = { work = \"claude-opus\" }\n\n[[routes]]\nmodel = \"opus\"\nprovider = \"work\"\n",
+        "the added route lands its bytes once"
+    );
+}
+
+/// `remove upstream` opens the C2 confirm (no new modal kind, `cancel`
+/// default-focused, `remove` destructive); `cancel` writes nothing, `remove`
+/// lands the cut and focus lands on the group's `+ add upstream` row (the last
+/// entry removed leaves no sibling).
+#[cfg(unix)]
+#[test]
+fn remove_upstream_confirms_and_lands_the_cut() {
+    use super::{ConfirmAction, ShuntEntryKey, ShuntFocusLine};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    let entry = ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    };
+    rig.focus_remove(entry.clone());
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    {
+        let confirm = match rig.app.modals.last() {
+            Some(super::Modal::Confirm(state)) => state,
+            other => panic!("expected a confirm, got {other:?}"),
+        };
+        assert_eq!(confirm.message, "remove upstream \"a\"?");
+        assert_eq!(confirm.detail, None);
+        assert!(!confirm.choice, "cancel default-focused");
+        assert!(
+            matches!(confirm.on_confirm, ConfirmAction::RemoveEntry { .. }),
+            "the C2 confirm kind is reused"
+        );
+    }
+    // `cancel` (Enter on the default-focused cancel) writes nothing.
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(rig.config_text(), RIG_TEXT, "cancel writes nothing");
+
+    // Re-open and confirm `remove`.
+    rig.focus_remove(entry.clone());
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        "[server]\nbind = \"127.0.0.1:3001\"\n",
+        "the remove lands the cut"
+    );
+    assert!(
+        !rig.app.services.shunt_expanded.contains(&entry),
+        "the entry leaves the expanded set"
+    );
+    assert_eq!(
+        rig.app.services.shunt_focus_kind(),
+        Some(ShuntFocusLine::Add(super::ShuntAddKind::Upstream)),
+        "focus lands on the group's `+ add upstream` row with no sibling left"
+    );
+}
+
+/// A remove refused by an unowned comment in a gap it touches keeps the entry
+/// expanded and renders the engine's own sentence on the `└` line under the
+/// `remove upstream` row; the file stays byte-identical.
+#[cfg(unix)]
+#[test]
+fn a_remove_refused_by_an_unowned_comment_shows_the_line() {
+    use super::ShuntEntryKey;
+    let text = "[[upstreams]]\nname = \"a\"\n# under a\n\n[[upstreams]]\nname = \"b\"\n\n# floating\n\n[[upstreams]]\nname = \"c\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    let entry = ShuntEntryKey::Upstream {
+        name: "b".into(),
+        occurrence: 0,
+    };
+    rig.focus_remove(entry.clone());
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(rig.config_text(), text, "a refused remove writes nothing");
+    assert!(
+        rig.app.services.shunt_expanded.contains(&entry),
+        "the entry stays expanded"
+    );
+    let refusal = rig.app.services.shunt_remove_refusal.borrow();
+    assert_eq!(
+        refusal.as_ref().map(|r| (&r.key, r.sentence.as_str())),
+        Some((
+            &entry,
+            "cannot remove upstream \"b\": a comment next to it belongs to no single entry; edit the config by hand"
+        )),
+        "the refusal lands under the remove row by equality"
+    );
+    drop(refusal);
+    let rows = shunt_config_rows(&rig.app);
+    let joined = rows.join("\n");
+    assert!(
+        joined.contains("└ cannot remove upstream \"b\": a comment next to it")
+            && joined.contains("single entry; edit the config by hand"),
+        "the refusal renders on the `└` line:\n{joined}"
+    );
+}
+
+/// A remove refusal retires when `q` ascends from the card: the blurred card
+/// draws no `└` line under the row the user left.
+#[cfg(unix)]
+#[test]
+fn a_remove_refusal_retires_when_q_ascends_from_the_card() {
+    use super::ShuntEntryKey;
+    let text = "[[upstreams]]\nname = \"a\"\n# under a\n\n[[upstreams]]\nname = \"b\"\n\n# floating\n\n[[upstreams]]\nname = \"c\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    let entry = ShuntEntryKey::Upstream {
+        name: "b".into(),
+        occurrence: 0,
+    };
+    rig.focus_remove(entry);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert!(
+        rig.app.services.shunt_remove_refusal.borrow().is_some(),
+        "precondition: the refusal shows under the remove row"
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char('q')));
+    assert_eq!(
+        rig.app.services.focus,
+        super::ServicesFocus::List,
+        "q ascends to the Services list"
+    );
+    assert!(
+        rig.app.services.shunt_remove_refusal.borrow().is_none(),
+        "the refusal retires with the ascend"
+    );
+    let rows = shunt_config_rows(&rig.app);
+    assert!(
+        rows.iter().all(|row| !row.contains('└')),
+        "the blurred card draws no refusal line:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// clauth runs no reference check of its own: an upstream still named by
+/// routes goes to `shunt check`, whose refusal takes the refused-check route —
+/// a danger toast + the held `check output` line, the file byte-identical.
+#[cfg(unix)]
+#[test]
+fn removing_a_referenced_upstream_goes_the_check_refused_route() {
+    use super::{ShuntEntryKey, ToastKind};
+    let text = "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nauth = \"claude_oauth\"\n\n[[routes]]\nmodel = \"m\"\nprovider = \"a\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    // The stub `shunt` refuses every check while the `fail` marker exists.
+    std::fs::write(rig.stub.join("fail"), "").unwrap();
+    let entry = ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    };
+    rig.focus_remove(entry.clone());
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        text,
+        "a check-refused remove writes nothing"
+    );
+    let expected = crate::tui::render::prose::mark_commands(&format!(
+        "save failed\n{}",
+        super::escape_control(&format!(
+            "`shunt check` refused the save (exit 1) · shunt.toml unchanged · {} check output on the shunt card",
+            crate::tui::render::prose::key("↵"),
+        ))
+    ));
+    assert_eq!(
+        rig.app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((ToastKind::Danger, expected.as_str())),
+        "the refused-check route toasts by equality"
+    );
+    assert!(
+        rig.app.services.check_output.is_some(),
+        "the card holds the check output"
+    );
+}
+
+/// One save at a time across a field save, a `save <kind>` and a remove: a
+/// second save while one checks toasts `a save is still checking` / `wait for
+/// it, then save again` and starts nothing.
+#[cfg(unix)]
+#[test]
+fn one_save_at_a_time_across_a_field_save_a_save_kind_and_a_remove() {
+    use super::{ShuntAddKind, ShuntDraftField, ShuntFocusLine, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+
+    // Hold the worker busy, then try a `save upstream`.
+    rig.app.services.shunt_save_worker.running = true;
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("work");
+    rig.focus_line(ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        rig.app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Info,
+            "a save is still checking\nwait for it, then save again"
+        )),
+        "a second save toasts the one-save guard by equality"
+    );
+    assert_eq!(rig.config_text(), RIG_TEXT, "nothing written");
 }
 
 #[cfg(unix)]
@@ -23488,9 +23894,10 @@ fn a_refusal_landing_after_focus_moved_away_toasts_and_writes_nothing() {
     // guard), so the locked-editor keys run before any outcome lands.
     rig.app.services.shunt_save_worker.running = true;
     rig.app.services.shunt_save = Some(super::ShuntSave {
-        key: ShuntFieldKey::Bind,
+        key: super::ShuntSaveKey::Field(ShuntFieldKey::Bind),
         started: std::time::Instant::now(),
         value: Some("${SHUNT_BIND}".to_string()),
+        entry: None,
     });
 
     // The editor is locked: `esc` does nothing (the editor stays open holding
@@ -23524,7 +23931,7 @@ fn a_refusal_landing_after_focus_moved_away_toasts_and_writes_nothing() {
         .shunt_save_worker
         .tx
         .send(super::ShuntActionOutcome::ConfigRefused {
-            key: ShuntFieldKey::Bind,
+            key: super::ShuntSaveKey::Field(ShuntFieldKey::Bind),
             sentence: sentence.to_string(),
         })
         .expect("send the refusal");
@@ -23555,9 +23962,10 @@ fn a_locked_save_footer_hints_row_and_back_not_edit_keys() {
     rig.focus_field(super::ShuntFieldKey::Bind);
     super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
     rig.app.services.shunt_save = Some(super::ShuntSave {
-        key: super::ShuntFieldKey::Bind,
+        key: super::ShuntSaveKey::Field(super::ShuntFieldKey::Bind),
         started: std::time::Instant::now(),
         value: Some("${SHUNT_BIND}".to_string()),
+        entry: None,
     });
     let footer = footer_row(&rig.app, 120, 40);
     assert_eq!(
@@ -23583,9 +23991,10 @@ fn a_locked_save_editor_keeps_x_question_and_q_live() {
     super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
     rig.app.services.shunt_save_worker.running = true;
     rig.app.services.shunt_save = Some(super::ShuntSave {
-        key: ShuntFieldKey::Bind,
+        key: super::ShuntSaveKey::Field(ShuntFieldKey::Bind),
         started: std::time::Instant::now(),
         value: Some("${SHUNT_BIND}".to_string()),
+        entry: None,
     });
 
     // `x` dismisses a pre-seeded toast.
@@ -23641,7 +24050,7 @@ fn a_locked_save_editor_keeps_x_question_and_q_live() {
         .shunt_save_worker
         .tx
         .send(super::ShuntActionOutcome::ConfigRefused {
-            key: ShuntFieldKey::Bind,
+            key: super::ShuntSaveKey::Field(ShuntFieldKey::Bind),
             sentence: sentence.to_string(),
         })
         .expect("send the refusal");
@@ -23673,9 +24082,10 @@ fn a_saving_row_sheds_its_edit_hints_in_the_footer() {
     // A typed row (Bind) whose save checks, no editor open.
     rig.focus_field(ShuntFieldKey::Bind);
     rig.app.services.shunt_save = Some(super::ShuntSave {
-        key: ShuntFieldKey::Bind,
+        key: super::ShuntSaveKey::Field(ShuntFieldKey::Bind),
         started: std::time::Instant::now(),
         value: Some("${SHUNT_BIND}".to_string()),
+        entry: None,
     });
     let footer = footer_row(&rig.app, 120, 40);
     assert_eq!(
@@ -23705,9 +24115,10 @@ fn a_saving_row_sheds_its_edit_hints_in_the_footer() {
     };
     rig.focus_field(kind.clone());
     rig.app.services.shunt_save = Some(super::ShuntSave {
-        key: kind.clone(),
+        key: super::ShuntSaveKey::Field(kind.clone()),
         started: std::time::Instant::now(),
         value: Some("responses".to_string()),
+        entry: None,
     });
     let footer = footer_row(&rig.app, 120, 40);
     assert_eq!(
@@ -23749,9 +24160,10 @@ fn entering_a_row_whose_save_still_checks_opens_no_fresh_editor() {
     }
     rig.app.services.shunt_save_worker.running = true;
     rig.app.services.shunt_save = Some(super::ShuntSave {
-        key: ShuntFieldKey::Bind,
+        key: super::ShuntSaveKey::Field(ShuntFieldKey::Bind),
         started: std::time::Instant::now(),
         value: Some("${SHUNT_BIND}".to_string()),
+        entry: None,
     });
 
     // Move away, then back onto the still-saving row.
@@ -23796,7 +24208,7 @@ fn entering_a_row_whose_save_still_checks_opens_no_fresh_editor() {
         .shunt_save_worker
         .tx
         .send(super::ShuntActionOutcome::ConfigRefused {
-            key: ShuntFieldKey::Bind,
+            key: super::ShuntSaveKey::Field(ShuntFieldKey::Bind),
             sentence: sentence.to_string(),
         })
         .expect("send the refusal");
@@ -23836,9 +24248,10 @@ fn a_saving_cycle_row_opens_no_fresh_pick_and_toasts_the_refusal() {
     );
     rig.app.services.shunt_save_worker.running = true;
     rig.app.services.shunt_save = Some(super::ShuntSave {
-        key: kind.clone(),
+        key: super::ShuntSaveKey::Field(kind.clone()),
         started: std::time::Instant::now(),
         value: Some("responses".to_string()),
+        entry: None,
     });
 
     // Move away and back onto the still-saving cycle row.
@@ -23866,7 +24279,7 @@ fn a_saving_cycle_row_opens_no_fresh_pick_and_toasts_the_refusal() {
         .shunt_save_worker
         .tx
         .send(super::ShuntActionOutcome::ConfigRefused {
-            key: kind,
+            key: super::ShuntSaveKey::Field(kind),
             sentence: sentence.to_string(),
         })
         .expect("send the refusal");
@@ -24509,4 +24922,1686 @@ fn the_recompute_keeps_the_expanded_set_across_a_failed_read_and_a_repair() {
         app.services.shunt_expanded.contains(&key),
         "the repaired read keeps the row expanded"
     );
+}
+
+// ── C3 round 2: reviewer A probes, renamed and landed as real tests ───────
+
+// ── reviewer A probes (copy only) ─────────────────────────────────────────────
+#[cfg(unix)]
+const ROUTES_FIXTURE: &str = "[[upstreams]]\nname = \"a\"\n\n[[routes]]\nmodel = \"m1\"\nprovider = \"a\"\n\n[[routes]]\nmodel = \"m2\"\nprovider = \"a\"\n\n[[routes]]\nmodel = \"m3\"\nprovider = \"a\"\n\n[[routes]]\nmodel = \"m4\"\nprovider = \"a\"\n";
+
+#[cfg(unix)]
+fn remove_entry_via_confirm(rig: &mut ConfigEditRig, entry: super::ShuntEntryKey) {
+    rig.focus_remove(entry);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+}
+
+#[cfg(unix)]
+fn route_model_at(rig: &ConfigEditRig, pos: usize) -> Option<String> {
+    let view = super::config_view(&rig.app)?;
+    match super::entry_for_key(view, &super::ShuntEntryKey::Route(pos))? {
+        super::ConfigEntryRef::Route(r) => r.model.as_ref().map(super::written_display),
+        _ => None,
+    }
+}
+
+/// rule 5: removing route 1 of 4 lands focus on the NEXT route (model m2).
+#[cfg(unix)]
+#[test]
+fn route_remove_focus_lands_on_the_next_route() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, ROUTES_FIXTURE);
+    remove_entry_via_confirm(&mut rig, super::ShuntEntryKey::Route(1));
+    rig.drain();
+    let focus = rig.app.services.shunt_focus_kind();
+    let focused_model = match &focus {
+        Some(super::ShuntFocusLine::Entry(super::ShuntEntryKey::Route(p))) => {
+            route_model_at(&rig, *p)
+        }
+        _ => None,
+    };
+    assert_eq!(
+        (focus.clone(), focused_model.as_deref()),
+        (
+            Some(super::ShuntFocusLine::Entry(super::ShuntEntryKey::Route(1))),
+            Some("m2")
+        ),
+        "RA-P1 focus after removing route 1: {focus:?}"
+    );
+}
+
+/// rule 5: removing route 3 of 4 lands focus on the next route (model m4).
+#[cfg(unix)]
+#[test]
+fn route_remove_focus_next_when_second_to_last() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, ROUTES_FIXTURE);
+    remove_entry_via_confirm(&mut rig, super::ShuntEntryKey::Route(3));
+    rig.drain();
+    let focus = rig.app.services.shunt_focus_kind();
+    assert_eq!(
+        focus,
+        Some(super::ShuntFocusLine::Entry(super::ShuntEntryKey::Route(3))),
+        "RA-P1b focus after removing route 3 of 4 (m4 is now position 3): {focus:?}"
+    );
+}
+
+/// The expanded set after a route remove keeps the SAME routes expanded.
+#[cfg(unix)]
+#[test]
+fn route_remove_keeps_the_other_expanded_route() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, ROUTES_FIXTURE);
+    rig.app
+        .services
+        .shunt_expanded
+        .insert(super::ShuntEntryKey::Route(3));
+    remove_entry_via_confirm(&mut rig, super::ShuntEntryKey::Route(2));
+    rig.drain();
+    let expanded_models: Vec<Option<String>> = {
+        let mut ps: Vec<usize> = rig
+            .app
+            .services
+            .shunt_expanded
+            .iter()
+            .filter_map(|k| match k {
+                super::ShuntEntryKey::Route(p) => Some(*p),
+                _ => None,
+            })
+            .collect();
+        ps.sort();
+        ps.into_iter().map(|p| route_model_at(&rig, p)).collect()
+    };
+    assert_eq!(
+        expanded_models,
+        vec![Some("m3".to_string())],
+        "RA-P2 the route the user expanded (m3) stays expanded after removing route 2"
+    );
+}
+
+/// An editor opened on route 3 (m3) while route 2's remove checks must not
+/// write into a different route once the remove lands.
+#[cfg(unix)]
+#[test]
+fn route_editor_open_across_a_remove_keeps_its_route() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, ROUTES_FIXTURE);
+    rig.app
+        .services
+        .shunt_expanded
+        .insert(super::ShuntEntryKey::Route(3));
+    remove_entry_via_confirm(&mut rig, super::ShuntEntryKey::Route(2));
+    // The remove checks; the user opens route 3's (m3) upstream_model editor.
+    let key = super::ShuntFieldKey::Route {
+        position: 3,
+        field: super::RouteFieldKind::UpstreamModel,
+    };
+    rig.focus_field(key);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    for c in "zzz".chars() {
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    rig.drain();
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    let text = rig.config_text();
+    eprintln!("RA-P10 file after:\n{text}");
+    assert!(
+        !text.contains("model = \"m4\"\nprovider = \"a\"\nupstream_model = \"zzz\""),
+        "RA-P10 the value typed on m3's row landed on m4:\n{text}"
+    );
+}
+
+/// The upstream draft's hidden mode rows: a value typed under `api_key`
+/// (`auth env`) must not ride into an add under `claude_oauth`, whose rows
+/// never show it.
+#[cfg(unix)]
+#[test]
+fn draft_mode_switch_leaks_hidden_env() {
+    use super::{ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("w");
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::AuthMode),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("api_key");
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::AuthEnv),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("SECRET_ENV");
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::AuthMode),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    for _ in 0.."api_key".len() {
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Backspace));
+    }
+    rig.type_and_commit("claude_oauth");
+    let rows = shunt_config_rows(&rig.app);
+    eprintln!("RA-P3 rows before save:\n{}", rows.join("\n"));
+    rig.focus_line(super::ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    let text = rig.config_text();
+    eprintln!("RA-P3 file after:\n{text}");
+    assert!(
+        !text.contains("SECRET_ENV"),
+        "RA-P3 a hidden draft value was written:\n{text}"
+    );
+}
+
+/// A refusal of `save upstream` whose draft the user folded while it checked
+/// must reach SOME surface (C2's field rule: the toast when no editor holds it).
+#[cfg(unix)]
+#[test]
+fn add_refusal_after_fold_reaches_a_surface() {
+    use super::{ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("a"); // duplicate: the engine refuses
+    rig.focus_line(super::ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        rig.app.services.shunt_save_worker.running,
+        "the save started"
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Esc));
+    let folded = !rig
+        .app
+        .services
+        .shunt_drafts
+        .is_open(ShuntAddKind::Upstream);
+    rig.drain();
+    let toasts: Vec<String> = rig.app.toasts.iter().map(|t| t.body.clone()).collect();
+    let refusal = rig
+        .app
+        .services
+        .shunt_drafts
+        .refusal(ShuntAddKind::Upstream)
+        .map(str::to_string);
+    eprintln!("RA-P4 folded={folded} toasts={toasts:?} refusal={refusal:?}");
+    assert!(
+        toasts.iter().any(|t| t.contains("already has an upstream")) || refusal.is_some(),
+        "RA-P4 the refusal reached no surface (folded={folded}, toasts={toasts:?})"
+    );
+}
+
+/// A name edited while `save upstream` checks: focus + ✓ still land on the
+/// entry that was written.
+#[cfg(unix)]
+#[test]
+fn add_focus_follows_the_saved_name_not_a_later_edit() {
+    use super::{ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("w");
+    rig.focus_line(super::ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    let opened = rig.app.services.shunt_field_edit.is_some();
+    rig.type_and_commit("2");
+    rig.drain();
+    let ok = rig.app.services.shunt_ok.as_ref().map(|(k, _)| k.clone());
+    let focus = rig.app.services.shunt_focus_kind();
+    eprintln!(
+        "RA-P8 editor_opened_mid_save={opened} ok={ok:?} focus={focus:?}\n{}",
+        rig.config_text()
+    );
+    let w = super::ShuntEntryKey::Upstream {
+        name: "w".into(),
+        occurrence: 0,
+    };
+    assert_eq!(
+        (ok, focus),
+        (
+            Some(super::ShuntOkKey::Entry(w.clone())),
+            Some(super::ShuntFocusLine::Entry(w))
+        ),
+        "RA-P8"
+    );
+}
+
+/// The happy path's focus + ✓ (untested by the diff): after `save upstream`.
+#[cfg(unix)]
+#[test]
+fn add_success_focus_and_check_mark() {
+    use super::{ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("w");
+    rig.focus_line(super::ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    let w = super::ShuntEntryKey::Upstream {
+        name: "w".into(),
+        occurrence: 0,
+    };
+    assert_eq!(
+        (
+            rig.app.services.shunt_ok.as_ref().map(|(k, _)| k.clone()),
+            rig.app.services.shunt_focus_kind(),
+            rig.app
+                .services
+                .shunt_drafts
+                .is_open(ShuntAddKind::Upstream),
+        ),
+        (
+            Some(super::ShuntOkKey::Entry(w.clone())),
+            Some(super::ShuntFocusLine::Entry(w)),
+            false
+        ),
+        "RA-P6"
+    );
+}
+
+/// `esc` on the `remove <kind>` row (an expanded entry's child) folds the
+/// entry like every other child row (`esc` folds it), staying descended.
+#[cfg(unix)]
+#[test]
+fn esc_on_the_remove_row_folds_the_entry() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    let entry = super::ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    };
+    rig.focus_remove(entry.clone());
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(
+        (
+            rig.app.services.focus == super::ServicesFocus::Detail,
+            rig.app.services.shunt_expanded.contains(&entry),
+            rig.app.services.shunt_focus_kind(),
+        ),
+        (true, false, Some(super::ShuntFocusLine::Entry(entry))),
+        "RA-P5"
+    );
+}
+
+/// Duplicate upstream names (valid in shunt; C2 renders them distinctly): the
+/// model draft's `upstream_model` rows and the add it builds.
+#[cfg(unix)]
+#[test]
+fn model_draft_over_duplicate_upstream_names() {
+    use super::{ShuntAddKind, ShuntDraftField};
+    let text = "[[upstreams]]\nname = \"x\"\n\n[[upstreams]]\nname = \"x\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    rig.open_add(ShuntAddKind::Model);
+    rig.focus_draft_field(
+        ShuntAddKind::Model,
+        ShuntDraftField::Model(super::ModelFieldKind::Id),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("m");
+    rig.focus_draft_field(
+        ShuntAddKind::Model,
+        ShuntDraftField::Model(super::ModelFieldKind::UpstreamModel("x".to_string())),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("s");
+    let rows = shunt_config_rows(&rig.app);
+    eprintln!("RA-P7 rows:\n{}", rows.join("\n"));
+    rig.focus_line(super::ShuntFocusLine::SaveAdd(ShuntAddKind::Model));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    let toasts: Vec<String> = rig.app.toasts.iter().map(|t| t.body.clone()).collect();
+    let refusal = rig
+        .app
+        .services
+        .shunt_drafts
+        .refusal(ShuntAddKind::Model)
+        .map(str::to_string);
+    let out = rig.config_text();
+    eprintln!("RA-P7 toasts={toasts:?} refusal={refusal:?}\nfile:\n{out}");
+    assert_eq!(
+        out,
+        "[[upstreams]]\nname = \"x\"\n\n[[upstreams]]\nname = \"x\"\n\n[[models]]\nid = \"m\"\nupstream_model = { x = \"s\" }\n",
+        "RA-P7"
+    );
+}
+
+/// A remove landing while an editor is open on a field of the removed entry:
+/// the editor must not outlive its row.
+#[cfg(unix)]
+#[test]
+fn editor_on_a_removed_entry_closes() {
+    let text = "[[upstreams]]\nname = \"a\"\n\n[[upstreams]]\nname = \"b\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    let entry = super::ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    };
+    remove_entry_via_confirm(&mut rig, entry);
+    rig.focus_field(super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::BaseUrl,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    let opened = rig.app.services.shunt_field_edit.is_some();
+    rig.drain();
+    let edit = rig
+        .app
+        .services
+        .shunt_field_edit
+        .as_ref()
+        .map(|s| s.key.clone());
+    let focus = rig.app.services.shunt_focus_kind();
+    eprintln!(
+        "RA-P9 opened_mid_remove={opened} editor_after={edit:?} focus={focus:?}\n{}",
+        rig.config_text()
+    );
+    assert_eq!(edit, None, "RA-P9 an editor outlives its removed row");
+}
+
+/// C2's landing rule: a landing save never moves focus off a row the user
+/// moved to (and opened an editor on) while it checked.
+#[cfg(unix)]
+#[test]
+fn add_landing_leaves_an_editor_the_user_opened_meanwhile() {
+    use super::{ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("w");
+    rig.focus_line(super::ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.focus_field(super::ShuntFieldKey::DefaultProvider);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char('z')));
+    rig.drain();
+    let edit = rig
+        .app
+        .services
+        .shunt_field_edit
+        .as_ref()
+        .map(|s| s.key.clone());
+    let focus = rig.app.services.shunt_focus_kind();
+    eprintln!("RA-P11 editor={edit:?} focus={focus:?}");
+    assert_eq!(
+        (edit.clone(), focus),
+        (
+            Some(super::ShuntFieldKey::DefaultProvider),
+            Some(super::ShuntFocusLine::Field(
+                super::ShuntFieldKey::DefaultProvider
+            ))
+        ),
+        "RA-P11 the add's landing moved focus off the open editor"
+    );
+}
+
+/// rule 4: after `save upstream` lands, the new entry row's caret slot shows
+/// the `SUCCESS` `✓` (rendered).
+#[cfg(unix)]
+#[test]
+fn add_success_renders_the_check_mark_on_the_entry() {
+    use super::{ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("w");
+    rig.focus_line(super::ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    let rows = shunt_config_rows(&rig.app);
+    let entry_row: Vec<&String> = rows.iter().filter(|r| r.contains("▶ w")).collect();
+    assert_eq!(
+        entry_row,
+        vec!["✓ ▶ w"],
+        "the new entry row pins whole-line: the `✓` caret slot and the `▶ w` label"
+    );
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &rig.app))
+        .unwrap();
+    let cells = crate::testutil::needle_cells(term.backend().buffer(), "✓").expect("the ✓ renders");
+    assert_eq!(
+        cells[0].fg,
+        crate::tui::theme::success_color(),
+        "the ✓ is SUCCESS colour"
+    );
+}
+
+// ── C3 round 2: the A-F10 / B-F11..F14 coverage the round-1 diff missed ─────
+
+/// The engine's own refusal (a duplicate name) keeps the draft open and lands
+/// its sentence on the `└` line under `save <kind>` — never a toast.
+#[cfg(unix)]
+#[test]
+fn an_add_refused_by_the_engine_keeps_the_draft_and_shows_the_line() {
+    use super::{ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("a"); // duplicate: RIG_TEXT already has an "a"
+    rig.focus_line(super::ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(rig.config_text(), RIG_TEXT, "a refused add writes nothing");
+    assert!(
+        rig.app
+            .services
+            .shunt_drafts
+            .is_open(ShuntAddKind::Upstream),
+        "the draft is kept"
+    );
+    assert_eq!(
+        rig.app
+            .services
+            .shunt_drafts
+            .refusal(ShuntAddKind::Upstream),
+        Some("cannot add upstream \"a\": the config already has an upstream named \"a\""),
+        "the engine's refusal sits on the save row by equality"
+    );
+}
+
+/// A refusal of `save upstream` landing after `esc` ascended to the Services
+/// list (the card is off-screen) toasts `save failed` + the sentence by
+/// equality and sets no `└` line — the row that raised it has no surface to
+/// hold the sentence.
+#[cfg(unix)]
+#[test]
+fn an_add_refusal_after_esc_ascends_toasts_not_a_line() {
+    use super::{ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("a"); // duplicate: RIG_TEXT already has an "a"
+    rig.focus_line(super::ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        rig.app.services.shunt_save_worker.running,
+        "the save started"
+    );
+    // `esc` on the locked save row ascends to the Services list (no fold).
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(
+        rig.app.services.focus,
+        super::ServicesFocus::List,
+        "esc ascended to the Services list"
+    );
+    rig.drain();
+    let toasts: Vec<String> = rig.app.toasts.iter().map(|t| t.body.clone()).collect();
+    assert_eq!(
+        toasts,
+        vec![
+            "save failed\ncannot add upstream \"a\": the config already has an upstream named \"a\""
+        ],
+        "the refusal toasts `save failed` + the sentence by equality"
+    );
+    assert_eq!(
+        rig.app
+            .services
+            .shunt_drafts
+            .refusal(ShuntAddKind::Upstream),
+        None,
+        "no `└` line: the row that raised the refusal is off-screen"
+    );
+    assert_eq!(rig.config_text(), RIG_TEXT, "a refused add writes nothing");
+}
+
+/// A blank model `id` and a blank route `model`/`provider` refuse before any
+/// worker runs, each with its own sentence.
+#[cfg(unix)]
+#[test]
+fn a_blank_model_or_route_required_field_refuses_with_its_sentence() {
+    use super::ShuntAddKind;
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+
+    rig.open_add(ShuntAddKind::Model);
+    rig.focus_line(super::ShuntFocusLine::SaveAdd(ShuntAddKind::Model));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        !rig.app.services.shunt_save_worker.running,
+        "no worker starts for a blank model id"
+    );
+    assert_eq!(
+        rig.app.services.shunt_drafts.refusal(ShuntAddKind::Model),
+        Some("cannot add model: set its id first"),
+        "the model required-field sentence"
+    );
+
+    rig.open_add(ShuntAddKind::Route);
+    rig.focus_line(super::ShuntFocusLine::SaveAdd(ShuntAddKind::Route));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        !rig.app.services.shunt_save_worker.running,
+        "no worker starts for a blank route"
+    );
+    assert_eq!(
+        rig.app.services.shunt_drafts.refusal(ShuntAddKind::Route),
+        Some("cannot add a route: set its model and provider first"),
+        "the route required-field sentence"
+    );
+
+    // A route with a model but no provider refuses the same way.
+    rig.focus_draft_field(
+        ShuntAddKind::Route,
+        super::ShuntDraftField::Route(super::RouteFieldKind::Model),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("m");
+    rig.focus_line(super::ShuntFocusLine::SaveAdd(ShuntAddKind::Route));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        !rig.app.services.shunt_save_worker.running,
+        "no worker starts for a route missing only its provider"
+    );
+    assert_eq!(
+        rig.app.services.shunt_drafts.refusal(ShuntAddKind::Route),
+        Some("cannot add a route: set its model and provider first"),
+        "a model-only route still refuses"
+    );
+    assert_eq!(rig.config_text(), RIG_TEXT, "nothing written");
+}
+
+/// An add refused by `shunt check` takes the refused-check route: a danger
+/// toast + the held `check output`, the draft kept and the file byte-identical.
+#[cfg(unix)]
+#[test]
+fn an_add_refused_by_shunt_check_toasts_and_keeps_the_draft() {
+    use super::{ShuntAddKind, ShuntDraftField, ToastKind, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    // The stub `shunt` refuses every check while the `fail` marker exists.
+    std::fs::write(rig.stub.join("fail"), "").unwrap();
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("work");
+    rig.focus_line(super::ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        RIG_TEXT,
+        "a check-refused add writes nothing"
+    );
+    assert!(
+        rig.app
+            .services
+            .shunt_drafts
+            .is_open(ShuntAddKind::Upstream),
+        "the draft is kept"
+    );
+    assert!(
+        rig.app.services.check_output.is_some(),
+        "the card holds the check output"
+    );
+    let expected = crate::tui::render::prose::mark_commands(&format!(
+        "save failed\n{}",
+        super::escape_control(&format!(
+            "`shunt check` refused the save (exit 1) · shunt.toml unchanged · {} check output on the shunt card",
+            crate::tui::render::prose::key("↵"),
+        ))
+    ));
+    assert_eq!(
+        rig.app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((ToastKind::Danger, expected.as_str())),
+        "the refused-check route toasts by equality"
+    );
+}
+
+/// Removing the first of two entries lands focus on the next; removing the last
+/// lands on the previous — for upstreams and models alike (routes are covered
+/// by the round-2 probes).
+#[cfg(unix)]
+#[test]
+fn remove_focus_lands_on_next_then_previous_for_upstreams_and_models() {
+    use super::{ShuntAddKind, ShuntEntryKey, ShuntFocusLine};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let text = "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\n\n[[upstreams]]\nname = \"b\"\n\n[[upstreams]]\nname = \"c\"\n\n[[models]]\nid = \"m1\"\n\n[[models]]\nid = \"m2\"\n";
+    let mut rig = config_edit_rig(&home, text);
+    let a = ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    };
+    let b = ShuntEntryKey::Upstream {
+        name: "b".into(),
+        occurrence: 0,
+    };
+    let c = ShuntEntryKey::Upstream {
+        name: "c".into(),
+        occurrence: 0,
+    };
+    // Remove the middle upstream: both a previous and c next exist, so the
+    // NEXT wins (the S3 swap plant — previous first — lands on a and reds).
+    rig.focus_remove(b.clone());
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(
+        rig.app.services.shunt_focus_kind(),
+        Some(ShuntFocusLine::Entry(c.clone())),
+        "removing the middle upstream lands on the next"
+    );
+
+    // Remove the last of the two left: no next, so the previous wins.
+    rig.focus_remove(c.clone());
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(
+        rig.app.services.shunt_focus_kind(),
+        Some(ShuntFocusLine::Entry(a.clone())),
+        "removing the last upstream lands on the previous"
+    );
+
+    rig.focus_remove(a.clone());
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(
+        rig.app.services.shunt_focus_kind(),
+        Some(ShuntFocusLine::Add(ShuntAddKind::Upstream)),
+        "removing the last upstream lands on `+ add upstream`"
+    );
+
+    let m1 = ShuntEntryKey::Model {
+        id: "m1".into(),
+        occurrence: 0,
+    };
+    let m2 = ShuntEntryKey::Model {
+        id: "m2".into(),
+        occurrence: 0,
+    };
+    rig.focus_remove(m1.clone());
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(
+        rig.app.services.shunt_focus_kind(),
+        Some(ShuntFocusLine::Entry(m2.clone())),
+        "removing the first model lands on the next"
+    );
+}
+
+/// The three remove confirm messages: upstream, model, and both route forms
+/// (with and without a model).
+#[cfg(unix)]
+#[test]
+fn the_remove_confirm_messages_pin_all_three_kinds() {
+    use super::{ConfirmAction, ShuntEntryKey};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let text = "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\n\n[[models]]\nid = \"m\"\n\n[[routes]]\nmodel = \"m\"\nprovider = \"a\"\n\n[[routes]]\nprovider = \"a\"\n";
+    let mut rig = config_edit_rig(&home, text);
+
+    let model = ShuntEntryKey::Model {
+        id: "m".into(),
+        occurrence: 0,
+    };
+    rig.focus_remove(model);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    let confirm = match rig.app.modals.last() {
+        Some(super::Modal::Confirm(state)) => state,
+        other => panic!("expected a confirm, got {other:?}"),
+    };
+    assert_eq!(confirm.message, "remove model \"m\"?");
+    assert!(matches!(
+        confirm.on_confirm,
+        ConfirmAction::RemoveEntry { .. }
+    ));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter)); // cancel
+
+    let route_with = ShuntEntryKey::Route(1);
+    rig.focus_remove(route_with);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    let confirm = match rig.app.modals.last() {
+        Some(super::Modal::Confirm(state)) => state,
+        other => panic!("expected a confirm, got {other:?}"),
+    };
+    assert_eq!(
+        confirm.message,
+        "remove the route at position 1 (model \"m\")?"
+    );
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+
+    let route_without = ShuntEntryKey::Route(2);
+    rig.focus_remove(route_without);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    let confirm = match rig.app.modals.last() {
+        Some(super::Modal::Confirm(state)) => state,
+        other => panic!("expected a confirm, got {other:?}"),
+    };
+    assert_eq!(confirm.message, "remove the route at position 2?");
+}
+
+/// The one-save guard over a REAL in-flight save: a second save of any kind
+/// toasts `a save is still checking` and starts nothing. The first save's
+/// worker blocks until the test releases it, so `running` is the worker's own
+/// flag, never faked.
+#[cfg(unix)]
+static BLOCK_SHUNT_SAVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A RAII reset for [`BLOCK_SHUNT_SAVE`]: any blocking test holds one so a
+/// panic mid-check (a plant's red) still releases the worker, letting the test
+/// binary exit instead of hanging on the spinning worker thread.
+#[cfg(unix)]
+struct BlockShuntSaveGuard;
+
+#[cfg(unix)]
+impl Drop for BlockShuntSaveGuard {
+    fn drop(&mut self) {
+        BLOCK_SHUNT_SAVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(unix)]
+fn blocking_shunt_save(job: super::ShuntActionJob) -> super::ShuntActionOutcome {
+    while BLOCK_SHUNT_SAVE.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    super::run_shunt_action(job)
+}
+
+#[cfg(unix)]
+fn start_real_save(rig: &mut ConfigEditRig, kind: super::ShuntFocusLine) {
+    rig.focus_line(kind);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+}
+
+#[cfg(unix)]
+fn field_save_on_a(rig: &mut ConfigEditRig) {
+    rig.focus_field(super::ShuntFieldKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+        field: super::UpstreamFieldKind::Effort,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+}
+
+#[cfg(unix)]
+#[test]
+fn the_one_save_guard_holds_over_a_real_in_flight_save() {
+    use super::{ShuntAddKind, ShuntDraftField, ShuntFocusLine, ToastKind, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.app.services.shunt_save_worker.prober = Some(blocking_shunt_save);
+    let _block_guard = BlockShuntSaveGuard;
+    let guard_toast = |rig: &ConfigEditRig| {
+        assert_eq!(
+            rig.app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+            Some((
+                ToastKind::Info,
+                "a save is still checking\nwait for it, then save again"
+            )),
+            "a second save toasts the one-save guard by equality"
+        );
+    };
+
+    // Leg 1: a `save upstream` in flight blocks a field save.
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("work");
+    BLOCK_SHUNT_SAVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    start_real_save(&mut rig, ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream));
+    assert!(
+        rig.app.services.shunt_save_worker.running,
+        "the save-kind save is genuinely in flight"
+    );
+    field_save_on_a(&mut rig);
+    guard_toast(&rig);
+    BLOCK_SHUNT_SAVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    rig.drain();
+
+    // Leg 2: a field save in flight blocks a `save upstream` (the draft is
+    // open first so the second save reaches the worker).
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("work2");
+    BLOCK_SHUNT_SAVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    field_save_on_a(&mut rig);
+    assert!(
+        rig.app.services.shunt_save_worker.running,
+        "the field save is genuinely in flight"
+    );
+    start_real_save(&mut rig, ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream));
+    guard_toast(&rig);
+    BLOCK_SHUNT_SAVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    rig.drain();
+
+    // Leg 3: a remove in flight blocks a field save.
+    rig.focus_remove(super::ShuntEntryKey::Upstream {
+        name: "work".into(),
+        occurrence: 0,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    BLOCK_SHUNT_SAVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        rig.app.services.shunt_save_worker.running,
+        "the remove is genuinely in flight"
+    );
+    field_save_on_a(&mut rig);
+    guard_toast(&rig);
+    BLOCK_SHUNT_SAVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    rig.drain();
+
+    // Leg 4: a field save in flight blocks a remove (the remove goes through
+    // the same guard; S7's "remove bypasses the guard" plant reds this leg).
+    BLOCK_SHUNT_SAVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    field_save_on_a(&mut rig);
+    assert!(
+        rig.app.services.shunt_save_worker.running,
+        "the second field save is genuinely in flight"
+    );
+    // The field's editor owns the keyboard while it checks; `↓` closes it and
+    // steps off (the locked editor's own `↑↓`), so the remove row is reachable
+    // while the save is still in flight. Drop the legs above's guard toasts,
+    // so the remove's OWN guard toast (or its absence under the S7 bypass
+    // plant) is the one the check reads.
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Down));
+    rig.app.toasts.clear();
+    rig.focus_remove(super::ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    });
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    guard_toast(&rig);
+    BLOCK_SHUNT_SAVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    rig.drain();
+}
+
+/// `esc` at rest on a draft row folds the draft without touching the file (the
+/// Setup `+ new` precedent); the file stays byte-identical through every
+/// draft commit, cycle pick and `esc`.
+#[cfg(unix)]
+#[test]
+fn esc_at_rest_folds_the_draft_and_writes_nothing() {
+    use super::{ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("work");
+    assert_eq!(rig.config_text(), RIG_TEXT, "a draft commit writes nothing");
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Esc));
+    assert!(
+        !rig.app
+            .services
+            .shunt_drafts
+            .is_open(ShuntAddKind::Upstream),
+        "esc at rest folds the draft"
+    );
+    assert_eq!(
+        rig.config_text(),
+        RIG_TEXT,
+        "esc folding the draft leaves the file byte-identical"
+    );
+}
+
+// ── C3 round 3: red-first probes adopted from reviewer A's round-2 probes ───
+
+/// Five routes m1..m5 (a shorthand upstream `a` supplies them).
+#[cfg(unix)]
+const ROUTES5_FIXTURE: &str = "[[upstreams]]\nname = \"a\"\n\n[[routes]]\nmodel = \"m1\"\nprovider = \"a\"\n\n[[routes]]\nmodel = \"m2\"\nprovider = \"a\"\n\n[[routes]]\nmodel = \"m3\"\nprovider = \"a\"\n\n[[routes]]\nmodel = \"m4\"\nprovider = \"a\"\n\n[[routes]]\nmodel = \"m5\"\nprovider = \"a\"\n";
+
+/// `ROUTES5_FIXTURE` after removing routes 2 (m2) and 4 (m4): m1, m3 and m5.
+#[cfg(unix)]
+const ROUTES5_MINUS_2_AND_4: &str = "[[upstreams]]\nname = \"a\"\n\n[[routes]]\nmodel = \"m1\"\nprovider = \"a\"\n\n[[routes]]\nmodel = \"m3\"\nprovider = \"a\"\n\n[[routes]]\nmodel = \"m5\"\nprovider = \"a\"\n";
+
+/// A remove confirm opened on route 4 (m4) while route 2's remove checks,
+/// then confirmed after route 2 lands, must still name and remove its own
+/// route: the shift moves the stored edit and the message down to position 3,
+/// so the confirm reads `remove the route at position 3 (model "m4")?` and
+/// confirming removes m4 — the file then holds m1, m3 and m5 by equality.
+#[cfg(unix)]
+#[test]
+fn a_remove_confirm_open_across_a_route_remove_removes_what_it_named() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, ROUTES5_FIXTURE);
+    rig.app
+        .services
+        .shunt_expanded
+        .insert(super::ShuntEntryKey::Route(4));
+    remove_entry_via_confirm(&mut rig, super::ShuntEntryKey::Route(2));
+    assert!(
+        rig.app.services.shunt_save_worker.running,
+        "route 2's remove checks"
+    );
+    // While it checks, open route 4's remove confirm.
+    rig.app.services.focus = super::ServicesFocus::Detail;
+    rig.app
+        .services
+        .set_shunt_focus(Some(super::ShuntFocusLine::Remove(
+            super::ShuntEntryKey::Route(4),
+        )));
+    rig.render();
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    let open_message = match rig.app.modals.last() {
+        Some(super::Modal::Confirm(state)) => state.message.clone(),
+        other => panic!("expected a confirm, got {other:?}"),
+    };
+    assert_eq!(
+        open_message, "remove the route at position 4 (model \"m4\")?",
+        "the confirm names the route as it read at open"
+    );
+    // Route 2's remove lands; the open confirm's key, edit and message shift
+    // with it (the same route, one place up).
+    rig.drain();
+    let shifted_message = match rig.app.modals.last() {
+        Some(super::Modal::Confirm(state)) => state.message.clone(),
+        other => panic!("expected a confirm after the shift, got {other:?}"),
+    };
+    assert_eq!(
+        shifted_message, "remove the route at position 3 (model \"m4\")?",
+        "the shifted confirm names the route's new position"
+    );
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        ROUTES5_MINUS_2_AND_4,
+        "the shifted confirm removes m4 (what it named): m1, m3 and m5 remain"
+    );
+}
+
+/// `ROUTES5_FIXTURE` after removing routes 1 (m1) and 3 (m3): m2, m4 and m5.
+#[cfg(unix)]
+const ROUTES5_MINUS_1_AND_3: &str = "[[upstreams]]\nname = \"a\"\n\n[[routes]]\nmodel = \"m2\"\nprovider = \"a\"\n\n[[routes]]\nmodel = \"m4\"\nprovider = \"a\"\n\n[[routes]]\nmodel = \"m5\"\nprovider = \"a\"\n";
+
+/// A remove confirm opened on an EARLIER route (1, m1) while a later route's
+/// remove (3) checks stays on its own route when the later remove lands: the
+/// `> position` guard must hold, so the message does not move (`remove the
+/// route at position 1 (model "m1")?`) and confirming removes m1 — the file
+/// then holds m2, m4 and m5 by equality.
+#[cfg(unix)]
+#[test]
+fn a_remove_confirm_on_an_earlier_route_across_a_later_remove_removes_what_it_named() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, ROUTES5_FIXTURE);
+    rig.app
+        .services
+        .shunt_expanded
+        .insert(super::ShuntEntryKey::Route(1));
+    remove_entry_via_confirm(&mut rig, super::ShuntEntryKey::Route(3));
+    assert!(
+        rig.app.services.shunt_save_worker.running,
+        "route 3's remove checks"
+    );
+    // While it checks, open route 1's remove confirm (the earlier route).
+    rig.app.services.focus = super::ServicesFocus::Detail;
+    rig.app
+        .services
+        .set_shunt_focus(Some(super::ShuntFocusLine::Remove(
+            super::ShuntEntryKey::Route(1),
+        )));
+    rig.render();
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    let open_message = match rig.app.modals.last() {
+        Some(super::Modal::Confirm(state)) => state.message.clone(),
+        other => panic!("expected a confirm, got {other:?}"),
+    };
+    assert_eq!(
+        open_message, "remove the route at position 1 (model \"m1\")?",
+        "the confirm names the route as it read at open"
+    );
+    // Route 3's remove lands; the earlier route's confirm stays on route 1.
+    rig.drain();
+    let message = match rig.app.modals.last() {
+        Some(super::Modal::Confirm(state)) => state.message.clone(),
+        other => panic!("expected a confirm after the drain, got {other:?}"),
+    };
+    assert_eq!(
+        message, "remove the route at position 1 (model \"m1\")?",
+        "the earlier route's confirm message is unchanged by equality"
+    );
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        ROUTES5_MINUS_1_AND_3,
+        "confirming removes m1 (what it named): m2, m4 and m5 remain"
+    );
+}
+
+/// Routes where positions 1 and 2 share every field (m), so a wrongly shifted
+/// edit — dropping the `> position` guard — would move the earlier route's
+/// stored edit to position 1 and, since route 1's view matches, remove route 1
+/// (the wrong one) instead of refusing.
+#[cfg(unix)]
+const ROUTES_WITH_IDENTICAL_NEIGHBOURS: &str = "[[upstreams]]\nname = \"a\"\n\n[[routes]]\nmodel = \"m\"\nprovider = \"a\"\n\n[[routes]]\nmodel = \"m\"\nprovider = \"a\"\n\n[[routes]]\nmodel = \"x\"\nprovider = \"a\"\n\n[[routes]]\nmodel = \"y\"\nprovider = \"a\"\n";
+
+/// `ROUTES_WITH_IDENTICAL_NEIGHBOURS` after removing routes 2 (m) and 4 (y):
+/// m and x remain.
+#[cfg(unix)]
+const ROUTES_WITH_IDENTICAL_NEIGHBOURS_MINUS_2_AND_4: &str = "[[upstreams]]\nname = \"a\"\n\n[[routes]]\nmodel = \"m\"\nprovider = \"a\"\n\n[[routes]]\nmodel = \"x\"\nprovider = \"a\"\n";
+
+/// The identical-fields twin of the earlier-route test: with routes 1 and 2
+/// sharing every field, a wrongly shifted edit would remove route 1 instead of
+/// route 2 (silent data loss, not a refusal). The message stays `remove the
+/// route at position 2 (model "m")?` by equality and confirming removes
+/// route 2 — the file then holds m and x by equality.
+#[cfg(unix)]
+#[test]
+fn an_earlier_route_confirm_across_a_later_remove_does_not_shift_when_fields_are_identical() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, ROUTES_WITH_IDENTICAL_NEIGHBOURS);
+    rig.app
+        .services
+        .shunt_expanded
+        .insert(super::ShuntEntryKey::Route(2));
+    remove_entry_via_confirm(&mut rig, super::ShuntEntryKey::Route(4));
+    assert!(
+        rig.app.services.shunt_save_worker.running,
+        "route 4's remove checks"
+    );
+    // While it checks, open route 2's remove confirm (the earlier route).
+    rig.app.services.focus = super::ServicesFocus::Detail;
+    rig.app
+        .services
+        .set_shunt_focus(Some(super::ShuntFocusLine::Remove(
+            super::ShuntEntryKey::Route(2),
+        )));
+    rig.render();
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    let open_message = match rig.app.modals.last() {
+        Some(super::Modal::Confirm(state)) => state.message.clone(),
+        other => panic!("expected a confirm, got {other:?}"),
+    };
+    assert_eq!(
+        open_message, "remove the route at position 2 (model \"m\")?",
+        "the confirm names the route as it read at open"
+    );
+    // Route 4's remove lands; the earlier route's confirm stays on route 2.
+    rig.drain();
+    let message = match rig.app.modals.last() {
+        Some(super::Modal::Confirm(state)) => state.message.clone(),
+        other => panic!("expected a confirm after the drain, got {other:?}"),
+    };
+    assert_eq!(
+        message, "remove the route at position 2 (model \"m\")?",
+        "the earlier route's confirm message is unchanged by equality"
+    );
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        ROUTES_WITH_IDENTICAL_NEIGHBOURS_MINUS_2_AND_4,
+        "confirming removes route 2 (what it named): m and x remain"
+    );
+}
+
+/// A model confirm open while a route's remove checks still removes its own
+/// model after the route lands: models are keyed by id and never shift with a
+/// route remove, so confirming removes the model — the file then holds the
+/// upstream and the remaining route by equality.
+#[cfg(unix)]
+#[test]
+fn a_model_confirm_open_across_a_route_remove_removes_what_it_named() {
+    let text = "[[upstreams]]\nname = \"a\"\n\n[[models]]\nid = \"x\"\n\n[[routes]]\nmodel = \"m1\"\nprovider = \"a\"\n\n[[routes]]\nmodel = \"m2\"\nprovider = \"a\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    let model = super::ShuntEntryKey::Model {
+        id: "x".into(),
+        occurrence: 0,
+    };
+    rig.app.services.shunt_expanded.insert(model.clone());
+    remove_entry_via_confirm(&mut rig, super::ShuntEntryKey::Route(1));
+    rig.app.services.focus = super::ServicesFocus::Detail;
+    rig.app
+        .services
+        .set_shunt_focus(Some(super::ShuntFocusLine::Remove(model)));
+    rig.render();
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    assert_eq!(
+        rig.config_text(),
+        "[[upstreams]]\nname = \"a\"\n\n[[routes]]\nmodel = \"m2\"\nprovider = \"a\"\n",
+        "confirming removes the model it named; the upstream and route m2 remain"
+    );
+}
+
+/// A remove refusal landing after the user moved off the row toasts `save
+/// failed` + the sentence and sets no `└` line (it has no row to show under).
+#[cfg(unix)]
+#[test]
+fn a_remove_refusal_landing_after_focus_moved_toasts_not_a_line() {
+    let text = "[[upstreams]]\nname = \"a\"\n# under a\n\n[[upstreams]]\nname = \"b\"\n\n# floating\n\n[[upstreams]]\nname = \"c\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, text);
+    let entry = super::ShuntEntryKey::Upstream {
+        name: "b".into(),
+        occurrence: 0,
+    };
+    remove_entry_via_confirm(&mut rig, entry.clone());
+    // Move off the row while it checks.
+    rig.app
+        .services
+        .set_shunt_focus(Some(super::ShuntFocusLine::Entry(
+            super::ShuntEntryKey::Upstream {
+                name: "a".into(),
+                occurrence: 0,
+            },
+        )));
+    rig.render();
+    rig.drain();
+    let refusal = rig.app.services.shunt_remove_refusal.borrow().clone();
+    let toasts: Vec<String> = rig.app.toasts.iter().map(|t| t.body.clone()).collect();
+    eprintln!("N2 refusal={refusal:?} toasts={toasts:?}");
+    assert!(
+        refusal.is_none(),
+        "no `└` line when focus left the remove row: {refusal:?}"
+    );
+    assert!(
+        toasts
+            .iter()
+            .any(|t| t.contains("cannot remove upstream \"b\"")),
+        "the refusal toasts `save failed` + the sentence: {toasts:?}"
+    );
+}
+
+// ── C3 round 4: a refusal shows its `└` line only where the user can see the
+// row — the Services tab, the detail pane, the `shunt` row, and the focus on
+// the row that started the save. Each of the four conjuncts is dropped by a
+// plant and must red its own test here. ───
+
+/// The unowned-comment fixture: removing `b` touches a gap holding a floating
+/// comment, so the engine refuses with its "belongs to no single entry"
+/// sentence.
+#[cfg(unix)]
+const UNOWNED_COMMENT_FIXTURE: &str = "[[upstreams]]\nname = \"a\"\n# under a\n\n[[upstreams]]\nname = \"b\"\n\n# floating\n\n[[upstreams]]\nname = \"c\"\n";
+
+/// Start a remove of `b` on the unowned-comment fixture and land it after
+/// `mutate` moved the card out of the row's view; the refusal must toast
+/// `save failed` + the sentence and set no `└` line.
+#[cfg(unix)]
+fn refused_remove_toasts_when_off_row(mutate: impl FnOnce(&mut ConfigEditRig)) {
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, UNOWNED_COMMENT_FIXTURE);
+    rig.app.services.shunt_save_worker.prober = Some(blocking_shunt_save);
+    let _block_guard = BlockShuntSaveGuard;
+    let entry = super::ShuntEntryKey::Upstream {
+        name: "b".into(),
+        occurrence: 0,
+    };
+    start_blocked_remove(&mut rig, entry);
+    mutate(&mut rig);
+    release_blocked_save(&mut rig);
+    let refusal = rig.app.services.shunt_remove_refusal.borrow().clone();
+    let toasts: Vec<String> = rig.app.toasts.iter().map(|t| t.body.clone()).collect();
+    assert!(
+        refusal.is_none(),
+        "no `└` line when the card is out of view: {refusal:?}"
+    );
+    assert!(
+        toasts
+            .iter()
+            .any(|t| t.contains("cannot remove upstream \"b\"")),
+        "the refusal toasts `save failed` + the sentence: {toasts:?}"
+    );
+}
+
+/// A remove refusal landing after `esc` ascended to the list toasts, never a
+/// `└` line on a blurred card (reviewer B's probe PB3-F1).
+#[cfg(unix)]
+#[test]
+fn a_remove_refusal_landing_after_esc_ascend_toasts_not_a_line() {
+    refused_remove_toasts_when_off_row(|rig| {
+        super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Esc));
+        assert_eq!(
+            rig.app.services.focus,
+            super::ServicesFocus::List,
+            "esc ascends to the list"
+        );
+    });
+}
+
+/// A remove refusal landing after a tab jump off Services toasts, never a
+/// `└` line on a pane that is not shown.
+#[cfg(unix)]
+#[test]
+fn a_remove_refusal_landing_after_a_tab_jump_toasts_not_a_line() {
+    refused_remove_toasts_when_off_row(|rig| {
+        rig.app.tab = super::Tab::Setup;
+    });
+}
+
+/// A remove refusal landing after the cursor moved to another service toasts,
+/// never a `└` line on a card the detail is not showing.
+#[cfg(unix)]
+#[test]
+fn a_remove_refusal_landing_after_picking_another_service_toasts_not_a_line() {
+    refused_remove_toasts_when_off_row(|rig| {
+        rig.app.services.cursor = 1;
+    });
+}
+
+// ── C3 round 3: ruling 4 — one `handle_key` test per lock, over a real
+// in-flight save (the blocking prober), reds when that one check is removed ──
+
+/// Start a remove of `entry` and hold it in flight on the blocking prober.
+#[cfg(unix)]
+fn start_blocked_remove(rig: &mut ConfigEditRig, entry: super::ShuntEntryKey) {
+    rig.focus_remove(entry);
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Char('y')));
+    BLOCK_SHUNT_SAVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    super::handle_confirm_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        rig.app.services.shunt_save_worker.running,
+        "the remove is in flight"
+    );
+}
+
+/// Open an upstream draft, name it, and hold its `save upstream` in flight.
+#[cfg(unix)]
+fn start_blocked_add(rig: &mut ConfigEditRig) {
+    use super::{ShuntAddKind, ShuntDraftField, ShuntFocusLine, UpstreamFieldKind};
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("work");
+    BLOCK_SHUNT_SAVE.store(true, std::sync::atomic::Ordering::SeqCst);
+    start_real_save(rig, ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream));
+    assert!(
+        rig.app.services.shunt_save_worker.running,
+        "the add is in flight"
+    );
+}
+
+/// Release the blocking prober and drain the landing.
+#[cfg(unix)]
+fn release_blocked_save(rig: &mut ConfigEditRig) {
+    BLOCK_SHUNT_SAVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    rig.drain();
+}
+
+/// Lock L4 (`toggle_shunt_entry`): `↵`/`space` on the entry row are inert while
+/// its remove checks — the expanded set never changes.
+#[cfg(unix)]
+#[test]
+fn a_removing_entry_ignores_expand_and_collapse() {
+    use super::{ShuntEntryKey, ShuntFocusLine};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.app.services.shunt_save_worker.prober = Some(blocking_shunt_save);
+    let _block_guard = BlockShuntSaveGuard;
+    let entry = ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    };
+    start_blocked_remove(&mut rig, entry.clone());
+    assert!(
+        rig.app.services.shunt_expanded.contains(&entry),
+        "the entry starts expanded"
+    );
+    rig.focus_line(ShuntFocusLine::Entry(entry.clone()));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        rig.app.services.shunt_expanded.contains(&entry),
+        "`↵` on the locked entry row does not collapse it"
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        rig.app.services.shunt_expanded.contains(&entry),
+        "`space` on the locked entry row does not collapse it"
+    );
+    release_blocked_save(&mut rig);
+}
+
+/// Lock L5 (`confirm_shunt_remove`): `↵` on the `remove` row opens no second
+/// confirm while its remove checks.
+#[cfg(unix)]
+#[test]
+fn a_removing_entry_opens_no_second_confirm() {
+    use super::{ShuntEntryKey, ShuntFocusLine};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.app.services.shunt_save_worker.prober = Some(blocking_shunt_save);
+    let _block_guard = BlockShuntSaveGuard;
+    let entry = ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    };
+    start_blocked_remove(&mut rig, entry.clone());
+    rig.focus_line(ShuntFocusLine::Remove(entry.clone()));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        rig.app.modals.is_empty(),
+        "no second confirm opens while the remove checks"
+    );
+    release_blocked_save(&mut rig);
+}
+
+/// Lock L1 (`shunt_esc_folds_entry` `SaveAdd` arm): `esc` on the saving
+/// `save <kind>` row ascends to the list and never folds the draft.
+#[cfg(unix)]
+#[test]
+fn esc_on_a_saving_save_row_ascends_without_folding_the_draft() {
+    use super::{ServicesFocus, ShuntAddKind, ShuntFocusLine};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.app.services.shunt_save_worker.prober = Some(blocking_shunt_save);
+    let _block_guard = BlockShuntSaveGuard;
+    start_blocked_add(&mut rig);
+    rig.focus_line(ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Esc));
+    assert!(
+        rig.app
+            .services
+            .shunt_drafts
+            .is_open(ShuntAddKind::Upstream),
+        "the locked draft is not folded"
+    );
+    assert_eq!(
+        rig.app.services.focus,
+        ServicesFocus::List,
+        "esc ascends to the list"
+    );
+    release_blocked_save(&mut rig);
+}
+
+/// Lock L6 (`shunt_esc_folds_entry` `Remove` arm): `esc` on the removing
+/// `remove <kind>` row ascends to the list and never folds the entry.
+#[cfg(unix)]
+#[test]
+fn esc_on_a_removing_entry_ascends_without_folding_the_entry() {
+    use super::{ServicesFocus, ShuntEntryKey, ShuntFocusLine};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.app.services.shunt_save_worker.prober = Some(blocking_shunt_save);
+    let _block_guard = BlockShuntSaveGuard;
+    let entry = ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    };
+    start_blocked_remove(&mut rig, entry.clone());
+    rig.focus_line(ShuntFocusLine::Remove(entry.clone()));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Esc));
+    assert!(
+        rig.app.services.shunt_expanded.contains(&entry),
+        "the locked entry is not folded"
+    );
+    assert_eq!(
+        rig.app.services.focus,
+        ServicesFocus::List,
+        "esc ascends to the list"
+    );
+    release_blocked_save(&mut rig);
+}
+
+/// Lock L2 (`toggle_shunt_add`): `↵`/`space` on the `+ add` row are inert while
+/// its draft saves — the draft never folds.
+#[cfg(unix)]
+#[test]
+fn enter_on_the_add_row_while_its_draft_saves_does_not_fold_it() {
+    use super::{ShuntAddKind, ShuntFocusLine};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.app.services.shunt_save_worker.prober = Some(blocking_shunt_save);
+    let _block_guard = BlockShuntSaveGuard;
+    start_blocked_add(&mut rig);
+    rig.focus_line(ShuntFocusLine::Add(ShuntAddKind::Upstream));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        rig.app
+            .services
+            .shunt_drafts
+            .is_open(ShuntAddKind::Upstream),
+        "`↵` on the locked `+ add` row does not fold the draft"
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        rig.app
+            .services
+            .shunt_drafts
+            .is_open(ShuntAddKind::Upstream),
+        "`space` on the locked `+ add` row does not fold the draft"
+    );
+    release_blocked_save(&mut rig);
+}
+
+/// Lock L3 (`field_locked` Draft arm): `↵` on a draft field row opens no editor
+/// while its draft saves.
+#[cfg(unix)]
+#[test]
+fn a_saving_drafts_field_rows_ignore_edit_keys() {
+    use super::{ShuntAddKind, ShuntDraftField, UpstreamFieldKind};
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.app.services.shunt_save_worker.prober = Some(blocking_shunt_save);
+    let _block_guard = BlockShuntSaveGuard;
+    start_blocked_add(&mut rig);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        rig.app.services.shunt_field_edit.is_none(),
+        "no editor opens on a locked draft field"
+    );
+    release_blocked_save(&mut rig);
+}
+
+// ── C3 round 3: ruling 5 M-B5 — a walk by text after an add and a remove ───
+
+/// Walk every stop down and back up, asserting at each step that the caret
+/// row's text is that stop's own row text (the blurred render's row, its
+/// caret slot restored) — the render and the walk agree on every stop. The
+/// walk's stop list is `check.shunt_focus`; the render publishes
+/// `shunt_stop_rows`; a landing that rebuilds the render's rows but not the
+/// walk's stops breaks the length pin below first.
+#[cfg(unix)]
+fn assert_rig_walk_lands_on_own_rows(rig: &mut ConfigEditRig) {
+    use super::ServicesFocus;
+    rig.app.services.focus = ServicesFocus::List;
+    rig.render();
+    let rest = shunt_config_rows(&rig.app);
+    let published = rig.app.services.shunt_stop_rows.borrow().clone();
+    let stops = rig
+        .app
+        .services
+        .selected_check()
+        .map(|c| c.shunt_focus.clone())
+        .expect("the shunt check");
+    assert_eq!(
+        published.len(),
+        stops.len(),
+        "one rendered row per stop:\n{}",
+        rest.join("\n")
+    );
+    let own: Vec<String> = (0..stops.len())
+        .map(|i| rest[published[i]].clone())
+        .collect();
+
+    rig.app.services.focus = ServicesFocus::Detail;
+    rig.app.services.set_shunt_focus(Some(stops[0].kind()));
+    rig.render();
+    for (i, own_text) in own.iter().enumerate() {
+        let focused = shunt_config_rows(&rig.app);
+        let caret = focused
+            .iter()
+            .find(|r| r.contains('❯'))
+            .unwrap_or_else(|| panic!("no caret row:\n{}", focused.join("\n")));
+        assert_eq!(
+            caret,
+            &caret_over_text(own_text),
+            "down stop {i} lands on its own row:\n{}",
+            focused.join("\n")
+        );
+        if i + 1 < stops.len() {
+            super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Down));
+        }
+    }
+    for (i, own_text) in own.iter().enumerate().rev() {
+        let focused = shunt_config_rows(&rig.app);
+        let caret = focused
+            .iter()
+            .find(|r| r.contains('❯'))
+            .expect("a caret row");
+        assert_eq!(
+            caret,
+            &caret_over_text(own_text),
+            "up stop {i} lands on its own row:\n{}",
+            focused.join("\n")
+        );
+        if i > 0 {
+            super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Up));
+        }
+    }
+}
+
+/// The blurred row's text with its two-cell caret gutter restored as `❯ `.
+#[cfg(unix)]
+fn caret_over_text(own: &str) -> String {
+    format!("❯ {}", own.get(2..).unwrap_or(""))
+}
+
+/// Ruling 17 / M-B5: after an add lands and after a route remove lands, the
+/// walk's cached stops and the rendered rows agree — every stop's focused row
+/// TEXT is that stop's own row. The plant (deleting the stop rebuild in
+/// `recompute_services_checks`) reds the length pin first.
+#[cfg(unix)]
+#[test]
+fn the_walk_agrees_after_an_add_and_a_remove_land() {
+    use super::{ShuntAddKind, ShuntDraftField, ShuntEntryKey, UpstreamFieldKind};
+
+    // Leg 1: an add lands (the new entry joins the walk at once).
+    let home = crate::testutil::HomeSandbox::new();
+    let _pin = crate::testutil::EnvPin::new(&home, &[(crate::gateway::BIND_ENV, None)]);
+    let mut rig = config_edit_rig(&home, RIG_TEXT);
+    rig.open_add(ShuntAddKind::Upstream);
+    rig.focus_draft_field(
+        ShuntAddKind::Upstream,
+        ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    );
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.type_and_commit("w");
+    rig.focus_line(super::ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream));
+    super::handle_key(&mut rig.app, crate::testutil::key(KeyCode::Enter));
+    rig.drain();
+    rig.app.services.shunt_ok = None; // drop the `✓` so the caret walks clean
+    assert_rig_walk_lands_on_own_rows(&mut rig);
+
+    // Leg 2: a route remove in the middle lands (the re-key shifts the walk).
+    let mut rig = config_edit_rig(&home, ROUTES_FIXTURE);
+    remove_entry_via_confirm(&mut rig, ShuntEntryKey::Route(2));
+    rig.drain();
+    rig.app.services.shunt_ok = None;
+    assert_rig_walk_lands_on_own_rows(&mut rig);
 }

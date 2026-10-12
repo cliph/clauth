@@ -26,19 +26,21 @@ use ratatui::widgets::{Block, ListItem, Paragraph};
 
 use super::super::app::{
     App, Check, ConfigEntryRef, HERDR_OPTIONS, Health, HerdrOption, InputState, ModelFieldKind,
-    OUTDATED_PLUGIN_MARK, RouteFieldKind, SHUNT_OK_MS, ServiceFix, ServicesFocus, ShuntConfigRead,
-    ShuntEntryKey, ShuntFieldEdit, ShuntFieldKey, ShuntFocus, UnreadConfig, UpstreamFieldKind,
-    config_entry_keys, config_field_stops, config_view, cycle_options, entry_field_keys,
-    entry_for_key, entry_name, escape_control, herdr_config_writable, is_cycle_field,
-    parse_herdr_tag_secs, shunt_field_value, written_display,
+    OUTDATED_PLUGIN_MARK, RouteFieldKind, SHUNT_OK_MS, ServiceFix, ServicesFocus, ShuntAddKind,
+    ShuntConfigRead, ShuntDraftField, ShuntEntryKey, ShuntFieldEdit, ShuntFieldKey, ShuntFocus,
+    ShuntOkKey, ShuntSaveKey, UnreadConfig, UpstreamFieldKind, add_row_offered, config_entry_keys,
+    config_field_stops, config_view, cycle_options, draft_field_keys, entry_field_keys,
+    entry_for_key, entry_kind, entry_name, escape_control, herdr_config_writable, is_cycle_field,
+    parse_herdr_tag_secs, removable, shunt_field_value, written_display,
 };
 use super::super::theme;
 use super::format::{middle_truncate, spinner_frame};
 use super::header::pulse_name_spans;
 use super::panes::{
-    cycle_row_lines, draw_following_list, draw_scrollbar, draw_scrolled_lines, empty_state,
-    head_cols, help_tooltip_lines, help_tooltip_lines_at, highlight_row, invalid_tooltip_lines,
-    key_cell, label_style, master_detail, section_box, value_caret, wrap_words,
+    bold_when, cycle_row_lines, draw_following_list, draw_scrollbar, draw_scrolled_lines,
+    empty_state, head_cols, help_tooltip_lines, help_tooltip_lines_at, highlight_row,
+    invalid_tooltip_lines, key_cell, label_style, master_detail, section_box, value_caret,
+    wrap_words,
 };
 use super::prose;
 use crate::format::truncate;
@@ -478,6 +480,8 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
     let focused_group = focus_stop.and_then(|i| match &check.shunt_focus[i] {
         ShuntFocus::Entry { key } => Some(entry_group(key)),
         ShuntFocus::Field { key } => Some(field_group(key)),
+        ShuntFocus::Add { kind } | ShuntFocus::SaveAdd { kind } => Some(kind.group()),
+        ShuntFocus::Remove { key } => Some(entry_group(key)),
         _ => None,
     });
     if detail_focused
@@ -504,7 +508,7 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
                 };
                 if let Some(rendered) = rendered {
                     lines[rendered] = highlight_row(
-                        entry_line(view, key, expanded, detail_focused, width),
+                        entry_line(view, key, expanded, detail_focused, app, width),
                         width,
                     );
                 }
@@ -542,9 +546,42 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
                     }
                 }
             }
+            ShuntFocus::Add { kind } => {
+                if let Some(rendered) = rendered {
+                    lines[rendered] = highlight_row(add_line(*kind, detail_focused, app), width);
+                }
+            }
+            ShuntFocus::SaveAdd { kind } => {
+                let rows = save_add_lines(*kind, detail_focused, app, width);
+                if let Some(rendered) = rendered {
+                    for (i, row) in rows.into_iter().enumerate() {
+                        if rendered + i < lines.len() {
+                            lines[rendered + i] = if i == 0 {
+                                highlight_row(row, width)
+                            } else {
+                                row
+                            };
+                        }
+                    }
+                }
+            }
+            ShuntFocus::Remove { key } => {
+                let rows = remove_lines(key, detail_focused, app, width);
+                if let Some(rendered) = rendered {
+                    for (i, row) in rows.into_iter().enumerate() {
+                        if rendered + i < lines.len() {
+                            lines[rendered + i] = if i == 0 {
+                                highlight_row(row, width)
+                            } else {
+                                row
+                            };
+                        }
+                    }
+                }
+            }
             _ => {
                 let Some(line) = focus.line() else {
-                    unreachable!("only an entry or field row lacks a detail line");
+                    unreachable!("only a config row lacks a detail line");
                 };
                 if let Some(rendered) = rendered {
                     lines[rendered] = highlight_row(
@@ -599,6 +636,7 @@ fn field_group(key: &ShuntFieldKey) -> usize {
         ShuntFieldKey::Upstream { .. } => 1,
         ShuntFieldKey::Model { .. } => 2,
         ShuntFieldKey::Route { .. } => 3,
+        ShuntFieldKey::Draft { kind, .. } => kind.group(),
     }
 }
 
@@ -627,8 +665,9 @@ struct ConfigRows<'a> {
 /// [`config_field_stops`]'s order) and take the caret; the bind row is read-only
 /// while overridden or the env file is unread, the legacy `providers` row and
 /// its note and the eyebrows never take focus. The entries and fields derive
-/// from [`config_entry_keys`] / [`entry_field_keys`] — the same row model the
-/// focus walk builds its stops from — so the two cannot disagree for any view.
+/// from [`config_entry_keys`] / [`entry_field_keys`] / [`draft_field_keys`] —
+/// the same row model the focus walk builds its stops from — so the two cannot
+/// disagree for any view.
 fn render_shunt_config(
     lines: &mut Vec<Line<'static>>,
     stop_rendered: &mut Vec<usize>,
@@ -639,10 +678,11 @@ fn render_shunt_config(
     width: usize,
 ) {
     let keys = config_entry_keys(view);
+    let drafts = &app.services.shunt_drafts;
     // The one row model both the render and the focus walk derive from: a
     // field's focusability is `config_field_stops`' membership, never a
     // predicate copied beside it.
-    let field_stops = config_field_stops(view, expanded);
+    let field_stops = config_field_stops(view, expanded, drafts);
     let mut rows = ConfigRows {
         lines,
         stop_rendered,
@@ -672,6 +712,7 @@ fn render_shunt_config(
             rows.lines.extend(legacy_note_lines(width));
         }
     }
+    push_add(&mut rows, view, ShuntAddKind::Upstream, app, width);
 
     eyebrows[2] = Some(rows.lines.len());
     rows.lines
@@ -682,12 +723,41 @@ fn render_shunt_config(
     {
         push_entry(&mut rows, view, key, expanded, app, width);
     }
+    push_add(&mut rows, view, ShuntAddKind::Model, app, width);
 
     eyebrows[3] = Some(rows.lines.len());
     rows.lines
         .push(Line::from(Span::styled("ROUTES", theme::label())));
     for key in keys.iter().filter(|k| matches!(k, ShuntEntryKey::Route(_))) {
         push_entry(&mut rows, view, key, expanded, app, width);
+    }
+    push_add(&mut rows, view, ShuntAddKind::Route, app, width);
+}
+
+/// The `+ add <kind>` row ending its group (a first-class `+ add` row, `ACCENT`
+/// and bold while selected), plus, while its draft is open, the blank field
+/// rows and the `save <kind>` row. Nothing renders where the group is not
+/// editable (no `+ add upstream` on a legacy `[providers.*]` config).
+fn push_add(
+    rows: &mut ConfigRows<'_>,
+    view: &ConfigView,
+    kind: ShuntAddKind,
+    app: &App,
+    width: usize,
+) {
+    if !add_row_offered(view, kind) {
+        return;
+    }
+    let start = rows.lines.len();
+    rows.lines.push(add_line(kind, false, app));
+    rows.stop_rendered.push(start);
+    if app.services.shunt_drafts.is_open(kind) {
+        for field in draft_field_keys(view, kind, &app.services.shunt_drafts) {
+            push_field(rows, view, &field, app, width);
+        }
+        let save_start = rows.lines.len();
+        rows.lines.extend(save_add_lines(kind, false, app, width));
+        rows.stop_rendered.push(save_start);
     }
 }
 
@@ -702,12 +772,25 @@ fn push_entry(
     width: usize,
 ) {
     let start = rows.lines.len();
-    rows.lines
-        .push(entry_line(view, key, expanded.contains(key), false, width));
+    rows.lines.push(entry_line(
+        view,
+        key,
+        expanded.contains(key),
+        false,
+        app,
+        width,
+    ));
     rows.stop_rendered.push(start);
     if expanded.contains(key) {
         for field in entry_field_keys(view, key) {
             push_field(rows, view, &field, app, width);
+        }
+        // The entry's last child: the `remove <kind>` row (absent where the
+        // engine's `Remove*` cannot address the entry — a duplicated name/id).
+        if removable(view, key) {
+            let remove_start = rows.lines.len();
+            rows.lines.extend(remove_lines(key, false, app, width));
+            rows.stop_rendered.push(remove_start);
         }
     }
 }
@@ -745,9 +828,14 @@ fn entry_line(
     key: &ShuntEntryKey,
     expanded: bool,
     selected: bool,
+    app: &App,
     width: usize,
 ) -> Line<'static> {
-    let mut spans = entry_lead(expanded, selected);
+    let ok = app.services.shunt_ok.as_ref().is_some_and(|(k, at)| {
+        matches!(k, ShuntOkKey::Entry(entry) if entry == key)
+            && at.elapsed().as_millis() < SHUNT_OK_MS as u128
+    });
+    let mut spans = entry_lead(expanded, selected, ok);
     match entry_for_key(view, key) {
         Some(ConfigEntryRef::Upstream(u)) => {
             spans.push(entry_label(u.name.as_ref(), selected));
@@ -817,9 +905,12 @@ fn route_label(r: &RouteView, room: usize) -> String {
     )
 }
 
-/// The shared caret + disclosure glyph lead of an entry row.
-fn entry_lead(expanded: bool, selected: bool) -> Vec<Span<'static>> {
-    let caret = if selected {
+/// The shared caret + disclosure glyph lead of an entry row. The `✓` (an add's
+/// success, `SHUNT_OK_MS`) replaces the caret the way a field row's does.
+fn entry_lead(expanded: bool, selected: bool, ok: bool) -> Vec<Span<'static>> {
+    let caret = if ok {
+        Span::styled("✓ ", theme::success())
+    } else if selected {
         Span::styled("❯ ", theme::accent().bold())
     } else {
         Span::styled("  ", Style::default())
@@ -831,6 +922,124 @@ fn entry_lead(expanded: bool, selected: bool) -> Vec<Span<'static>> {
         theme::dim()
     };
     vec![caret, Span::styled(format!("{glyph} "), glyph_style)]
+}
+
+/// The caret slot of an action row (a `+ add`, `save <kind>` or `remove
+/// <kind>` row): the braille spinner while its save runs, else `❯` focused /
+/// blank.
+fn action_lead(saving: bool, selected: bool, app: &App) -> Span<'static> {
+    if saving {
+        Span::styled(
+            format!("{} ", spinner_frame(app.tick_count)),
+            theme::accent(),
+        )
+    } else if selected {
+        Span::styled("❯ ", theme::accent().bold())
+    } else {
+        Span::styled("  ", Style::default())
+    }
+}
+
+/// The `+ add <kind>` row: a first-class `+ add` row — `ACCENT` label, bold
+/// while selected (the cloudy-tui Master-detail `+ new` rule), no disclosure
+/// glyph.
+fn add_line(kind: ShuntAddKind, selected: bool, app: &App) -> Line<'static> {
+    let label = if selected {
+        theme::accent().bold()
+    } else {
+        theme::accent()
+    };
+    Line::from(vec![
+        action_lead(false, selected, app),
+        Span::styled(kind.add_label(), label),
+    ])
+}
+
+/// The `save <kind>` row (an action line, indented under the `+ add` row at
+/// the entry-child indent), plus its refusal `└` line (a required field left
+/// blank, or the engine's own sentence): the caret slot shows the spinner and
+/// the label the shimmer crest while its save checks. At rest it takes the
+/// `create account` treatment (ACCENT, bold while selected).
+fn save_add_lines(
+    kind: ShuntAddKind,
+    selected: bool,
+    app: &App,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let saving = app.services.saving(&ShuntSaveKey::SaveAdd(kind));
+    let mut spans = vec![
+        action_lead(saving, selected, app),
+        Span::raw(" ".repeat(ENTRY_INDENT.saturating_sub(CARET_GUTTER))),
+    ];
+    if saving {
+        let elapsed = app
+            .services
+            .shunt_save
+            .as_ref()
+            .map(|save| save.started.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        spans.extend(pulse_name_spans(
+            &kind.save_label(),
+            theme::accent(),
+            elapsed,
+        ));
+        spans.push(Span::styled("  checking", theme::dim()));
+    } else {
+        spans.push(Span::styled(
+            kind.save_label(),
+            bold_when(theme::accent(), selected),
+        ));
+    }
+    let mut rows = vec![Line::from(spans)];
+    if let Some(refusal) = app.services.shunt_drafts.refusal(kind) {
+        rows.extend(invalid_tooltip_lines(refusal, width));
+    }
+    rows
+}
+
+/// The `remove <kind>` row ending an expanded entry (an action line, indented
+/// under the entry's name like its field rows), plus its refusal `└` line (an
+/// unowned comment in a gap the remove touches). At rest it takes the `delete
+/// account` treatment (`DANGER`, bold); while its remove checks it shows the
+/// same saving shape as `save <kind>` — the spinner, the shimmer crest over
+/// its label and a dim `checking` trail.
+fn remove_lines(
+    key: &ShuntEntryKey,
+    selected: bool,
+    app: &App,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let saving = app.services.saving(&ShuntSaveKey::Remove(key.clone()));
+    let mut spans = vec![
+        action_lead(saving, selected, app),
+        Span::raw(" ".repeat(ENTRY_INDENT.saturating_sub(CARET_GUTTER))),
+    ];
+    if saving {
+        let elapsed = app
+            .services
+            .shunt_save
+            .as_ref()
+            .map(|save| save.started.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        spans.extend(pulse_name_spans(
+            &entry_kind(key).remove_label(),
+            theme::accent(),
+            elapsed,
+        ));
+        spans.push(Span::styled("  checking", theme::dim()));
+    } else {
+        spans.push(Span::styled(
+            entry_kind(key).remove_label(),
+            theme::danger().bold(),
+        ));
+    }
+    let mut rows = vec![Line::from(spans)];
+    if let Some(refusal) = app.services.shunt_remove_refusal.borrow().as_ref()
+        && refusal.key == *key
+    {
+        rows.extend(invalid_tooltip_lines(&refusal.sentence, width));
+    }
+    rows
 }
 
 /// An entry's name/id, escaped and padded to the shared value column, in the
@@ -942,11 +1151,41 @@ fn field_label(key: &ShuntFieldKey) -> String {
             RouteFieldKind::ServiceTier => "service_tier",
         }
         .to_string(),
+        ShuntFieldKey::Draft { field, .. } => match field {
+            ShuntDraftField::Upstream(field) => match field {
+                UpstreamFieldKind::Name => "name",
+                UpstreamFieldKind::Provider => "provider",
+                UpstreamFieldKind::Kind => "kind",
+                UpstreamFieldKind::BaseUrl => "base_url",
+                UpstreamFieldKind::AuthMode => "auth mode",
+                UpstreamFieldKind::AuthAccount => "account",
+                UpstreamFieldKind::Accounts => "accounts",
+                UpstreamFieldKind::AuthEnv => "auth env",
+                UpstreamFieldKind::AuthHeader => "auth header",
+                UpstreamFieldKind::Effort => "effort",
+                UpstreamFieldKind::ServiceTier => "service_tier",
+            }
+            .to_string(),
+            ShuntDraftField::Model(field) => match field {
+                ModelFieldKind::Id => "id".to_string(),
+                ModelFieldKind::DisplayName => "display_name".to_string(),
+                ModelFieldKind::UpstreamModel(provider) => provider.clone(),
+            },
+            ShuntDraftField::Route(field) => match field {
+                RouteFieldKind::Model => "model",
+                RouteFieldKind::Provider => "provider",
+                RouteFieldKind::UpstreamModel => "upstream_model",
+                RouteFieldKind::Effort => "effort",
+                RouteFieldKind::ServiceTier => "service_tier",
+            }
+            .to_string(),
+        },
     }
 }
 
-/// A field row's indent: the server fields sit at the card gutter, an entry's
-/// fields under its label.
+/// A field row's indent: the server fields sit at the card gutter; a draft
+/// field and an entry's field sit under their parent's label (`ENTRY_INDENT`,
+/// two cells deeper than the `+ add` row's label), values at col 20.
 fn field_indent(key: &ShuntFieldKey) -> usize {
     match key {
         ShuntFieldKey::Bind | ShuntFieldKey::DefaultProvider => CARET_GUTTER,
@@ -963,12 +1202,11 @@ fn field_lead(key: &ShuntFieldKey, selected: bool, app: &App) -> Span<'static> {
         .shunt_field_edit
         .as_ref()
         .is_some_and(|s| s.key == *key);
-    let saving = app.services.saving(key);
-    let ok = app
-        .services
-        .shunt_ok
-        .as_ref()
-        .is_some_and(|(k, at)| k == key && at.elapsed().as_millis() < SHUNT_OK_MS as u128);
+    let saving = app.services.saving(&ShuntSaveKey::Field(key.clone()));
+    let ok = app.services.shunt_ok.as_ref().is_some_and(|(k, at)| {
+        matches!(k, ShuntOkKey::Field(field) if field == key)
+            && at.elapsed().as_millis() < SHUNT_OK_MS as u128
+    });
     if saving {
         Span::styled(
             format!("{} ", spinner_frame(app.tick_count)),
@@ -993,7 +1231,7 @@ fn field_row_caret(app: &App, key: &ShuntFieldKey) -> Option<usize> {
     if state.key != *key {
         return None;
     }
-    if app.services.saving(key) {
+    if app.services.saving(&ShuntSaveKey::Field(key.clone())) {
         return None;
     }
     match &state.edit {
@@ -1030,8 +1268,8 @@ fn field_row_lines(
         .shunt_field_edit
         .as_ref()
         .filter(|s| s.key == *key);
-    let saving = app.services.saving(key);
-    let value = shunt_field_value(view, key).flatten();
+    let saving = app.services.saving(&ShuntSaveKey::Field(key.clone()));
+    let value = shunt_field_value(view, &app.services.shunt_drafts, key).flatten();
     let room = width.saturating_sub(CONFIG_VALUE_COL);
 
     let lead = || {
@@ -1055,7 +1293,12 @@ fn field_row_lines(
     // dim `checking` trail — typed and cycle rows alike. The editor stays open
     // with the typed text, but the row shows the value the save checks.
     if saving {
-        let Some(save) = app.services.shunt_save.as_ref().filter(|s| s.key == *key) else {
+        let Some(save) = app
+            .services
+            .shunt_save
+            .as_ref()
+            .filter(|s| s.key == ShuntSaveKey::Field(key.clone()))
+        else {
             unreachable!("saving implies a save in flight");
         };
         let mut spans = lead();
@@ -1283,6 +1526,13 @@ fn shunt_focus_line(focus: &ShuntFocus, text: &str, selected: bool, app: &App) -
         ShuntFocus::CheckOutput { .. } => problem_line(text, selected),
         ShuntFocus::Entry { .. } => unreachable!("entry rows render through entry_line"),
         ShuntFocus::Field { .. } => unreachable!("field rows render through field_row_lines"),
+        ShuntFocus::Add { .. } => unreachable!("the `+ add` row renders through add_line"),
+        ShuntFocus::SaveAdd { .. } => {
+            unreachable!("the `save <kind>` row renders through save_add_lines")
+        }
+        ShuntFocus::Remove { .. } => {
+            unreachable!("the `remove <kind>` row renders through remove_lines")
+        }
     }
 }
 

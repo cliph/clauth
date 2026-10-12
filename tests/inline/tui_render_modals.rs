@@ -1474,6 +1474,60 @@ fn the_add_admin_table_confirm_button_is_dangerous() {
     );
 }
 
+/// The `remove upstream …?` confirm's affirmative button is labeled `remove`
+/// (never a generic `confirm`) and is destructive (DANGER fg, like its `stop
+/// shunt?` sibling); `cancel` stays the default-focused neutral inverse block.
+#[test]
+fn the_remove_entry_confirm_labels_and_marks_the_remove_button_dangerous() {
+    use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState, ShuntEntryKey};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let state = ConfirmState {
+        message: "remove upstream \"a\"?".into(),
+        detail: None,
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::RemoveEntry {
+            key: ShuntEntryKey::Upstream {
+                name: "a".into(),
+                occurrence: 0,
+            },
+            edit: Box::new(crate::gateway_edit::Edit::RemoveUpstream { name: "a".into() }),
+        },
+    };
+    let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    term.draw(|f| draw_confirm(f, f.area(), &state)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let screen = crate::testutil::buffer_rows(&buf).join("\n");
+    let stride = buf.area.width as usize;
+    let mut seen = None;
+    for y in 0..buf.area.height as usize {
+        for x in 0..stride {
+            let cell = &buf.content[y * stride + x];
+            if cell.symbol() == "r"
+                && buf.content.get(y * stride + x + 1).map(|c| c.symbol()) == Some("e")
+                && buf.content.get(y * stride + x + 2).map(|c| c.symbol()) == Some("m")
+                && buf.content.get(y * stride + x + 3).map(|c| c.symbol()) == Some("o")
+                && buf.content.get(y * stride + x + 4).map(|c| c.symbol()) == Some("v")
+                && buf.content.get(y * stride + x + 5).map(|c| c.symbol()) == Some("e")
+            {
+                seen = Some(cell.fg);
+            }
+        }
+    }
+    assert_eq!(
+        seen,
+        Some(crate::tui::theme::danger_color()),
+        "the remove confirm button is DANGER unfocused:\n{screen}"
+    );
+    assert!(
+        !screen.contains("confirm"),
+        "the button is labeled `remove`, never a generic `confirm`:\n{screen}"
+    );
+}
+
 /// Draw `state` as the TUI draws a confirm on a `width`×`height` screen and
 /// return the buffer plus the modal's rows, border to border.
 fn render_confirm(

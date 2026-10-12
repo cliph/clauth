@@ -3570,11 +3570,14 @@ fn base_view() -> ConfigView {
 /// An app whose shunt card is the full slot plus `view` as its config section.
 fn config_view_app(view: ConfigView, expanded: std::collections::HashSet<ShuntEntryKey>) -> App {
     let mut card = crate::tui::app::shunt_check(&shunt_slot_full(), true, None);
-    card.shunt_focus
-        .extend(crate::tui::app::config_field_stops(&view, &expanded));
+    let drafts = crate::tui::app::ShuntDrafts::default();
+    card.shunt_focus.extend(crate::tui::app::config_field_stops(
+        &view, &expanded, &drafts,
+    ));
     let mut app = app_with(card);
     app.services.shunt_config = Some(ShuntConfigRead::Ok(Box::new(view)));
     app.services.shunt_expanded = expanded;
+    app.services.shunt_drafts = drafts;
     app
 }
 
@@ -3676,8 +3679,11 @@ fn the_shunt_config_renders_upstreams_collapsed() {
             "UPSTREAMS",
             "  ▶ anthropic       claude_oauth",
             "  ▶ openai          api_key",
+            "  + add upstream",
             "MODELS",
+            "  + add model",
             "ROUTES",
+            "  + add route",
         ],
     );
 }
@@ -3743,8 +3749,12 @@ fn the_shunt_config_renders_one_upstream_expanded_with_accounts() {
             "    accounts        alice, bob",
             "    effort          —",
             "    service_tier    —",
+            "    remove upstream",
+            "  + add upstream",
             "MODELS",
+            "  + add model",
             "ROUTES",
+            "  + add route",
         ],
     );
 }
@@ -3779,13 +3789,48 @@ fn the_shunt_config_renders_the_legacy_form() {
             "  providers         anthropic, openai",
             "  └ [providers.*] form; convert to [[upstreams]] by hand to edit",
             "MODELS",
+            "  + add model",
             "ROUTES",
+            "  + add route",
         ],
     );
 }
 
-/// While the bind override holds, the bind row names the variable (the view's
-/// spelling), the suffix dim, the row still read-only.
+/// A legacy `[providers.*]` config offers no `+ add upstream` and no `remove
+/// upstream` stop (its providers are read-only): the walk carries only the
+/// model and route add rows.
+#[test]
+fn the_legacy_config_offers_no_upstream_add_or_remove() {
+    use crate::tui::app::ShuntAddKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.form = ProviderForm::Legacy {
+        providers: vec!["anthropic".to_string()],
+    };
+    let stops = crate::tui::app::config_field_stops(
+        &view,
+        &std::collections::HashSet::new(),
+        &crate::tui::app::ShuntDrafts::default(),
+    );
+    assert!(
+        !stops.iter().any(|s| matches!(
+            s,
+            crate::tui::app::ShuntFocus::Add {
+                kind: ShuntAddKind::Upstream
+            }
+        )),
+        "no `+ add upstream` stop on a legacy config"
+    );
+    assert!(
+        !stops.iter().any(|s| matches!(
+            s,
+            crate::tui::app::ShuntFocus::Remove {
+                key: crate::tui::app::ShuntEntryKey::Upstream { .. }
+            }
+        )),
+        "no `remove upstream` stop on a legacy config"
+    );
+}
 #[test]
 fn the_shunt_config_renders_the_bind_override_row() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -3809,8 +3854,11 @@ fn the_shunt_config_renders_the_bind_override_row() {
             "  bind              127.0.0.1:3001  set by SHUNT_SERVER__BIND",
             "  default_provider  anthropic",
             "UPSTREAMS",
+            "  + add upstream",
             "MODELS",
+            "  + add model",
             "ROUTES",
+            "  + add route",
         ],
     );
 }
@@ -3847,7 +3895,9 @@ fn the_shunt_config_renders_a_reference_value_as_written() {
             "  bind              127.0.0.1:3001",
             "  default_provider  anthropic",
             "UPSTREAMS",
+            "  + add upstream",
             "MODELS",
+            "  + add model",
             "ROUTES",
             "  ▼ 1  opus → anthropic",
             "    model           opus",
@@ -3855,6 +3905,8 @@ fn the_shunt_config_renders_a_reference_value_as_written() {
             "    upstream_model  ${MODEL}",
             "    effort          —",
             "    service_tier    —",
+            "    remove route",
+            "  + add route",
         ],
     );
 }
@@ -3891,9 +3943,12 @@ fn the_shunt_config_renders_an_absent_key_as_em_dash() {
             "  bind              127.0.0.1:3001",
             "  default_provider  anthropic",
             "UPSTREAMS",
+            "  + add upstream",
             "MODELS",
+            "  + add model",
             "ROUTES",
             "  ▶ 1  — → —",
+            "  + add route",
         ],
     );
 }
@@ -3935,13 +3990,17 @@ fn the_shunt_config_renders_a_model_with_two_upstreams_expanded() {
             "  bind              127.0.0.1:3001",
             "  default_provider  anthropic",
             "UPSTREAMS",
+            "  + add upstream",
             "MODELS",
             "  ▼ opus            2 upstreams",
             "    id              opus",
             "    display_name    Opus",
             "    anthropic       claude-opus",
             "    openai          gpt-5",
+            "    remove model",
+            "  + add model",
             "ROUTES",
+            "  + add route",
         ],
     );
 }
@@ -3978,10 +4037,310 @@ fn the_shunt_config_renders_a_route_row() {
             "  bind              127.0.0.1:3001",
             "  default_provider  anthropic",
             "UPSTREAMS",
+            "  + add upstream",
             "MODELS",
+            "  + add model",
             "ROUTES",
             "  ▶ 3  opus → anthropic",
+            "  + add route",
         ],
+    );
+}
+
+// ── C3 render pins: the add draft, save and remove rows ──────────────────────
+
+use crate::tui::app::{ShuntAddKind, ShuntDrafts, ShuntSave, ShuntSaveKey, UpstreamDraft};
+
+/// An app whose shunt card is the full slot plus `view`, `expanded` and
+/// `drafts` (the open add forms).
+fn config_draft_app(
+    view: ConfigView,
+    expanded: std::collections::HashSet<ShuntEntryKey>,
+    drafts: ShuntDrafts,
+) -> App {
+    let mut card = crate::tui::app::shunt_check(&shunt_slot_full(), true, None);
+    card.shunt_focus.extend(crate::tui::app::config_field_stops(
+        &view, &expanded, &drafts,
+    ));
+    let mut app = app_with(card);
+    app.services.shunt_config = Some(ShuntConfigRead::Ok(Box::new(view)));
+    app.services.shunt_expanded = expanded;
+    app.services.shunt_drafts = drafts;
+    app
+}
+
+/// Render a config section over `view`/`expanded`/`drafts` and pin the detail
+/// rows by equality (whole line vecs).
+fn assert_config_detail_with(
+    view: ConfigView,
+    expanded: std::collections::HashSet<ShuntEntryKey>,
+    drafts: ShuntDrafts,
+    expected: &[&str],
+) {
+    let app = config_draft_app(view, expanded, drafts);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 40)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert_eq!(
+        config_detail_rows(&rows),
+        expected,
+        "config detail rows:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// An open upstream draft renders its blank field rows under the `+ add
+/// upstream` row (Disclosure alignment, every unset value `—` faint) and ends
+/// on the `save upstream` row.
+#[test]
+fn the_shunt_config_renders_an_open_upstream_draft() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let view = base_view();
+    let drafts = ShuntDrafts {
+        upstream: Some(UpstreamDraft::default()),
+        ..ShuntDrafts::default()
+    };
+    assert_config_detail_with(
+        view,
+        std::collections::HashSet::new(),
+        drafts,
+        &[
+            "binary     /usr/local/bin/shunt",
+            "config     /home/u/.clauth/gateway.toml",
+            "version    0.49.1",
+            "state      healthy",
+            "reason     port busy",
+            "pid        4242",
+            "port       3001",
+            "restarts   2",
+            "last exit  exit 1",
+            "",
+            "SERVER",
+            "  bind              127.0.0.1:3001",
+            "  default_provider  anthropic",
+            "UPSTREAMS",
+            "  + add upstream",
+            "    name            —",
+            "    provider        —",
+            "    kind            —",
+            "    base_url        —",
+            "    auth mode       —",
+            "    effort          —",
+            "    service_tier    —",
+            "    save upstream",
+            "MODELS",
+            "  + add model",
+            "ROUTES",
+            "  + add route",
+        ],
+    );
+}
+
+/// A model draft lists `id`, `display_name`, then one `upstream_model
+/// <provider>` row per upstream the config declares, in config order.
+#[test]
+fn the_shunt_config_renders_a_model_draft_with_provider_rows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![shorthand_up("a", "api_key"), shorthand_up("b", "api_key")];
+    let drafts = ShuntDrafts {
+        model: Some(crate::tui::app::ModelDraft {
+            id: Some("opus".to_string()),
+            ..crate::tui::app::ModelDraft::default()
+        }),
+        ..ShuntDrafts::default()
+    };
+    assert_config_detail_with(
+        view,
+        std::collections::HashSet::new(),
+        drafts,
+        &[
+            "binary     /usr/local/bin/shunt",
+            "config     /home/u/.clauth/gateway.toml",
+            "version    0.49.1",
+            "state      healthy",
+            "reason     port busy",
+            "pid        4242",
+            "port       3001",
+            "restarts   2",
+            "last exit  exit 1",
+            "",
+            "SERVER",
+            "  bind              127.0.0.1:3001",
+            "  default_provider  anthropic",
+            "UPSTREAMS",
+            "  ▶ a               api_key",
+            "  ▶ b               api_key",
+            "  + add upstream",
+            "MODELS",
+            "  + add model",
+            "    id              opus",
+            "    display_name    —",
+            "    a               —",
+            "    b               —",
+            "    save model",
+            "ROUTES",
+            "  + add route",
+        ],
+    );
+}
+
+/// A saving `save <kind>` row shows the spinner in its caret slot, its label
+/// under the shimmer crest and a dim `checking` trail.
+#[test]
+fn the_shunt_config_renders_a_saving_save_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let view = base_view();
+    let drafts = ShuntDrafts {
+        upstream: Some(UpstreamDraft::default()),
+        ..ShuntDrafts::default()
+    };
+    let mut app = config_draft_app(view, std::collections::HashSet::new(), drafts);
+    app.tick_count = 0;
+    app.services.shunt_save = Some(ShuntSave {
+        key: ShuntSaveKey::SaveAdd(ShuntAddKind::Upstream),
+        started: std::time::Instant::now(),
+        value: None,
+        entry: None,
+    });
+    let rows = render_app_config_rows(&app);
+    let save_row = rows
+        .iter()
+        .find(|r| r.contains("save upstream"))
+        .unwrap_or_else(|| panic!("no save row:\n{}", rows.join("\n")));
+    assert_eq!(
+        save_row, "⠋   save upstream  checking",
+        "the saving save row shows spinner + shimmer + checking at the entry-child indent"
+    );
+}
+
+/// A draft's refusal (a required field left blank, or the engine's sentence)
+/// renders on the `└` DANGER line under the `save <kind>` row.
+#[test]
+fn the_shunt_config_renders_a_draft_refusal_under_the_save_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let view = base_view();
+    let drafts = ShuntDrafts {
+        upstream: Some(UpstreamDraft {
+            refusal: Some("cannot add upstream: set its name first".to_string()),
+            ..UpstreamDraft::default()
+        }),
+        ..ShuntDrafts::default()
+    };
+    assert_config_detail_with(
+        view,
+        std::collections::HashSet::new(),
+        drafts,
+        &[
+            "binary     /usr/local/bin/shunt",
+            "config     /home/u/.clauth/gateway.toml",
+            "version    0.49.1",
+            "state      healthy",
+            "reason     port busy",
+            "pid        4242",
+            "port       3001",
+            "restarts   2",
+            "last exit  exit 1",
+            "",
+            "SERVER",
+            "  bind              127.0.0.1:3001",
+            "  default_provider  anthropic",
+            "UPSTREAMS",
+            "  + add upstream",
+            "    name            —",
+            "    provider        —",
+            "    kind            —",
+            "    base_url        —",
+            "    auth mode       —",
+            "    effort          —",
+            "    service_tier    —",
+            "    save upstream",
+            " └ cannot add upstream: set its name first",
+            "MODELS",
+            "  + add model",
+            "ROUTES",
+            "  + add route",
+        ],
+    );
+}
+
+/// A remove refusal renders on the `└` DANGER line directly under the entry's
+/// `remove upstream` row, and under the RIGHT entry when two are expanded (the
+/// entry still expanded).
+#[test]
+fn the_shunt_config_renders_a_remove_refusal_under_the_remove_row() {
+    use crate::tui::app::ShuntRemoveRefusal;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![
+        UpstreamView {
+            name: Some(w("a")),
+            provider: None,
+            kind: None,
+            base_url: None,
+            auth: None,
+            effort: None,
+            service_tier: None,
+        },
+        UpstreamView {
+            name: Some(w("b")),
+            provider: None,
+            kind: None,
+            base_url: None,
+            auth: None,
+            effort: None,
+            service_tier: None,
+        },
+    ];
+    let entry_a = ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    };
+    let entry_b = ShuntEntryKey::Upstream {
+        name: "b".into(),
+        occurrence: 0,
+    };
+    let expanded = std::collections::HashSet::from([entry_a, entry_b.clone()]);
+    let app = config_draft_app(view, expanded, ShuntDrafts::default());
+    let refusal_view = match &app.services.shunt_config {
+        Some(ShuntConfigRead::Ok(view)) => view.clone(),
+        _ => unreachable!("the app holds a read view"),
+    };
+    app.services.shunt_remove_refusal.replace(Some(ShuntRemoveRefusal {
+        key: entry_b,
+        sentence: "cannot remove upstream \"b\": a comment next to it belongs to no single entry; edit the config by hand".to_string(),
+        view: refusal_view,
+    }));
+    let rows = render_app_config_rows(&app);
+    // Pin the section from the first remove row: the `└` line sits directly
+    // under `b`'s remove row, never `a`'s.
+    let start = rows
+        .iter()
+        .position(|r| r == "    remove upstream")
+        .expect("the first remove row");
+    assert_eq!(
+        &rows[start..],
+        &[
+            "    remove upstream",
+            "  ▼ b",
+            "    name            b",
+            "    provider        —",
+            "    kind            —",
+            "    base_url        —",
+            "    auth mode       —",
+            "    effort          —",
+            "    service_tier    —",
+            "    remove upstream",
+            " └ cannot remove upstream \"b\": a comment next to it belongs to no",
+            "   single entry; edit the config by hand",
+            "  + add upstream",
+            "MODELS",
+            "  + add model",
+            "ROUTES",
+            "  + add route",
+        ],
+        "the remove refusal renders under its own remove row:\n{}",
+        rows.join("\n")
     );
 }
 
@@ -4348,7 +4707,7 @@ fn the_focus_walk_lands_on_its_own_rows_with_a_read_only_bind() {
     }]);
     let mut app = config_view_app(view.clone(), expanded.clone());
     render_tall(&app);
-    let stops = crate::tui::app::config_field_stops(&view, &expanded);
+    let stops = crate::tui::app::config_field_stops(&view, &expanded, &app.services.shunt_drafts);
 
     // Each stop's own line at rest, in card order (the read-only bind row and
     // the eyebrows render but are not stops).
@@ -4363,6 +4722,10 @@ fn the_focus_walk_lands_on_its_own_rows_with_a_read_only_bind() {
         "    accounts        —",
         "    effort          —",
         "    service_tier    —",
+        "    remove upstream",
+        "  + add upstream",
+        "  + add model",
+        "  + add route",
     ];
     assert_eq!(
         stops.len(),
@@ -4426,12 +4789,90 @@ fn the_focus_walk_lands_on_its_own_rows_with_a_read_only_bind() {
     );
 }
 
+/// The walk and the render agree after opening and folding a draft: every stop
+/// (the draft field rows and the `save <kind>` row included) lands on its own
+/// rendered text, and folding drops them back out of the walk — never a stale
+/// stop list or a count-only check.
+#[test]
+fn the_walk_agrees_after_opening_and_folding_a_draft() {
+    use crate::tui::app::{ServicesFocus, ShuntAddKind, ShuntFocusLine};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![shorthand_up("a", "api_key")];
+    let mut app = config_view_app_with_enabled(view, std::collections::HashSet::new());
+    render_tall(&app);
+
+    // Open the upstream draft from its `+ add` row.
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Add(ShuntAddKind::Upstream)));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        app.services.shunt_drafts.is_open(ShuntAddKind::Upstream),
+        "enter opens the draft"
+    );
+    assert_walk_lands_on_own_rows(&mut app);
+
+    // Fold it back with `↵` on the `+ add` row (now focus is back on it).
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Add(ShuntAddKind::Upstream)));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        !app.services.shunt_drafts.is_open(ShuntAddKind::Upstream),
+        "enter on the open `+ add` row folds the draft"
+    );
+    assert_walk_lands_on_own_rows(&mut app);
+
+    // Re-open, then `esc` at rest on a draft field row folds the draft too.
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Add(ShuntAddKind::Upstream)));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    app.services.set_shunt_focus(Some(ShuntFocusLine::Field(
+        crate::tui::app::ShuntFieldKey::Draft {
+            kind: ShuntAddKind::Upstream,
+            field: crate::tui::app::ShuntDraftField::Upstream(
+                crate::tui::app::UpstreamFieldKind::Name,
+            ),
+        },
+    )));
+    render_tall(&app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert!(
+        !app.services.shunt_drafts.is_open(ShuntAddKind::Upstream),
+        "esc at rest on a draft field row folds the draft"
+    );
+    assert_walk_lands_on_own_rows(&mut app);
+
+    // Re-open, then commit `auth mode` = `api_key` on the draft: the one draft
+    // change that reshapes the row set mid-draft (the mode-dependent rows
+    // appear). The walk and the render must agree on the new rows at once.
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Add(ShuntAddKind::Upstream)));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    app.services.set_shunt_focus(Some(ShuntFocusLine::Field(
+        crate::tui::app::ShuntFieldKey::Draft {
+            kind: ShuntAddKind::Upstream,
+            field: crate::tui::app::ShuntDraftField::Upstream(
+                crate::tui::app::UpstreamFieldKind::AuthMode,
+            ),
+        },
+    )));
+    render_tall(&app);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    for c in "claude_oauth".chars() {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_walk_lands_on_own_rows(&mut app);
+}
+
 /// While a cycle save runs, the row shows the same saving shape as a typed
 /// save: the spinner in the caret slot, the value being saved under the
 /// shimmer, and a dim `checking` trail — not the pre-save held value.
 #[test]
 fn a_cycle_save_renders_like_a_typed_save() {
-    use crate::tui::app::{ShuntFieldKey, ShuntSave, UpstreamFieldKind};
+    use crate::tui::app::{ShuntFieldKey, ShuntSave, ShuntSaveKey, UpstreamFieldKind};
     let _home = crate::testutil::HomeSandbox::new();
     let mut view = base_view();
     view.upstreams = vec![UpstreamView {
@@ -4454,9 +4895,10 @@ fn a_cycle_save_renders_like_a_typed_save() {
         field: UpstreamFieldKind::Kind,
     };
     app.services.shunt_save = Some(ShuntSave {
-        key,
+        key: ShuntSaveKey::Field(key),
         started: std::time::Instant::now(),
         value: Some("responses".into()),
+        entry: None,
     });
     app.tick_count = 0;
     let rows = render_app_config_rows(&app);
@@ -4475,7 +4917,7 @@ fn a_cycle_save_renders_like_a_typed_save() {
 /// value's accent.
 #[test]
 fn a_saving_row_trails_checking_in_text_dim() {
-    use crate::tui::app::{ShuntFieldKey, ShuntSave, UpstreamFieldKind};
+    use crate::tui::app::{ShuntFieldKey, ShuntSave, ShuntSaveKey, UpstreamFieldKind};
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut view = base_view();
@@ -4494,13 +4936,14 @@ fn a_saving_row_trails_checking_in_text_dim() {
     }]);
     let mut app = config_view_app(view, expanded);
     app.services.shunt_save = Some(ShuntSave {
-        key: ShuntFieldKey::Upstream {
+        key: ShuntSaveKey::Field(ShuntFieldKey::Upstream {
             name: "a".into(),
             occurrence: 0,
             field: UpstreamFieldKind::Kind,
-        },
+        }),
         started: std::time::Instant::now(),
         value: Some("responses".into()),
+        entry: None,
     });
     app.tick_count = 0;
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
@@ -4769,7 +5212,7 @@ fn a_control_character_value_keeps_the_shunt_editor_caret_aligned() {
 /// the value's cells are tinted away from the plain accent.
 #[test]
 fn a_saving_value_carries_the_shimmer_crest() {
-    use crate::tui::app::{ShuntFieldKey, ShuntSave, UpstreamFieldKind};
+    use crate::tui::app::{ShuntFieldKey, ShuntSave, ShuntSaveKey, UpstreamFieldKind};
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut view = base_view();
@@ -4793,9 +5236,10 @@ fn a_saving_value_carries_the_shimmer_crest() {
     };
     let mut app = config_view_app(view, expanded);
     app.services.shunt_save = Some(ShuntSave {
-        key,
+        key: ShuntSaveKey::Field(key),
         started: std::time::Instant::now() - std::time::Duration::from_millis(200),
         value: Some("high".into()),
+        entry: None,
     });
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
     term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
@@ -4845,6 +5289,7 @@ fn config_focus_identity_holds_across_a_reorder() {
     card.shunt_focus.extend(crate::tui::app::config_field_stops(
         &view,
         &app.services.shunt_expanded,
+        &app.services.shunt_drafts,
     ));
     app.services.checks = vec![card];
     app.services.shunt_config = Some(ShuntConfigRead::Ok(Box::new(view)));
@@ -5019,8 +5464,11 @@ fn the_shunt_config_renders_the_env_file_failure_line() {
             "  bind              127.0.0.1:3001  env file not read",
             "  default_provider  anthropic",
             "UPSTREAMS",
+            "  + add upstream",
             "MODELS",
+            "  + add model",
             "ROUTES",
+            "  + add route",
         ],
     );
 }
@@ -5065,12 +5513,15 @@ fn the_shunt_config_renders_two_same_id_models_distinctly() {
             "  bind              127.0.0.1:3001",
             "  default_provider  anthropic",
             "UPSTREAMS",
+            "  + add upstream",
             "MODELS",
             "  ▶ m",
             "  ▼ m",
             "    id              m",
             "    display_name    Second",
+            "  + add model",
             "ROUTES",
+            "  + add route",
         ],
     );
 }
@@ -5166,8 +5617,11 @@ fn the_shunt_config_renders_two_same_name_upstreams_distinctly() {
             "    accounts        —".to_string(),
             "    effort          —".to_string(),
             "    service_tier    —".to_string(),
+            "  + add upstream".to_string(),
             "MODELS".to_string(),
+            "  + add model".to_string(),
             "ROUTES".to_string(),
+            "  + add route".to_string(),
         ],
         "the second same-name upstream draws its own summary and fields"
     );
@@ -5206,8 +5660,11 @@ fn the_shunt_config_renders_two_nameless_upstreams_distinctly() {
             "    accounts        —".to_string(),
             "    effort          —".to_string(),
             "    service_tier    —".to_string(),
+            "  + add upstream".to_string(),
             "MODELS".to_string(),
+            "  + add model".to_string(),
             "ROUTES".to_string(),
+            "  + add route".to_string(),
         ],
         "the second nameless upstream draws its own fields"
     );
@@ -5361,9 +5818,12 @@ fn the_shunt_config_ellipsizes_long_names_summaries_and_route_labels() {
             "  default_provider  anthropic".to_string(),
             "UPSTREAMS".to_string(),
             "  ▶ abcdefghijklm…  antigravity_oau…".to_string(),
+            "  + add upstream".to_string(),
             "MODELS".to_string(),
+            "  + add model".to_string(),
             "ROUTES".to_string(),
             "  ▶ 1  0123456789abcdef… → anthropic".to_string(),
+            "  + add route".to_string(),
         ],
         "long names, summaries and route labels ellipsize at their slot"
     );
@@ -5391,9 +5851,12 @@ fn the_shunt_config_keeps_the_route_provider_when_the_model_shrinks() {
             "  bind              127.0.0.1:3001".to_string(),
             "  default_provider  anthropic".to_string(),
             "UPSTREAMS".to_string(),
+            "  + add upstream".to_string(),
             "MODELS".to_string(),
+            "  + add model".to_string(),
             "ROUTES".to_string(),
             "  ▶ 2  a-really-long-model-slug-for-trunca… → openai".to_string(),
+            "  + add route".to_string(),
         ],
         "the route label shrinks the model, keeping the arrow and provider"
     );
@@ -5421,9 +5884,12 @@ fn the_shunt_config_marks_a_crowded_out_route_model_with_an_ellipsis() {
             "  bind              127.0.0.1:3001".to_string(),
             "  default_provider  anthropic".to_string(),
             "UPSTREAMS".to_string(),
+            "  + add upstream".to_string(),
             "MODELS".to_string(),
+            "  + add model".to_string(),
             "ROUTES".to_string(),
             "  ▶ 2  … → abcdefghijklmnopqrstuvwxyz0123456789ABCD…".to_string(),
+            "  + add route".to_string(),
         ],
         "the crowded-out model keeps a `…` and the provider shrinks by one more cell"
     );
@@ -5450,9 +5916,12 @@ fn the_shunt_config_marks_an_absent_crowded_route_model_with_an_em_dash() {
             "  bind              127.0.0.1:3001".to_string(),
             "  default_provider  anthropic".to_string(),
             "UPSTREAMS".to_string(),
+            "  + add upstream".to_string(),
             "MODELS".to_string(),
+            "  + add model".to_string(),
             "ROUTES".to_string(),
             "  ▶ 2  — → abcdefghijklmnopqrstuvwxyz0123456789ABCD…".to_string(),
+            "  + add route".to_string(),
         ],
         "an absent model keeps its `—` when the provider crowds it out"
     );
@@ -5474,8 +5943,11 @@ fn the_shunt_config_ellipsizes_the_bind_suffix_at_a_narrow_width() {
             "  bind              127.0.0.1:3001  set by SHUNT_SE…".to_string(),
             "  default_provider  anthropic".to_string(),
             "UPSTREAMS".to_string(),
+            "  + add upstream".to_string(),
             "MODELS".to_string(),
+            "  + add model".to_string(),
             "ROUTES".to_string(),
+            "  + add route".to_string(),
         ],
         "the set-by suffix ellipsizes within the pane"
     );
@@ -5488,8 +5960,11 @@ fn the_shunt_config_ellipsizes_the_bind_suffix_at_a_narrow_width() {
             "  bind              127.0.0.1:3001  env file not re…".to_string(),
             "  default_provider  anthropic".to_string(),
             "UPSTREAMS".to_string(),
+            "  + add upstream".to_string(),
             "MODELS".to_string(),
+            "  + add model".to_string(),
             "ROUTES".to_string(),
+            "  + add route".to_string(),
         ],
         "the env-file suffix ellipsizes within the pane"
     );
@@ -5503,8 +5978,11 @@ fn the_shunt_config_ellipsizes_the_bind_suffix_at_a_narrow_width() {
             "  bind              0123456789abcdef0123456789abcde…".to_string(),
             "  default_provider  anthropic".to_string(),
             "UPSTREAMS".to_string(),
+            "  + add upstream".to_string(),
             "MODELS".to_string(),
+            "  + add model".to_string(),
             "ROUTES".to_string(),
+            "  + add route".to_string(),
         ],
         "an overflowing value ellipsizes and the suffix drops whole"
     );
@@ -5646,8 +6124,10 @@ fn the_shunt_config_legacy_form_hides_populated_upstreams() {
             "  providers         anthropic",
             "  └ [providers.*] form; convert to [[upstreams]] by hand to edit",
             "MODELS",
+            "  + add model",
             "ROUTES",
             "  ▶ 1  opus → anthropic",
+            "  + add route",
         ],
     );
     assert!(matches!(
@@ -5656,4 +6136,387 @@ fn the_shunt_config_legacy_form_hides_populated_upstreams() {
             key: ShuntEntryKey::Route(1)
         }]
     ));
+}
+
+/// The add/save/remove footer hints derive from the row's state: `+ add` reads
+/// `add` closed and `collapse` open (folding drops the draft); `save`/`remove`
+/// read `save`/`remove` at rest and shed them while their save checks — the
+/// same predicate their handlers gate on.
+#[test]
+fn the_add_save_remove_footer_hints_derive_from_state() {
+    use crate::tui::app::{ServicesFocus, ShuntAddKind, ShuntFocusLine, ShuntSave, ShuntSaveKey};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // `+ add` closed.
+    let view = base_view();
+    let mut app = config_draft_app(
+        view,
+        std::collections::HashSet::new(),
+        ShuntDrafts::default(),
+    );
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Add(ShuntAddKind::Upstream)));
+    assert_eq!(
+        super::super::footer::services_hints(&app),
+        vec![
+            ("↑↓", "row"),
+            ("r", "refresh"),
+            ("space/↵", "add"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "`+ add` closed reads add"
+    );
+
+    // `+ add` open, `save` at rest, `save` saving — all on one open-draft app.
+    let view = base_view();
+    let mut app = config_draft_app(
+        view,
+        std::collections::HashSet::new(),
+        ShuntDrafts {
+            upstream: Some(crate::tui::app::UpstreamDraft::default()),
+            ..ShuntDrafts::default()
+        },
+    );
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Add(ShuntAddKind::Upstream)));
+    assert_eq!(
+        super::super::footer::services_hints(&app),
+        vec![
+            ("↑↓", "row"),
+            ("r", "refresh"),
+            ("space/↵", "collapse"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "`+ add` open reads collapse"
+    );
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream)));
+    assert_eq!(
+        super::super::footer::services_hints(&app),
+        vec![
+            ("↑↓", "row"),
+            ("r", "refresh"),
+            ("↵", "save"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "`save` at rest reads save"
+    );
+    app.services.shunt_save = Some(ShuntSave {
+        key: ShuntSaveKey::SaveAdd(ShuntAddKind::Upstream),
+        started: std::time::Instant::now(),
+        value: None,
+        entry: None,
+    });
+    assert_eq!(
+        super::super::footer::services_hints(&app),
+        vec![
+            ("↑↓", "row"),
+            ("r", "refresh"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "a saving `save` row offers no `↵ save`"
+    );
+
+    // `+ add` while its draft saves: the row is locked, so it sheds its
+    // `space/↵` hint too (nothing it advertises acts). B's P2-B4 plant reds
+    // this leg.
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Add(ShuntAddKind::Upstream)));
+    assert_eq!(
+        super::super::footer::services_hints(&app),
+        vec![
+            ("↑↓", "row"),
+            ("r", "refresh"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "a saving `+ add` row offers no `space/↵`"
+    );
+}
+
+/// The add/save/remove footer hints: the `remove <kind>` row reads `↵ remove`
+/// at rest and sheds it while its remove checks.
+#[test]
+fn the_remove_footer_hint_derives_from_state() {
+    use crate::tui::app::{ServicesFocus, ShuntFocusLine, ShuntSave, ShuntSaveKey};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![shorthand_up("a", "api_key")];
+    let entry = ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    };
+    let expanded = std::collections::HashSet::from([entry.clone()]);
+    let mut app = config_view_app(view, expanded);
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Remove(entry.clone())));
+    assert_eq!(
+        super::super::footer::services_hints(&app),
+        vec![
+            ("↑↓", "row"),
+            ("r", "refresh"),
+            ("↵", "remove"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "`remove` at rest reads remove"
+    );
+    app.services.shunt_save = Some(ShuntSave {
+        key: ShuntSaveKey::Remove(entry.clone()),
+        started: std::time::Instant::now(),
+        value: None,
+        entry: None,
+    });
+    assert_eq!(
+        super::super::footer::services_hints(&app),
+        vec![
+            ("↑↓", "row"),
+            ("r", "refresh"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "a saving `remove` row offers no `↵ remove`"
+    );
+
+    // The locked entry row (F-B1): while its remove checks, the entry's own
+    // row sheds `space/↵ collapse|expand` — it advertises no key the lock
+    // ignores. B's PB2-F1 plant reds this.
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Entry(entry)));
+    assert_eq!(
+        super::super::footer::services_hints(&app),
+        vec![
+            ("↑↓", "row"),
+            ("r", "refresh"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "a removing entry's own row offers no `space/↵`"
+    );
+}
+
+/// A saving `remove <kind>` row shows the C2 saving shape — the spinner, the
+/// shimmer crest over its label and a dim `checking` trail — like `save
+/// <kind>`.
+#[test]
+fn the_shunt_config_renders_a_saving_remove_row() {
+    use crate::tui::app::{ShuntSave, ShuntSaveKey};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.upstreams = vec![shorthand_up("a", "api_key")];
+    let entry = ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    };
+    let expanded = std::collections::HashSet::from([entry.clone()]);
+    let mut app = config_view_app(view, expanded);
+    app.tick_count = 0;
+    app.services.shunt_save = Some(ShuntSave {
+        key: ShuntSaveKey::Remove(entry),
+        started: std::time::Instant::now(),
+        value: None,
+        entry: None,
+    });
+    let rows = render_app_config_rows(&app);
+    let remove_row = rows
+        .iter()
+        .find(|r| r.contains("remove upstream"))
+        .unwrap_or_else(|| panic!("no remove row:\n{}", rows.join("\n")));
+    assert_eq!(
+        remove_row, "⠋   remove upstream  checking",
+        "the saving remove row shows spinner + shimmer + checking"
+    );
+}
+
+/// The `+ add` row's label is ACCENT (the Master-detail `+ new` rule), never
+/// the blurred field label's dim — B's P-B5 plant (label_style) reds this.
+#[test]
+fn the_add_row_label_is_accent() {
+    use crate::tui::app::ShuntAddKind;
+    let _home = crate::testutil::HomeSandbox::new();
+    let view = base_view();
+    let app = config_draft_app(
+        view,
+        std::collections::HashSet::new(),
+        ShuntDrafts::default(),
+    );
+    let line = super::add_line(ShuntAddKind::Upstream, false, &app);
+    assert_eq!(
+        line.spans[1].style.fg,
+        crate::tui::theme::accent().fg,
+        "the `+ add` label is ACCENT, not the field label's dim"
+    );
+}
+
+/// A saving `save <kind>` row shimmers its label into per-character spans at
+/// the full tier (the crest moves across the name) — B's P-B4 plant (a static
+/// accent label) reds this.
+#[test]
+fn the_saving_save_row_label_shimmers_into_per_char_spans() {
+    use crate::tui::app::{ShuntAddKind, ShuntSave, ShuntSaveKey};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let view = base_view();
+    let drafts = ShuntDrafts {
+        upstream: Some(crate::tui::app::UpstreamDraft::default()),
+        ..ShuntDrafts::default()
+    };
+    let mut app = config_draft_app(view, std::collections::HashSet::new(), drafts);
+    app.services.shunt_save = Some(ShuntSave {
+        key: ShuntSaveKey::SaveAdd(ShuntAddKind::Upstream),
+        started: std::time::Instant::now() - std::time::Duration::from_millis(450),
+        value: None,
+        entry: None,
+    });
+    let rows = super::save_add_lines(ShuntAddKind::Upstream, false, &app, W as usize);
+    let label_spans = rows[0].spans.len();
+    assert!(
+        label_spans > 5,
+        "the shimmer splits the label into per-char spans, got {label_spans}"
+    );
+}
+
+/// Ruling 9 (B-M-B2): the group eyebrow stays dim + bold + underlined while
+/// the focus rests on its `+ add`, `save` or `remove` row, the way it does on
+/// an entry or field. B's P2-B2 plant (dropping the `Add`/`SaveAdd`/`Remove`
+/// arms in `focused_group`) reds this.
+#[test]
+fn the_group_eyebrow_stays_underlined_on_the_add_save_and_remove_rows() {
+    use crate::tui::app::{
+        ServicesFocus, ShuntAddKind, ShuntDrafts, ShuntFocusLine, UpstreamDraft,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // `+ add upstream` focused (draft closed).
+    let mut app = config_draft_app(
+        base_view(),
+        std::collections::HashSet::new(),
+        ShuntDrafts::default(),
+    );
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Add(ShuntAddKind::Upstream)));
+    assert_upstreams_eyebrow_underlined(&app);
+
+    // `save upstream` focused (draft open).
+    let mut app = config_draft_app(
+        base_view(),
+        std::collections::HashSet::new(),
+        ShuntDrafts {
+            upstream: Some(UpstreamDraft::default()),
+            ..ShuntDrafts::default()
+        },
+    );
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream)));
+    assert_upstreams_eyebrow_underlined(&app);
+
+    // `remove upstream` focused (entry expanded).
+    let mut view = base_view();
+    view.upstreams = vec![shorthand_up("a", "api_key")];
+    let entry = ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    };
+    let mut app = config_view_app(view, std::collections::HashSet::from([entry.clone()]));
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Remove(entry)));
+    assert_upstreams_eyebrow_underlined(&app);
+}
+
+/// Render `app` and assert every `UPSTREAMS` eyebrow cell is dim + bold +
+/// underlined (the focused group's cue).
+fn assert_upstreams_eyebrow_underlined(app: &App) {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let eyebrow = crate::testutil::needle_cells(&buf, "UPSTREAMS").expect("UPSTREAMS eyebrow");
+    for cell in &eyebrow {
+        assert_eq!(
+            cell.fg,
+            super::theme::text_dim_color(),
+            "the focused group's eyebrow is dim"
+        );
+        assert!(
+            cell.modifier.contains(ratatui::style::Modifier::BOLD),
+            "the focused group's eyebrow is bold"
+        );
+        assert!(
+            cell.modifier.contains(ratatui::style::Modifier::UNDERLINED),
+            "the focused group's eyebrow is underlined"
+        );
+    }
+}
+
+/// Ruling 8 (B-M-B3): the `save <kind>` row takes the `create account`
+/// treatment (ACCENT, bold while selected) and the `remove <kind>` row the
+/// `delete account` treatment (DANGER, bold). B's P2-B3 plant (both to
+/// `label_style`) reds this.
+#[test]
+fn the_save_and_remove_rows_take_the_house_colours() {
+    use crate::tui::app::{ShuntAddKind, ShuntDrafts, UpstreamDraft};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let drafts = ShuntDrafts {
+        upstream: Some(UpstreamDraft::default()),
+        ..ShuntDrafts::default()
+    };
+    let app = config_draft_app(base_view(), std::collections::HashSet::new(), drafts);
+
+    let selected = super::save_add_lines(ShuntAddKind::Upstream, true, &app, W as usize);
+    assert_eq!(
+        selected[0].spans[2].style.fg,
+        crate::tui::theme::accent().fg,
+        "the `save` label is ACCENT"
+    );
+    assert!(
+        selected[0].spans[2]
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD),
+        "the selected `save` label is bold"
+    );
+    let blurred = super::save_add_lines(ShuntAddKind::Upstream, false, &app, W as usize);
+    assert_eq!(
+        blurred[0].spans[2].style.fg,
+        crate::tui::theme::accent().fg,
+        "the blurred `save` label stays ACCENT"
+    );
+    assert!(
+        !blurred[0].spans[2]
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD),
+        "the blurred `save` label is not bold"
+    );
+
+    let mut view = base_view();
+    view.upstreams = vec![shorthand_up("a", "api_key")];
+    let entry = ShuntEntryKey::Upstream {
+        name: "a".into(),
+        occurrence: 0,
+    };
+    let app = config_view_app(view, std::collections::HashSet::from([entry.clone()]));
+    let remove = super::remove_lines(&entry, true, &app, W as usize);
+    assert_eq!(
+        remove[0].spans[2].style.fg,
+        crate::tui::theme::danger().fg,
+        "the `remove` label is DANGER"
+    );
+    assert!(
+        remove[0].spans[2]
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD),
+        "the `remove` label is bold at rest"
+    );
 }

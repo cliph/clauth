@@ -943,6 +943,15 @@ pub(crate) enum ConfirmAction {
         key: ShuntFieldKey,
         edit: Box<crate::gateway_edit::Edit>,
     },
+    /// `remove upstream|model|route …?`'s `remove`: run the entry's remove
+    /// through the save worker. The edit is built when the confirm OPENS (the
+    /// entry as it reads then, a route's `RouteView` included), so confirming
+    /// runs that edit — never a lookup by position at confirm time. A route the
+    /// shift moved under it then refuses through the engine's `EntryChanged`.
+    RemoveEntry {
+        key: ShuntEntryKey,
+        edit: Box<crate::gateway_edit::Edit>,
+    },
 }
 
 /// One-field name prompt shared by the Setup menu's two naming actions. The
@@ -1797,29 +1806,43 @@ pub(crate) enum ShuntFocus {
     /// A config-section field row (an editable `key value` line, or a cycle
     /// row), whose `↵` opens it and `space` cycles a cycle row.
     Field { key: ShuntFieldKey },
+    /// A `+ add <kind>` action row ending its group, whose `↵`/`space` opens
+    /// (or folds) that kind's blank draft in place.
+    Add { kind: ShuntAddKind },
+    /// The `save <kind>` row of an open draft, whose `↵` runs the add.
+    SaveAdd { kind: ShuntAddKind },
+    /// The `remove <kind>` row ending an expanded entry, whose `↵` opens the
+    /// remove confirm.
+    Remove { key: ShuntEntryKey },
 }
 
 impl ShuntFocus {
-    /// The detail-line index the focusable sits on; `None` on a config entry
-    /// row, which has no `Check::detail` line.
+    /// The detail-line index the focusable sits on; `None` on a config row,
+    /// which has no `Check::detail` line.
     pub(crate) fn line(&self) -> Option<usize> {
         match self {
             ShuntFocus::Fix { line, .. }
             | ShuntFocus::Enabled { line }
             | ShuntFocus::CheckOutput { line } => Some(*line),
-            ShuntFocus::Entry { .. } | ShuntFocus::Field { .. } => None,
+            ShuntFocus::Entry { .. }
+            | ShuntFocus::Field { .. }
+            | ShuntFocus::Add { .. }
+            | ShuntFocus::SaveAdd { .. }
+            | ShuntFocus::Remove { .. } => None,
         }
     }
 
-    /// The fix this line applies, `None` on the `enabled`, `check output` and
-    /// config entry/field rows.
+    /// The fix this line applies, `None` on every config-section row.
     pub(crate) fn fix(&self) -> Option<&ServiceFix> {
         match self {
             ShuntFocus::Fix { fix, .. } => Some(fix),
             ShuntFocus::Enabled { .. }
             | ShuntFocus::CheckOutput { .. }
             | ShuntFocus::Entry { .. }
-            | ShuntFocus::Field { .. } => None,
+            | ShuntFocus::Field { .. }
+            | ShuntFocus::Add { .. }
+            | ShuntFocus::SaveAdd { .. }
+            | ShuntFocus::Remove { .. } => None,
         }
     }
 
@@ -1830,6 +1853,9 @@ impl ShuntFocus {
             ShuntFocus::CheckOutput { .. } => ShuntFocusLine::CheckOutput,
             ShuntFocus::Entry { key } => ShuntFocusLine::Entry(key.clone()),
             ShuntFocus::Field { key } => ShuntFocusLine::Field(key.clone()),
+            ShuntFocus::Add { kind } => ShuntFocusLine::Add(*kind),
+            ShuntFocus::SaveAdd { kind } => ShuntFocusLine::SaveAdd(*kind),
+            ShuntFocus::Remove { key } => ShuntFocusLine::Remove(key.clone()),
             ShuntFocus::Fix {
                 fix: ServiceFix::AdoptConfig(_),
                 ..
@@ -1870,6 +1896,12 @@ pub(crate) enum ShuntFocusLine {
     Entry(ShuntEntryKey),
     /// A config-section field row, by its `(entry, field)` identity.
     Field(ShuntFieldKey),
+    /// A `+ add <kind>` row, by its kind.
+    Add(ShuntAddKind),
+    /// The `save <kind>` row of an open draft, by its kind.
+    SaveAdd(ShuntAddKind),
+    /// A `remove <kind>` row, by its entry's identity.
+    Remove(ShuntEntryKey),
 }
 
 /// A config-section entry's identity: the group (the variant) plus the
@@ -1916,6 +1948,11 @@ pub(crate) enum ShuntFieldKey {
         position: usize,
         field: RouteFieldKind,
     },
+    /// A field of an open add form's draft (keyed by the kind and its field).
+    Draft {
+        kind: ShuntAddKind,
+        field: ShuntDraftField,
+    },
 }
 
 /// A field of an expanded upstream row.
@@ -1953,6 +1990,203 @@ pub(crate) enum RouteFieldKind {
     ServiceTier,
 }
 
+/// The kind of a `+ add` form on the shunt card's config section (and its
+/// `save <kind>` row): one of the three editable groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ShuntAddKind {
+    Upstream,
+    Model,
+    Route,
+}
+
+impl ShuntAddKind {
+    /// The kind word every approved copy spells: `upstream` / `model` / `route`.
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            ShuntAddKind::Upstream => "upstream",
+            ShuntAddKind::Model => "model",
+            ShuntAddKind::Route => "route",
+        }
+    }
+
+    /// The `+ add <kind>` row's label.
+    pub(crate) fn add_label(self) -> String {
+        format!("+ add {}", self.word())
+    }
+
+    /// The `save <kind>` row's label.
+    pub(crate) fn save_label(self) -> String {
+        format!("save {}", self.word())
+    }
+
+    /// The `remove <kind>` row's label.
+    pub(crate) fn remove_label(self) -> String {
+        format!("remove {}", self.word())
+    }
+
+    /// The config-section group index of this kind, in the card's order
+    /// (SERVER, UPSTREAMS, MODELS, ROUTES).
+    pub(crate) fn group(self) -> usize {
+        match self {
+            ShuntAddKind::Upstream => 1,
+            ShuntAddKind::Model => 2,
+            ShuntAddKind::Route => 3,
+        }
+    }
+}
+
+/// A field of an open add form's draft, keyed by the kind and the field
+/// within it. It reuses the entry field-kind enums: the upstream draft's
+/// fields are [`UpstreamFieldKind`]'s, the model draft's [`ModelFieldKind`]'s,
+/// the route draft's [`RouteFieldKind`]'s.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ShuntDraftField {
+    Upstream(UpstreamFieldKind),
+    Model(ModelFieldKind),
+    Route(RouteFieldKind),
+}
+
+/// The open add form's committed draft for one upstream: every value is the
+/// typed (or picked) value, `None` = unset (renders `—` and is left out of
+/// the add). A draft commit lands here, in memory, never in the file; only
+/// `save upstream` writes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct UpstreamDraft {
+    pub(crate) name: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) kind: Option<String>,
+    pub(crate) base_url: Option<String>,
+    pub(crate) auth_mode: Option<String>,
+    pub(crate) account: Option<String>,
+    /// The comma-separated account names, exactly as the accounts row parses
+    /// them.
+    pub(crate) accounts: Option<String>,
+    pub(crate) env: Option<String>,
+    pub(crate) header: Option<String>,
+    pub(crate) effort: Option<String>,
+    pub(crate) service_tier: Option<String>,
+    /// A refusal rendered on the `└` line under `save upstream` (a required
+    /// field left blank, or the engine's own sentence).
+    pub(crate) refusal: Option<String>,
+}
+
+/// The open add form's committed draft for one model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ModelDraft {
+    pub(crate) id: Option<String>,
+    pub(crate) display_name: Option<String>,
+    /// Provider name → model slug; `None` = blank (left out of the add). The
+    /// rows derive from the config's current provider list; a committed value
+    /// is looked up by provider name here.
+    pub(crate) upstream_model: Vec<(String, Option<String>)>,
+    /// A refusal rendered on the `└` line under `save model`.
+    pub(crate) refusal: Option<String>,
+}
+
+/// The open add form's committed draft for one route.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RouteDraft {
+    pub(crate) model: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) upstream_model: Option<String>,
+    pub(crate) effort: Option<String>,
+    pub(crate) service_tier: Option<String>,
+    /// A refusal rendered on the `└` line under `save route`.
+    pub(crate) refusal: Option<String>,
+}
+
+/// The open add forms: at most one draft per kind, each surviving the card's
+/// recompute and any other row's save.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ShuntDrafts {
+    pub(crate) upstream: Option<UpstreamDraft>,
+    pub(crate) model: Option<ModelDraft>,
+    pub(crate) route: Option<RouteDraft>,
+}
+
+impl ShuntDrafts {
+    /// Whether the `+ add <kind>` draft is open.
+    pub(crate) fn is_open(&self, kind: ShuntAddKind) -> bool {
+        match kind {
+            ShuntAddKind::Upstream => self.upstream.is_some(),
+            ShuntAddKind::Model => self.model.is_some(),
+            ShuntAddKind::Route => self.route.is_some(),
+        }
+    }
+
+    /// Open (or reseed) the `+ add <kind>` draft in place, dropping any
+    /// committed values and refusal from a previous open of the same kind. A
+    /// model draft's `upstream_model` rows derive from the config's current
+    /// provider list at render and save time, so opening it seeds nothing.
+    pub(crate) fn open(&mut self, kind: ShuntAddKind) {
+        match kind {
+            ShuntAddKind::Upstream => self.upstream = Some(UpstreamDraft::default()),
+            ShuntAddKind::Model => self.model = Some(ModelDraft::default()),
+            ShuntAddKind::Route => self.route = Some(RouteDraft::default()),
+        }
+    }
+
+    /// Fold (close) the `+ add <kind>` draft, dropping it and its refusal.
+    pub(crate) fn fold(&mut self, kind: ShuntAddKind) {
+        match kind {
+            ShuntAddKind::Upstream => self.upstream = None,
+            ShuntAddKind::Model => self.model = None,
+            ShuntAddKind::Route => self.route = None,
+        }
+    }
+
+    /// The refusal under the `save <kind>` row, if one shows.
+    pub(crate) fn refusal(&self, kind: ShuntAddKind) -> Option<&str> {
+        match kind {
+            ShuntAddKind::Upstream => self.upstream.as_ref().and_then(|d| d.refusal.as_deref()),
+            ShuntAddKind::Model => self.model.as_ref().and_then(|d| d.refusal.as_deref()),
+            ShuntAddKind::Route => self.route.as_ref().and_then(|d| d.refusal.as_deref()),
+        }
+    }
+
+    /// Set the refusal under the `save <kind>` row.
+    pub(crate) fn set_refusal(&mut self, kind: ShuntAddKind, sentence: String) {
+        match kind {
+            ShuntAddKind::Upstream => {
+                if let Some(draft) = &mut self.upstream {
+                    draft.refusal = Some(sentence);
+                }
+            }
+            ShuntAddKind::Model => {
+                if let Some(draft) = &mut self.model {
+                    draft.refusal = Some(sentence);
+                }
+            }
+            ShuntAddKind::Route => {
+                if let Some(draft) = &mut self.route {
+                    draft.refusal = Some(sentence);
+                }
+            }
+        }
+    }
+
+    /// Clear the refusal under the `save <kind>` row of `kind`.
+    pub(crate) fn clear_refusal(&mut self, kind: ShuntAddKind) {
+        match kind {
+            ShuntAddKind::Upstream => {
+                if let Some(draft) = &mut self.upstream {
+                    draft.refusal = None;
+                }
+            }
+            ShuntAddKind::Model => {
+                if let Some(draft) = &mut self.model {
+                    draft.refusal = None;
+                }
+            }
+            ShuntAddKind::Route => {
+                if let Some(draft) = &mut self.route {
+                    draft.refusal = None;
+                }
+            }
+        }
+    }
+}
+
 /// The shunt card's open field editor (or a cycle row's pending pick). `None`
 /// at rest, when a field row shows `❯` + its value.
 #[derive(Debug, Clone)]
@@ -1974,16 +2208,40 @@ pub(crate) enum ShuntFieldEdit {
     },
 }
 
-/// One field save in flight: the row's key (so the render spinner/shimmer the
+/// The row a config save is keyed by: a field row, a `save <kind>` row, or a
+/// `remove <kind>` row. The one [`ServicesState::saving`] predicate reads it,
+/// so the spinner, the lock and every footer hint can never disagree about
+/// which row is busy.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ShuntSaveKey {
+    Field(ShuntFieldKey),
+    SaveAdd(ShuntAddKind),
+    Remove(ShuntEntryKey),
+}
+
+/// The row whose caret slot shows the `SUCCESS` `✓` after a successful save:
+/// a field row, or an entry row (an add's new entry).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ShuntOkKey {
+    Field(ShuntFieldKey),
+    Entry(ShuntEntryKey),
+}
+
+/// One config save in flight: the row's key (so the render spinner/shimmer the
 /// right row) and when it started (the `✓` holds for about a second).
 #[derive(Debug, Clone)]
 pub(crate) struct ShuntSave {
-    pub(crate) key: ShuntFieldKey,
+    pub(crate) key: ShuntSaveKey,
     pub(crate) started: std::time::Instant,
     /// The value being saved (`None` = unset), which the saving row renders
     /// under the shimmer crest (the editor stays open with the typed text, but
     /// the row shows the value the save checks).
     pub(crate) value: Option<String>,
+    /// The entry a `save <kind>` lands under, fixed when the save STARTS from
+    /// the `Edit` being saved (the new name/id, or the route's position in the
+    /// pre-save view). The outcome drain reads this, never the draft or the
+    /// live view, so a fold or a recompute mid-check cannot move the `✓`.
+    pub(crate) entry: Option<ShuntEntryKey>,
 }
 
 /// The shunt card's open field editor: which field, its edit state, and a
@@ -1994,6 +2252,19 @@ pub(crate) struct ShuntFieldEditState {
     pub(crate) key: ShuntFieldKey,
     pub(crate) edit: ShuntFieldEdit,
     pub(crate) refusal: Option<String>,
+}
+
+/// A remove's `EditRefusal`, rendered on the `└` line under the entry's
+/// `remove <kind>` row while the entry is still expanded. It retires when
+/// focus leaves the row, when the entry collapses, or when a recompute reads a
+/// view that differs from the one it was raised on (a hand-edit).
+#[derive(Debug, Clone)]
+pub(crate) struct ShuntRemoveRefusal {
+    pub(crate) key: ShuntEntryKey,
+    pub(crate) sentence: String,
+    /// The config view the refusal was raised on, so a recompute whose view
+    /// differs retires it.
+    pub(crate) view: Box<crate::gateway_edit::ConfigView>,
 }
 
 /// How long a field's caret slot shows the `SUCCESS` `✓` after its save lands.
@@ -2217,13 +2488,14 @@ pub(crate) enum ShuntActionJob {
     Hold,
     /// `start shunt` on a held gateway: remove the hold.
     RemoveHold,
-    /// Save one config field through the E1 engine (`apply_edit`), off the UI
-    /// thread. `key` rides back in the outcome so the row can spinner/`✓` it;
-    /// `confirmed` names a save that went through the `restart shunt?` confirm.
+    /// Save one config row (a field, a `save <kind>`, or a `remove <kind>`)
+    /// through the E1 engine (`apply_edit`), off the UI thread. `key` rides
+    /// back in the outcome so the row can spinner/`✓` it; `confirmed` names a
+    /// save that went through the `restart shunt?` confirm.
     ConfigEdit {
         record: crate::gateway::GatewayRecord,
         edit: Box<crate::gateway_edit::Edit>,
-        key: ShuntFieldKey,
+        key: ShuntSaveKey,
         confirmed: bool,
     },
 }
@@ -2281,22 +2553,22 @@ pub(crate) enum ShuntActionOutcome {
     /// recompute so the card reads the record's real state.
     #[default]
     NoOp,
-    /// A config field save landed: the `✓` shows on the row, and (for a
-    /// confirmed written bind) the restart toast. `value` is what was saved
-    /// (`None` = unset, the bind for the restart toast); `restart_only` names
-    /// a bind save; `confirmed` says it went through the restart confirm.
+    /// A config save landed: the `✓` shows on the row, and (for a confirmed
+    /// written bind) the restart toast. `value` is what was saved (`None` =
+    /// unset, the bind for the restart toast); `restart_only` names a bind
+    /// save; `confirmed` says it went through the restart confirm.
     ConfigSaved {
-        key: ShuntFieldKey,
+        key: ShuntSaveKey,
         written: bool,
         restart_only: bool,
         value: Option<String>,
         confirmed: bool,
     },
     /// The engine refused the edit on the input or the file's shape: its own
-    /// sentence renders on the `└` DANGER line under the field, the editor
-    /// kept open.
+    /// sentence renders on the `└` DANGER line under the row (the field's, the
+    /// `save <kind>`'s or the `remove <kind>`'s), the draft/editor kept open.
     ConfigRefused {
-        key: ShuntFieldKey,
+        key: ShuntSaveKey,
         sentence: String,
     },
     /// `shunt check` (or the landing) refused: the compact detail line and the
@@ -2436,7 +2708,15 @@ pub(crate) struct ServicesState {
     pub(crate) shunt_save: Option<ShuntSave>,
     /// The field whose save just landed and when — its caret slot shows `✓`
     /// for about a second, then the normal caret.
-    pub(crate) shunt_ok: Option<(ShuntFieldKey, Instant)>,
+    pub(crate) shunt_ok: Option<(ShuntOkKey, Instant)>,
+    /// The open add forms (at most one per kind), each surviving the card's
+    /// recompute and any other row's save.
+    pub(crate) shunt_drafts: ShuntDrafts,
+    /// A remove's `EditRefusal`, rendered on the `└` line under the entry's
+    /// `remove <kind>` row while the entry is still expanded. RefCell so the
+    /// focus setter (which takes `&self`, the render's contract) can retire it
+    /// the moment focus leaves the remove row.
+    pub(crate) shunt_remove_refusal: std::cell::RefCell<Option<ShuntRemoveRefusal>>,
     /// The cached standalone-store move plan (`None` = not yet planned). The
     /// plan runs on a worker — it spawns `ps`/`powershell` on macOS/Windows —
     /// on tab entry, on `r`, and after any shunt-card action lands.
@@ -2555,6 +2835,8 @@ impl Default for ServicesState {
             shunt_field_edit: None,
             shunt_save: None,
             shunt_ok: None,
+            shunt_drafts: ShuntDrafts::default(),
+            shunt_remove_refusal: std::cell::RefCell::new(None),
             move_plan: None,
             move_plan_probe: ProbeWorker::new(move_plan_probe),
             admin_need: None,
@@ -2646,7 +2928,7 @@ impl ServicesState {
     /// The one predicate every render, key-handler and footer site reads, so a
     /// hint, a spinner, the editor lock and a re-open guard can never disagree
     /// about which row is busy.
-    pub(crate) fn saving(&self, key: &ShuntFieldKey) -> bool {
+    pub(crate) fn saving(&self, key: &ShuntSaveKey) -> bool {
         self.shunt_save.as_ref().is_some_and(|s| s.key == *key)
     }
 
@@ -2655,9 +2937,21 @@ impl ServicesState {
         self.shunt_focus.borrow().clone()
     }
 
-    /// Set the held focus identity.
+    /// Set the held focus identity. The moment focus leaves a remove row, that
+    /// row's refusal retires (its sentence names a comment only meaningful
+    /// while the user still sits on the row that raised it).
     pub(crate) fn set_shunt_focus(&self, kind: Option<ShuntFocusLine>) {
-        self.shunt_focus.replace(kind);
+        self.shunt_focus.replace(kind.clone());
+        let left_row = self
+            .shunt_remove_refusal
+            .borrow()
+            .as_ref()
+            .is_some_and(|refusal| {
+                kind.as_ref() != Some(&ShuntFocusLine::Remove(refusal.key.clone()))
+            });
+        if left_row {
+            self.shunt_remove_refusal.take();
+        }
     }
 
     /// The descend rule applied where the geometry is published: the render
@@ -4629,7 +4923,7 @@ impl KeyOwner {
                 .services
                 .shunt_field_edit
                 .as_ref()
-                .is_some_and(|state| app.services.saving(&state.key))
+                .is_some_and(|state| app.services.saving(&ShuntSaveKey::Field(state.key.clone())))
             && matches!(code, KeyCode::Char('?' | 'x'))
         {
             return false;
@@ -5736,6 +6030,12 @@ fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
                 let key = key.clone();
                 open_shunt_field_editor(app, &key);
             }
+            Some(ShuntFocus::Add { kind }) => toggle_shunt_add(app, *kind),
+            Some(ShuntFocus::SaveAdd { kind }) => commit_shunt_add(app, *kind),
+            Some(ShuntFocus::Remove { key }) => {
+                let key = key.clone();
+                confirm_shunt_remove(app, &key);
+            }
             Some(ShuntFocus::Fix { .. }) | None => {}
         },
         KeyCode::Char(' ') => match app.services.focused_shunt_focus() {
@@ -5755,6 +6055,8 @@ fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
                     open_shunt_field_editor(app, &key);
                 }
             }
+            Some(ShuntFocus::Add { kind }) => toggle_shunt_add(app, *kind),
+            Some(ShuntFocus::SaveAdd { .. }) | Some(ShuntFocus::Remove { .. }) => {}
             Some(ShuntFocus::Fix { .. }) | None => {}
         },
         _ => {}
@@ -5984,10 +6286,31 @@ fn toggle_shunt_enabled(app: &mut App) {
 /// recompute prunes an expanded key whose entry left the config, so a key
 /// re-appearing after an edit arrives collapsed.
 fn toggle_shunt_entry(app: &mut App, key: &ShuntEntryKey) {
+    // A locked remove ignores expand/collapse (ruling 2): the entry's rows are
+    // inert while its `remove <kind>` checks.
+    if app.services.saving(&ShuntSaveKey::Remove(key.clone())) {
+        return;
+    }
     if !app.services.shunt_expanded.remove(key) {
         app.services.shunt_expanded.insert(key.clone());
+    } else {
+        // Collapsing an entry retires a refusal on its remove row.
+        retire_remove_refusal(app, key);
     }
     rebuild_shunt_config_stops(app);
+}
+
+/// Retire a remove refusal whose entry is `key` (a collapse), if one shows.
+fn retire_remove_refusal(app: &mut App, key: &ShuntEntryKey) {
+    if app
+        .services
+        .shunt_remove_refusal
+        .borrow()
+        .as_ref()
+        .is_some_and(|refusal| refusal.key == *key)
+    {
+        app.services.shunt_remove_refusal.take();
+    }
 }
 
 /// Re-derive the card's cached config stops in the same call that changed the
@@ -5996,9 +6319,13 @@ fn toggle_shunt_entry(app: &mut App, key: &ShuntEntryKey) {
 /// The action-section stops (every stop with a detail line) are kept; the
 /// config section is replaced from the one row model.
 fn rebuild_shunt_config_stops(app: &mut App) {
-    let Some(stops) =
-        config_view(app).map(|view| config_field_stops(view, &app.services.shunt_expanded))
-    else {
+    let Some(stops) = config_view(app).map(|view| {
+        config_field_stops(
+            view,
+            &app.services.shunt_expanded,
+            &app.services.shunt_drafts,
+        )
+    }) else {
         return;
     };
     let Some(check) = app.services.checks.iter_mut().find(|c| c.label == "shunt") else {
@@ -6014,12 +6341,268 @@ fn rebuild_shunt_config_stops(app: &mut App) {
     check.shunt_focus.extend(stops);
 }
 
+// ── add and remove rows ─────────────────────────────────────────────────────
+
+/// `↵`/`space` on `+ add <kind>`: open the blank draft in place, or fold it
+/// when it is already open (the Setup `+ new` form's precedent, which `esc` at
+/// rest on a draft row follows too). Focus stays on the `+ add` row.
+fn toggle_shunt_add(app: &mut App, kind: ShuntAddKind) {
+    // A locked draft ignores fold (ruling 2): `↵`/`space` on `+ add <kind>` are
+    // inert while its `save <kind>` checks.
+    if app.services.saving(&ShuntSaveKey::SaveAdd(kind)) {
+        return;
+    }
+    let was_open = app.services.shunt_drafts.is_open(kind);
+    if was_open {
+        app.services.shunt_drafts.fold(kind);
+    } else {
+        app.services.shunt_drafts.open(kind);
+    }
+    // A folded draft closes its field editor too (a draft field's included).
+    if was_open
+        && let Some(state) = &app.services.shunt_field_edit
+        && let ShuntFieldKey::Draft {
+            kind: state_kind, ..
+        } = state.key
+        && state_kind == kind
+    {
+        app.services.shunt_field_edit = None;
+    }
+    rebuild_shunt_config_stops(app);
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Add(kind)));
+}
+
+/// `↵` on `save <kind>`: build the `New*` from the draft (a blank field is
+/// left out) and run it through the save worker. A required field left blank
+/// refuses before any worker runs, on the `└` line under `save <kind>`.
+fn commit_shunt_add(app: &mut App, kind: ShuntAddKind) {
+    if app.services.saving(&ShuntSaveKey::SaveAdd(kind)) {
+        return;
+    }
+    let Some(view) = config_view(app).cloned() else {
+        return;
+    };
+    match build_add_edit(&view, &app.services.shunt_drafts, kind) {
+        AddDraft::Refuse(sentence) => {
+            app.services.shunt_drafts.set_refusal(kind, sentence);
+        }
+        AddDraft::Edit(edit) => {
+            start_shunt_save(app, ShuntSaveKey::SaveAdd(kind), *edit, false);
+        }
+    }
+}
+
+/// The `Edit::Add*` a draft builds, or a required-field refusal sentence.
+enum AddDraft {
+    Edit(Box<crate::gateway_edit::Edit>),
+    Refuse(String),
+}
+
+/// Build the add edit from a draft: a blank field is `None` (left out), the
+/// `accounts` list is comma-separated with spaces around commas trimmed (C2's
+/// accounts row parse). A required field left blank refuses first.
+fn build_add_edit(
+    view: &crate::gateway_edit::ConfigView,
+    drafts: &ShuntDrafts,
+    kind: ShuntAddKind,
+) -> AddDraft {
+    use crate::gateway_edit::{Edit, NewAuth, NewModel, NewRoute, NewUpstream};
+    match kind {
+        ShuntAddKind::Upstream => {
+            let Some(draft) = &drafts.upstream else {
+                return AddDraft::Refuse("cannot add upstream: set its name first".to_string());
+            };
+            let Some(name) = draft.name.as_deref().filter(|name| !name.is_empty()) else {
+                return AddDraft::Refuse("cannot add upstream: set its name first".to_string());
+            };
+            let auth = draft
+                .auth_mode
+                .as_deref()
+                .filter(|mode| !mode.is_empty())
+                .map(|mode| {
+                    // Only the fields whose rows the current mode shows reach
+                    // the add: a value typed under one mode then hidden by a
+                    // switch must not ride into the written config.
+                    let (account, accounts, env, header) = match auth_mode_rows(Some(mode)) {
+                        AuthModeRows::ApiKey => {
+                            (None, Vec::new(), draft.env.clone(), draft.header.clone())
+                        }
+                        AuthModeRows::OAuth => (
+                            None,
+                            split_accounts(draft.accounts.as_deref().unwrap_or("")),
+                            None,
+                            None,
+                        ),
+                        AuthModeRows::None => (None, Vec::new(), None, None),
+                    };
+                    NewAuth {
+                        mode: Some(mode.to_string()),
+                        account,
+                        accounts,
+                        env,
+                        header,
+                    }
+                });
+            AddDraft::Edit(Box::new(Edit::AddUpstream(NewUpstream {
+                name: name.to_string(),
+                provider: draft.provider.clone(),
+                kind: draft.kind.clone(),
+                base_url: draft.base_url.clone(),
+                auth,
+                effort: draft.effort.clone(),
+                service_tier: draft.service_tier.clone(),
+            })))
+        }
+        ShuntAddKind::Model => {
+            let Some(draft) = &drafts.model else {
+                return AddDraft::Refuse("cannot add model: set its id first".to_string());
+            };
+            let Some(id) = draft.id.as_deref().filter(|id| !id.is_empty()) else {
+                return AddDraft::Refuse("cannot add model: set its id first".to_string());
+            };
+            let upstream_model = provider_names(view)
+                .into_iter()
+                .filter_map(|provider| {
+                    draft
+                        .upstream_model
+                        .iter()
+                        .find(|(name, _)| *name == provider)
+                        .and_then(|(_, slug)| slug.clone())
+                        .map(|slug| (provider, slug))
+                })
+                .collect();
+            AddDraft::Edit(Box::new(Edit::AddModel(NewModel {
+                id: id.to_string(),
+                display_name: draft.display_name.clone(),
+                upstream_model,
+            })))
+        }
+        ShuntAddKind::Route => {
+            let Some(draft) = &drafts.route else {
+                return AddDraft::Refuse(
+                    "cannot add a route: set its model and provider first".to_string(),
+                );
+            };
+            let (Some(model), Some(provider)) = (
+                draft.model.clone().filter(|model| !model.is_empty()),
+                draft
+                    .provider
+                    .clone()
+                    .filter(|provider| !provider.is_empty()),
+            ) else {
+                return AddDraft::Refuse(
+                    "cannot add a route: set its model and provider first".to_string(),
+                );
+            };
+            AddDraft::Edit(Box::new(Edit::AddRoute(NewRoute {
+                model,
+                provider,
+                upstream_model: draft.upstream_model.clone(),
+                effort: draft.effort.clone(),
+                service_tier: draft.service_tier.clone(),
+            })))
+        }
+    }
+}
+
+/// `↵` on `remove <kind>`: open the confirm modal (the C2 confirm kind reused,
+/// no new modal kind, no body line), `cancel` default-focused, `remove` the
+/// destructive button.
+fn confirm_shunt_remove(app: &mut App, key: &ShuntEntryKey) {
+    // A locked remove opens no second confirm (ruling 2): the `remove <kind>`
+    // row is inert while its own remove checks.
+    if app.services.saving(&ShuntSaveKey::Remove(key.clone())) {
+        return;
+    }
+    let Some(view) = config_view(app).cloned() else {
+        return;
+    };
+    // The edit is built here, from the entry as it reads now (a route's
+    // `RouteView` included): confirming runs THIS edit, never a lookup at
+    // confirm time, so a route the shift moved under it refuses `EntryChanged`
+    // instead of removing the entry that now sits at its position.
+    let Some(edit) = remove_edit(&view, key) else {
+        // The route the key names left the config since its row rendered:
+        // nothing to remove, and no confirm to open.
+        return;
+    };
+    let message = remove_confirm_message(&view, key);
+    app.disarm_quit();
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message,
+        detail: None,
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::RemoveEntry {
+            key: key.clone(),
+            edit: Box::new(edit),
+        },
+    }));
+}
+
+/// The remove confirm's message, the approved copy: `remove upstream
+/// "<name>"?` / `remove model "<id>"?` / `remove the route at position <n>
+/// (model "<m>")?`.
+fn remove_confirm_message(view: &crate::gateway_edit::ConfigView, key: &ShuntEntryKey) -> String {
+    match key {
+        ShuntEntryKey::Upstream { name, .. } => {
+            format!("remove upstream \"{}\"?", escape_control(name))
+        }
+        ShuntEntryKey::Model { id, .. } => format!("remove model \"{}\"?", escape_control(id)),
+        ShuntEntryKey::Route(position) => {
+            match entry_for_key(view, key) {
+                Some(ConfigEntryRef::Route(route)) => remove_route_confirm_message(route),
+                // The route the key names left the config since its row
+                // rendered: name it by position alone (there is no model left
+                // to quote).
+                _ => format!("remove the route at position {}?", position),
+            }
+        }
+    }
+}
+
+/// The remove confirm's message for a route, built from the route's own view:
+/// `remove the route at position <n> (model "<m>")?`, or the position alone
+/// when the route has no model (the engine's `RouteView::named` rule,
+/// mirrored). Shared by the confirm at open and by the shift that moves an
+/// open route confirm when an earlier route's remove lands.
+fn remove_route_confirm_message(route: &crate::gateway_edit::RouteView) -> String {
+    match route.model.as_ref().map(written_display) {
+        Some(model) => format!(
+            "remove the route at position {} (model \"{}\")?",
+            route.position,
+            escape_control(&model)
+        ),
+        None => format!("remove the route at position {}?", route.position),
+    }
+}
+
+/// The `Edit::Remove*` one entry key produces; `None` when the route the key
+/// names left the config since the confirm opened (a no-op remove).
+fn remove_edit(
+    view: &crate::gateway_edit::ConfigView,
+    key: &ShuntEntryKey,
+) -> Option<crate::gateway_edit::Edit> {
+    use crate::gateway_edit::Edit;
+    match key {
+        ShuntEntryKey::Upstream { name, .. } => Some(Edit::RemoveUpstream { name: name.clone() }),
+        ShuntEntryKey::Model { id, .. } => Some(Edit::RemoveModel { id: id.clone() }),
+        ShuntEntryKey::Route(_) => match entry_for_key(view, key) {
+            Some(ConfigEntryRef::Route(route)) => Some(Edit::RemoveRoute {
+                route: route.clone(),
+            }),
+            _ => None,
+        },
+    }
+}
+
 // ── the config field editor ─────────────────────────────────────────────────
 
-/// The entry a field row belongs to; `None` on a server field.
+/// The entry a field row belongs to; `None` on a server or draft field.
 fn field_entry(key: &ShuntFieldKey) -> Option<ShuntEntryKey> {
     match key {
-        ShuntFieldKey::Bind | ShuntFieldKey::DefaultProvider => None,
+        ShuntFieldKey::Bind | ShuntFieldKey::DefaultProvider | ShuntFieldKey::Draft { .. } => None,
         ShuntFieldKey::Upstream {
             name, occurrence, ..
         } => Some(ShuntEntryKey::Upstream {
@@ -6031,6 +6614,22 @@ fn field_entry(key: &ShuntFieldKey) -> Option<ShuntEntryKey> {
             occurrence: *occurrence,
         }),
         ShuntFieldKey::Route { position, .. } => Some(ShuntEntryKey::Route(*position)),
+    }
+}
+
+/// Whether a field row's keys (`↵`, `space`, typing, the cycle pick) are inert
+/// while its save — its own, its draft's `save <kind>`, or its entry's
+/// `remove <kind>` — is checking. The one lock the field editor, the pick
+/// stepper and the footer read, so a busy row's hint and lock can never
+/// disagree.
+pub(crate) fn field_locked(app: &App, key: &ShuntFieldKey) -> bool {
+    match key {
+        ShuntFieldKey::Draft { kind, .. } => app.services.saving(&ShuntSaveKey::SaveAdd(*kind)),
+        _ => {
+            app.services.saving(&ShuntSaveKey::Field(key.clone()))
+                || field_entry(key)
+                    .is_some_and(|entry| app.services.saving(&ShuntSaveKey::Remove(entry)))
+        }
     }
 }
 
@@ -6056,10 +6655,11 @@ fn is_rename_field(key: &ShuntFieldKey) -> bool {
 /// refusal landing later toasts instead of describing text the editor no
 /// longer shows.
 fn open_shunt_field_editor(app: &mut App, key: &ShuntFieldKey) {
-    if app.services.saving(key) {
+    if field_locked(app, key) {
         return;
     }
-    let saved = config_view(app).and_then(|view| shunt_field_value(view, key).flatten());
+    let saved = config_view(app)
+        .and_then(|view| shunt_field_value(view, &app.services.shunt_drafts, key).flatten());
     let input = InputState::new(saved.as_deref().unwrap_or(""));
     app.services.shunt_field_edit = Some(ShuntFieldEditState {
         key: key.clone(),
@@ -6081,10 +6681,12 @@ fn next_pick(options: &[&str], current: Option<&str>) -> String {
 /// or advance an already-pending pick. A row whose save is still checking never
 /// opens a fresh pick (same inert rule as the typed editor).
 fn step_shunt_pick(app: &mut App, key: &ShuntFieldKey) {
-    if app.services.saving(key) {
+    if field_locked(app, key) {
         return;
     }
-    let Some(value) = config_view(app).and_then(|view| shunt_field_value(view, key)) else {
+    let Some(value) =
+        config_view(app).and_then(|view| shunt_field_value(view, &app.services.shunt_drafts, key))
+    else {
         return;
     };
     let options = cycle_options(key);
@@ -6116,7 +6718,7 @@ fn handle_shunt_field_edit_key(app: &mut App, key: KeyEvent) {
     // step off the row (closing the editor) and `q` ascends to the list; both
     // stay claimed here so neither reaches a global binding that would leave
     // the editor open on a list-focused screen.
-    if app.services.saving(&state.key) {
+    if field_locked(app, &state.key) {
         match key.code {
             KeyCode::Up | KeyCode::Down => {
                 app.services.shunt_field_edit = None;
@@ -6155,6 +6757,17 @@ fn commit_shunt_field(app: &mut App, key: &ShuntFieldKey) {
         ShuntFieldEdit::Typed { input, .. } => input.value.clone(),
         ShuntFieldEdit::Pick { picked, .. } => picked.clone(),
     };
+    // A draft field's commit lands in the draft, never the file: set the value
+    // (empty unsets), clear the `save <kind>` refusal, close the editor, and
+    // rebuild the stops (a committed auth mode can change the mode-dependent
+    // row set).
+    if let ShuntFieldKey::Draft { kind, field } = key {
+        set_draft_field_value(&mut app.services.shunt_drafts, *kind, field, &typed);
+        app.services.shunt_drafts.clear_refusal(*kind);
+        app.services.shunt_field_edit = None;
+        rebuild_shunt_config_stops(app);
+        return;
+    }
     let Some(record) = app.services.shunt_record.clone() else {
         return;
     };
@@ -6225,7 +6838,7 @@ fn commit_shunt_field(app: &mut App, key: &ShuntFieldKey) {
         }
     }
 
-    start_field_save(app, key.clone(), edit, false);
+    start_shunt_save(app, ShuntSaveKey::Field(key.clone()), edit, false);
 }
 
 /// The rename confirm's `from`: the entry's current name/id, control-escaped
@@ -6359,12 +6972,12 @@ fn show_field_refusal(app: &mut App, key: &ShuntFieldKey, err: &anyhow::Error) {
     }
 }
 
-/// Start the save worker for one field (its own worker; the outcome drains on
+/// Start the save worker for one row (its own worker; the outcome drains on
 /// the tick). One save at a time — the worker's own `running` is the guard —
-/// and the editor stays open with the typed text until the outcome lands.
-fn start_field_save(
+/// and a field's editor stays open with the typed text until the outcome lands.
+fn start_shunt_save(
     app: &mut App,
-    key: ShuntFieldKey,
+    key: ShuntSaveKey,
     edit: crate::gateway_edit::Edit,
     confirmed: bool,
 ) {
@@ -6378,10 +6991,12 @@ fn start_field_save(
     let Some(record) = app.services.shunt_record.clone() else {
         return;
     };
+    let entry = add_edit_entry_key(&edit, config_view(app));
     app.services.shunt_save = Some(ShuntSave {
         key: key.clone(),
         started: Instant::now(),
         value: edit_save_value(&edit),
+        entry,
     });
     app.services
         .shunt_save_worker
@@ -6393,35 +7008,83 @@ fn start_field_save(
         });
 }
 
-/// Ascend off the shunt detail: close any open field editor and move focus to
-/// the list. Every site that moves `services.focus` off the shunt detail (the
+/// Ascend off the shunt detail: close any open field editor, retire a remove
+/// refusal (its row is no longer the user's), and move focus to the list.
+/// Every site that moves `services.focus` off the shunt detail (the
 /// global `esc` and `q` ascend arms, the tab jump's Services reset, and the
 /// locked editor's own `q`) goes through here, so the state "list focused,
 /// editor open" cannot exist — an editor left open would keep owning the
 /// keyboard on a pane that does not hold focus.
 fn leave_shunt_detail(app: &mut App) {
     app.services.shunt_field_edit = None;
+    app.services.shunt_remove_refusal.take();
     app.services.focus = ServicesFocus::List;
 }
 
-/// `esc` on a field row that is not editing: fold its entry (back to the entry
-/// row). Returns `true` when it folded; a server field row (or no field focus)
-/// leaves it to ascend as today.
+/// `esc` on a config row that is not editing: fold its entry (back to the
+/// entry row), or fold its open draft (back to the `+ add` row) — the Setup
+/// `+ new` form's precedent, whose `esc` at rest drops the draft. Returns
+/// `true` when it folded; a server field row (or no config focus) leaves it to
+/// ascend as today.
 fn shunt_esc_folds_entry(app: &mut App) -> bool {
     let Some(focus) = app.services.focused_shunt_focus().cloned() else {
         return false;
     };
-    let ShuntFocus::Field { key } = focus else {
-        return false;
+    let fold_draft = |app: &mut App, kind: ShuntAddKind| {
+        app.services.shunt_drafts.fold(kind);
+        rebuild_shunt_config_stops(app);
+        app.services
+            .set_shunt_focus(Some(ShuntFocusLine::Add(kind)));
     };
-    let Some(entry) = field_entry(&key) else {
-        return false;
-    };
-    app.services.shunt_expanded.remove(&entry);
-    rebuild_shunt_config_stops(app);
-    app.services
-        .set_shunt_focus(Some(ShuntFocusLine::Entry(entry)));
-    true
+    match focus {
+        ShuntFocus::Field { key } => {
+            // A locked row's `esc` ascends to the list (no fold) — ruling 2.
+            if field_locked(app, &key) {
+                return false;
+            }
+            if let ShuntFieldKey::Draft { kind, .. } = &key {
+                fold_draft(app, *kind);
+                return true;
+            }
+            let Some(entry) = field_entry(&key) else {
+                return false;
+            };
+            app.services.shunt_expanded.remove(&entry);
+            retire_remove_refusal(app, &entry);
+            rebuild_shunt_config_stops(app);
+            app.services
+                .set_shunt_focus(Some(ShuntFocusLine::Entry(entry)));
+            true
+        }
+        ShuntFocus::SaveAdd { kind } => {
+            if app.services.saving(&ShuntSaveKey::SaveAdd(kind)) {
+                return false;
+            }
+            fold_draft(app, kind);
+            true
+        }
+        ShuntFocus::Add { kind } if app.services.shunt_drafts.is_open(kind) => {
+            if app.services.saving(&ShuntSaveKey::SaveAdd(kind)) {
+                return false;
+            }
+            fold_draft(app, kind);
+            true
+        }
+        ShuntFocus::Remove { key } => {
+            // `esc` on the `remove <kind>` row folds its entry like C2's field
+            // rows, unless the remove is locked (ruling 2): then it ascends.
+            if app.services.saving(&ShuntSaveKey::Remove(key.clone())) {
+                return false;
+            }
+            app.services.shunt_expanded.remove(&key);
+            retire_remove_refusal(app, &key);
+            rebuild_shunt_config_stops(app);
+            app.services
+                .set_shunt_focus(Some(ShuntFocusLine::Entry(key)));
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Open the read-only `check output` modal over the held failed-check stderr,
@@ -7155,6 +7818,20 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool, shunt: ShuntR
     if let Some(ShuntConfigRead::Ok(view)) = &app.services.shunt_config {
         prune_shunt_expanded(view, &mut app.services.shunt_expanded);
     }
+    // A remove refusal names a comment in the file it was raised on; a
+    // recompute whose view differs (a hand-edit) retires it, so a stale DANGER
+    // sentence never outlives the file it described.
+    if app
+        .services
+        .shunt_remove_refusal
+        .borrow()
+        .as_ref()
+        .is_some_and(|refusal| {
+            matches!(&app.services.shunt_config, Some(ShuntConfigRead::Ok(view)) if view.as_ref() != refusal.view.as_ref())
+        })
+    {
+        app.services.shunt_remove_refusal.take();
+    }
     app.services.admin_need = app
         .services
         .shunt_record
@@ -7219,9 +7896,11 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool, shunt: ShuntR
     // render draws them in the same order, so the published geometry stays
     // parallel to this list.
     if let Some(ShuntConfigRead::Ok(view)) = &app.services.shunt_config {
-        shunt
-            .shunt_focus
-            .extend(config_field_stops(view, &app.services.shunt_expanded));
+        shunt.shunt_focus.extend(config_field_stops(
+            view,
+            &app.services.shunt_expanded,
+            &app.services.shunt_drafts,
+        ));
     }
     checks.push(shunt);
 
@@ -7394,6 +8073,22 @@ fn drain_service_probes(app: &mut App) {
     }
 }
 
+/// Whether a shunt refusal can show on its own `└` line: the Services tab is
+/// shown, the detail pane holds focus, the `shunt` row is the selected
+/// service, and the focus still rests on the row that started the save. Any
+/// conjunct false (an `esc` ascend, a tab jump, another service picked, or a
+/// focus move off the row) leaves the row off-screen — the refusal toasts
+/// `save failed` + the sentence instead.
+fn refusal_row_visible(app: &App, on_row: bool) -> bool {
+    app.tab == Tab::Services
+        && app.services.focus == ServicesFocus::Detail
+        && app
+            .services
+            .selected_check()
+            .is_some_and(|c| c.label == "shunt")
+        && on_row
+}
+
 /// One shunt-card action's result: the toast, every error `Display` escaped
 /// (it can interpolate an untrusted path), the moved count singular at 1. The
 /// plan/pool caches are dropped by the drain's recompute (which restarts their
@@ -7485,82 +8180,199 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
             value,
             confirmed,
         } => {
-            app.services.shunt_save = None;
-            // The `✓` shows for about a second on the row that saved; a rename
-            // moves focus to the renamed field (the expanded set's key moves
-            // with it).
-            let new_key = config_view(app)
-                .and_then(|view| renamed_field_key(view, &key, value.as_deref().unwrap_or("")))
-                .unwrap_or(key.clone());
-            // A rename moves the expanded set's key with the renamed entry, so
-            // the new name's fields stay expanded and the focus follows.
-            if is_rename_field(&key) {
-                if let Some(old_entry) = field_entry(&key) {
-                    app.services.shunt_expanded.remove(&old_entry);
-                }
-                if let Some(new_entry) = field_entry(&new_key) {
-                    app.services.shunt_expanded.insert(new_entry);
-                }
-            }
-            app.services.shunt_ok = Some((new_key.clone(), Instant::now()));
-            // A landing save touches only its own row: it closes the editor and
-            // moves focus only when they still name the saved row (a rename's
-            // new name included), never another editor the user opened or a row
-            // the user moved to while the save ran.
-            if app
+            // The entry a `save <kind>` lands under was fixed when the save
+            // started and rides in the in-flight save; capture it before the
+            // slot clears.
+            let save_entry = app
                 .services
-                .shunt_field_edit
+                .shunt_save
                 .as_ref()
-                .is_some_and(|state| state.key == key)
-            {
-                app.services.shunt_field_edit = None;
-            }
-            if app
-                .services
-                .focused_shunt_focus()
-                .is_some_and(|focus| focus == &ShuntFocus::Field { key: key.clone() })
-            {
-                app.services
-                    .set_shunt_focus(Some(ShuntFocusLine::Field(new_key)));
-            }
-            if written && restart_only && confirmed {
-                // An emptied bind writes the key's removal, so shunt starts on
-                // its own default; a set bind restarts on the new address.
-                if let Some(bind) = value {
-                    app.toast(
-                        ToastKind::Success,
-                        format!(
-                            "shunt restarting\nbind saved · it starts on {}",
-                            escape_control(&bind)
-                        ),
-                    );
-                } else {
-                    app.toast(
-                        ToastKind::Success,
-                        format!(
-                            "shunt restarting\nbind removed · it starts on {}",
-                            crate::gateway::SHUNT_DEFAULT_BIND
-                        ),
-                    );
+                .and_then(|save| save.entry.clone());
+            app.services.shunt_save = None;
+            match key {
+                ShuntSaveKey::Field(field_key) => {
+                    // The `✓` shows for about a second on the row that saved; a
+                    // rename moves focus to the renamed field (the expanded
+                    // set's key moves with it).
+                    let new_key = config_view(app)
+                        .and_then(|view| {
+                            renamed_field_key(view, &field_key, value.as_deref().unwrap_or(""))
+                        })
+                        .unwrap_or(field_key.clone());
+                    // A rename moves the expanded set's key with the renamed
+                    // entry, so the new name's fields stay expanded and the
+                    // focus follows.
+                    if is_rename_field(&field_key) {
+                        if let Some(old_entry) = field_entry(&field_key) {
+                            app.services.shunt_expanded.remove(&old_entry);
+                        }
+                        if let Some(new_entry) = field_entry(&new_key) {
+                            app.services.shunt_expanded.insert(new_entry);
+                        }
+                    }
+                    app.services.shunt_ok =
+                        Some((ShuntOkKey::Field(new_key.clone()), Instant::now()));
+                    // A landing save touches only its own row: it closes the
+                    // editor and moves focus only when they still name the
+                    // saved row (a rename's new name included), never another
+                    // editor the user opened or a row the user moved to while
+                    // the save ran.
+                    if app
+                        .services
+                        .shunt_field_edit
+                        .as_ref()
+                        .is_some_and(|state| state.key == field_key)
+                    {
+                        app.services.shunt_field_edit = None;
+                    }
+                    if app.services.focused_shunt_focus().is_some_and(|focus| {
+                        focus
+                            == &ShuntFocus::Field {
+                                key: field_key.clone(),
+                            }
+                    }) {
+                        app.services
+                            .set_shunt_focus(Some(ShuntFocusLine::Field(new_key)));
+                    }
+                    if written && restart_only && confirmed {
+                        // An emptied bind writes the key's removal, so shunt
+                        // starts on its own default; a set bind restarts on the
+                        // new address.
+                        if let Some(bind) = value {
+                            app.toast(
+                                ToastKind::Success,
+                                format!(
+                                    "shunt restarting\nbind saved · it starts on {}",
+                                    escape_control(&bind)
+                                ),
+                            );
+                        } else {
+                            app.toast(
+                                ToastKind::Success,
+                                format!(
+                                    "shunt restarting\nbind removed · it starts on {}",
+                                    crate::gateway::SHUNT_DEFAULT_BIND
+                                ),
+                            );
+                        }
+                    }
+                }
+                ShuntSaveKey::SaveAdd(kind) => {
+                    // The draft closes, the new entry appears where the engine
+                    // put it (collapsed), and that row's caret slot shows the
+                    // `✓` for `SHUNT_OK_MS`. Focus moves to the new entry only
+                    // while it still rests on this kind's own rows (the
+                    // `+ add`, a draft field, or `save <kind>`) — never an
+                    // editor the user opened or a row they moved to meanwhile.
+                    let new_entry = save_entry.clone();
+                    app.services.shunt_drafts.fold(kind);
+                    if let Some(entry) = new_entry {
+                        app.services.shunt_expanded.remove(&entry);
+                        app.services.shunt_ok =
+                            Some((ShuntOkKey::Entry(entry.clone()), Instant::now()));
+                        if focus_on_add_kind(app, kind) {
+                            app.services
+                                .set_shunt_focus(Some(ShuntFocusLine::Entry(entry)));
+                        }
+                    }
+                }
+                ShuntSaveKey::Remove(entry_key) => {
+                    // The entry leaves the card and the expanded set. Focus
+                    // lands on the next entry row of that group, else the
+                    // previous one, else its `+ add <kind>` row — but only
+                    // while it still rests on the removed entry's own rows.
+                    let focus_was_here = focus_on_removed_entry(app, &entry_key);
+                    // Close a field editor open on the removed entry BEFORE
+                    // re-keying: its key names the removed entry, and after a
+                    // route shift a later route's new position could coincide.
+                    if app
+                        .services
+                        .shunt_field_edit
+                        .as_ref()
+                        .is_some_and(|state| field_entry(&state.key).as_ref() == Some(&entry_key))
+                    {
+                        app.services.shunt_field_edit = None;
+                    }
+                    if let ShuntEntryKey::Route(position) = entry_key {
+                        // A route remove shifts every later route down by one:
+                        // re-key the route-positioned state so each still names
+                        // the SAME route after the recompute. This also drops
+                        // the removed route's own keys.
+                        rekey_routes_after_remove(app, position);
+                    } else {
+                        app.services.shunt_expanded.remove(&entry_key);
+                    }
+                    app.services.shunt_remove_refusal.take();
+                    if focus_was_here {
+                        let focus = remove_focus_target(app, &entry_key);
+                        app.services.set_shunt_focus(focus);
+                    }
                 }
             }
         }
         ShuntActionOutcome::ConfigRefused { key, sentence } => {
             app.services.shunt_save = None;
-            // The engine refused the input or the file's shape: the editor
-            // stays open with the typed text, the refusal on the `└` line.
-            // Once the user moved focus away (or opened another field), there
-            // is no editor for that row to write — the refusal toasts instead
-            // of reaching no surface.
-            if let Some(state) = app.services.shunt_field_edit.as_mut()
-                && state.key == key
-            {
-                state.refusal = Some(sentence);
-            } else {
-                app.toast(
-                    ToastKind::Danger,
-                    format!("save failed\n{}", escape_control(&sentence)),
-                );
+            match key {
+                ShuntSaveKey::Field(field_key) => {
+                    // The engine refused the input or the file's shape: the
+                    // editor stays open with the typed text, the refusal on the
+                    // `└` line. Once the user moved focus away (or opened
+                    // another field), there is no editor for that row to write
+                    // — the refusal toasts instead of reaching no surface.
+                    if let Some(state) = app.services.shunt_field_edit.as_mut()
+                        && state.key == field_key
+                    {
+                        state.refusal = Some(sentence);
+                    } else {
+                        app.toast(
+                            ToastKind::Danger,
+                            format!("save failed\n{}", escape_control(&sentence)),
+                        );
+                    }
+                }
+                ShuntSaveKey::SaveAdd(kind) => {
+                    // The draft is kept; the refusal sits on the `└` line under
+                    // the `save <kind>` row only while that row is on the
+                    // focused card — the Services tab, the detail pane, the
+                    // `shunt` row, and the kind's own rows (`+ add`, a draft
+                    // field, `save`). Anything else has no surface to hold the
+                    // sentence, so it toasts like the field arm.
+                    if refusal_row_visible(app, focus_on_add_kind(app, kind)) {
+                        app.services.shunt_drafts.set_refusal(kind, sentence);
+                    } else {
+                        app.toast(
+                            ToastKind::Danger,
+                            format!("save failed\n{}", escape_control(&sentence)),
+                        );
+                    }
+                }
+                ShuntSaveKey::Remove(entry_key) => {
+                    // The refusal sits on the `└` line under the entry's
+                    // `remove <kind>` row only while that row is on the focused
+                    // card — the Services tab, the detail pane, the `shunt`
+                    // row, and the focus still on the `remove` row. Landing
+                    // anywhere else, it has no row to show under — it toasts
+                    // like the field and add arms instead.
+                    let on_row = app.services.shunt_focus_kind()
+                        == Some(ShuntFocusLine::Remove(entry_key.clone()));
+                    if refusal_row_visible(app, on_row) {
+                        let view = config_view(app).cloned().map(Box::new);
+                        if let Some(view) = view {
+                            app.services
+                                .shunt_remove_refusal
+                                .replace(Some(ShuntRemoveRefusal {
+                                    key: entry_key,
+                                    sentence,
+                                    view,
+                                }));
+                        }
+                    } else {
+                        app.toast(
+                            ToastKind::Danger,
+                            format!("save failed\n{}", escape_control(&sentence)),
+                        );
+                    }
+                }
             }
         }
         ShuntActionOutcome::ConfigCheckFailed {
@@ -7604,6 +8416,189 @@ fn hold_check_output(
     } else {
         None
     };
+}
+
+/// The entry key a `save <kind>` edit lands under, fixed at save START: for an
+/// upstream/model, the (unique) name/id with occurrence 0 (the engine refused
+/// a duplicate); for a route, the position after the pre-save view's routes.
+/// `None` on any non-add edit. The outcome drain reads the key this captured,
+/// never the draft or the live view.
+fn add_edit_entry_key(
+    edit: &crate::gateway_edit::Edit,
+    view: Option<&crate::gateway_edit::ConfigView>,
+) -> Option<ShuntEntryKey> {
+    use crate::gateway_edit::Edit;
+    match edit {
+        Edit::AddUpstream(new) => Some(ShuntEntryKey::Upstream {
+            name: new.name.clone(),
+            occurrence: 0,
+        }),
+        Edit::AddModel(new) => Some(ShuntEntryKey::Model {
+            id: new.id.clone(),
+            occurrence: 0,
+        }),
+        Edit::AddRoute(_) => view.map(|view| ShuntEntryKey::Route(view.routes.len() + 1)),
+        _ => None,
+    }
+}
+
+/// The focus target after a successful remove: the next entry row of the same
+/// group, else the previous one, else the group's `+ add <kind>` row. A route
+/// remove shifts every later route down by one, so its "next" is the route now
+/// at position p (the old p+1), computed against the pre-remove view.
+fn remove_focus_target(app: &App, removed: &ShuntEntryKey) -> Option<ShuntFocusLine> {
+    let view = config_view(app)?;
+    match removed {
+        ShuntEntryKey::Route(position) => {
+            let has_next = view
+                .routes
+                .iter()
+                .any(|route| route.position == *position + 1);
+            if has_next {
+                return Some(ShuntFocusLine::Entry(ShuntEntryKey::Route(*position)));
+            }
+            if *position > 1 {
+                return Some(ShuntFocusLine::Entry(ShuntEntryKey::Route(position - 1)));
+            }
+            add_row_offered(view, ShuntAddKind::Route)
+                .then_some(ShuntFocusLine::Add(ShuntAddKind::Route))
+        }
+        _ => {
+            let kind = entry_kind(removed);
+            let keys = config_entry_keys(view);
+            let idx = keys.iter().position(|key| key == removed)?;
+            let same_kind = |key: &ShuntEntryKey| entry_kind(key) == kind;
+            if let Some(next) = keys.iter().skip(idx + 1).find(|key| same_kind(key)) {
+                return Some(ShuntFocusLine::Entry(next.clone()));
+            }
+            if let Some(prev) = keys.iter().take(idx).rev().find(|key| same_kind(key)) {
+                return Some(ShuntFocusLine::Entry(prev.clone()));
+            }
+            add_row_offered(view, kind).then_some(ShuntFocusLine::Add(kind))
+        }
+    }
+}
+
+/// Whether focus still rests on a `+ add <kind>` save's own rows: the `+ add`
+/// row, one of its draft field rows, or its `save <kind>` row.
+fn focus_on_add_kind(app: &App, kind: ShuntAddKind) -> bool {
+    app.services
+        .focused_shunt_focus()
+        .is_some_and(|focus| match focus {
+            ShuntFocus::Add { kind: k } | ShuntFocus::SaveAdd { kind: k } => *k == kind,
+            ShuntFocus::Field {
+                key: ShuntFieldKey::Draft { kind: k, .. },
+            } => *k == kind,
+            _ => false,
+        })
+}
+
+/// Whether focus still rests on a removed entry's own rows: the entry row, one
+/// of its field rows, or its `remove <kind>` row.
+fn focus_on_removed_entry(app: &App, removed: &ShuntEntryKey) -> bool {
+    app.services
+        .focused_shunt_focus()
+        .is_some_and(|focus| match focus {
+            ShuntFocus::Entry { key } | ShuntFocus::Remove { key } => key == removed,
+            ShuntFocus::Field { key } => field_entry(key).as_ref() == Some(removed),
+            _ => false,
+        })
+}
+
+/// Re-key every route-positioned piece of state after removing the route at
+/// `position`: each `Route(n > position)` key moves down by one (the same
+/// route's new position), and `Route(position)` drops (its entry left the
+/// config). Upstreams and models are keyed by name/id and never shift.
+fn rekey_routes_after_remove(app: &mut App, position: usize) {
+    app.services.shunt_expanded = app
+        .services
+        .shunt_expanded
+        .iter()
+        .filter_map(|key| shift_entry_key(key, position))
+        .collect();
+    if let Some(state) = app.services.shunt_field_edit.clone() {
+        app.services.shunt_field_edit =
+            shift_field_key(&state.key, position).map(|key| ShuntFieldEditState {
+                key,
+                edit: state.edit,
+                refusal: state.refusal,
+            });
+    }
+    app.services.shunt_ok = app
+        .services
+        .shunt_ok
+        .take()
+        .and_then(|(key, at)| shift_ok_key(&key, position).map(|key| (key, at)));
+    let focus = app
+        .services
+        .shunt_focus_kind()
+        .and_then(|line| shift_focus_line(&line, position));
+    app.services.set_shunt_focus(focus);
+    // An open remove confirm's route key shifts with the other route-keyed
+    // state (ruling 5's list gains the open confirm). A shifted route confirm
+    // still names and removes its own route: the stored `RemoveRoute` edit
+    // moves down with the key, and the message is rebuilt from the shifted
+    // route so the copy names the route's new position. A confirm must never
+    // be left able only to refuse.
+    if let Some(Modal::Confirm(state)) = app.modals.last_mut()
+        && let ConfirmAction::RemoveEntry { key, edit } = &mut state.on_confirm
+        && let Some(shifted) = shift_entry_key(key, position)
+    {
+        *key = shifted;
+        if let crate::gateway_edit::Edit::RemoveRoute { route } = edit.as_mut()
+            && route.position > position
+        {
+            route.position -= 1;
+            state.message = remove_route_confirm_message(route);
+        }
+    }
+}
+
+/// Shift one entry key past a removed route; `None` when it names the removed
+/// route itself.
+fn shift_entry_key(key: &ShuntEntryKey, position: usize) -> Option<ShuntEntryKey> {
+    match key {
+        ShuntEntryKey::Route(p) if *p > position => Some(ShuntEntryKey::Route(p - 1)),
+        ShuntEntryKey::Route(p) if *p == position => None,
+        other => Some(other.clone()),
+    }
+}
+
+/// Shift one field key past a removed route; `None` when it names the removed
+/// route itself.
+fn shift_field_key(key: &ShuntFieldKey, position: usize) -> Option<ShuntFieldKey> {
+    match key {
+        ShuntFieldKey::Route { position: p, field } if *p > position => {
+            Some(ShuntFieldKey::Route {
+                position: p - 1,
+                field: *field,
+            })
+        }
+        ShuntFieldKey::Route { position: p, .. } if *p == position => None,
+        other => Some(other.clone()),
+    }
+}
+
+/// Shift one `✓` key past a removed route; `None` when it names the removed
+/// route itself.
+fn shift_ok_key(key: &ShuntOkKey, position: usize) -> Option<ShuntOkKey> {
+    match key {
+        ShuntOkKey::Entry(entry) => shift_entry_key(entry, position).map(ShuntOkKey::Entry),
+        ShuntOkKey::Field(field) => shift_field_key(field, position).map(ShuntOkKey::Field),
+    }
+}
+
+/// Shift one held focus identity past a removed route; `None` when it names the
+/// removed route itself.
+fn shift_focus_line(line: &ShuntFocusLine, position: usize) -> Option<ShuntFocusLine> {
+    match line {
+        ShuntFocusLine::Entry(entry) => shift_entry_key(entry, position).map(ShuntFocusLine::Entry),
+        ShuntFocusLine::Field(field) => shift_field_key(field, position).map(ShuntFocusLine::Field),
+        ShuntFocusLine::Remove(entry) => {
+            shift_entry_key(entry, position).map(ShuntFocusLine::Remove)
+        }
+        other => Some(other.clone()),
+    }
 }
 
 /// The `delegates` row: a selector whose detail is the job list. Green while a
@@ -8296,6 +9291,31 @@ pub(crate) fn entry_field_keys(
     }
 }
 
+/// The auth sub-rows one auth mode shows — the single row model shared by
+/// C2's existing-entry rows, the draft's rows, and the add the draft builds,
+/// so the form never writes a key whose row the current mode does not show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthModeRows {
+    /// `api_key`: `auth env` + `auth header`.
+    ApiKey,
+    /// A pool OAuth mode: `account` (only when set, for an existing entry) +
+    /// `accounts`.
+    OAuth,
+    /// Any other mode, or none: no sub-rows.
+    None,
+}
+
+/// The sub-rows a mode name shows, per [`AuthModeRows`].
+fn auth_mode_rows(mode: Option<&str>) -> AuthModeRows {
+    match mode {
+        Some("api_key") => AuthModeRows::ApiKey,
+        Some("claude_oauth" | "chatgpt_oauth" | "kimi_oauth" | "antigravity_oauth") => {
+            AuthModeRows::OAuth
+        }
+        _ => AuthModeRows::None,
+    }
+}
+
 fn upstream_field_keys(
     key: &ShuntEntryKey,
     u: &crate::gateway_edit::UpstreamView,
@@ -8316,18 +9336,18 @@ fn upstream_field_keys(
         at(UpstreamFieldKind::AuthMode),
     ];
     if let Some(auth) = &u.auth {
-        match auth.mode.as_ref().map(written_display).as_deref() {
-            Some("api_key") => {
+        match auth_mode_rows(auth.mode.as_ref().map(written_display).as_deref()) {
+            AuthModeRows::ApiKey => {
                 keys.push(at(UpstreamFieldKind::AuthEnv));
                 keys.push(at(UpstreamFieldKind::AuthHeader));
             }
-            Some("claude_oauth" | "chatgpt_oauth" | "kimi_oauth" | "antigravity_oauth") => {
+            AuthModeRows::OAuth => {
                 if auth.account.is_some() {
                     keys.push(at(UpstreamFieldKind::AuthAccount));
                 }
                 keys.push(at(UpstreamFieldKind::Accounts));
             }
-            _ => {}
+            AuthModeRows::None => {}
         }
     }
     keys.push(at(UpstreamFieldKind::Effort));
@@ -8385,6 +9405,7 @@ fn route_field_keys(r: &crate::gateway_edit::RouteView) -> Vec<ShuntFieldKey> {
 pub(crate) fn config_field_stops(
     view: &crate::gateway_edit::ConfigView,
     expanded: &HashSet<ShuntEntryKey>,
+    drafts: &ShuntDrafts,
 ) -> Vec<ShuntFocus> {
     let mut stops = Vec::new();
     if matches!(
@@ -8398,24 +9419,298 @@ pub(crate) fn config_field_stops(
     stops.push(ShuntFocus::Field {
         key: ShuntFieldKey::DefaultProvider,
     });
-    for key in config_entry_keys(view) {
-        stops.push(ShuntFocus::Entry { key: key.clone() });
-        if expanded.contains(&key) {
-            stops.extend(
-                entry_field_keys(view, &key)
-                    .into_iter()
-                    .map(|field| ShuntFocus::Field { key: field }),
-            );
+
+    let keys = config_entry_keys(view);
+    for kind in [
+        ShuntAddKind::Upstream,
+        ShuntAddKind::Model,
+        ShuntAddKind::Route,
+    ] {
+        for key in keys.iter().filter(|key| entry_kind(key) == kind) {
+            stops.push(ShuntFocus::Entry { key: key.clone() });
+            if expanded.contains(key) {
+                stops.extend(
+                    entry_field_keys(view, key)
+                        .into_iter()
+                        .map(|field| ShuntFocus::Field { key: field }),
+                );
+                if removable(view, key) {
+                    stops.push(ShuntFocus::Remove { key: key.clone() });
+                }
+            }
+        }
+        if add_row_offered(view, kind) {
+            stops.push(ShuntFocus::Add { kind });
+            if drafts.is_open(kind) {
+                stops.extend(
+                    draft_field_keys(view, kind, drafts)
+                        .into_iter()
+                        .map(|field| ShuntFocus::Field { key: field }),
+                );
+                stops.push(ShuntFocus::SaveAdd { kind });
+            }
         }
     }
     stops
 }
 
+/// The group kind an entry key belongs to.
+pub(crate) fn entry_kind(key: &ShuntEntryKey) -> ShuntAddKind {
+    match key {
+        ShuntEntryKey::Upstream { .. } => ShuntAddKind::Upstream,
+        ShuntEntryKey::Model { .. } => ShuntAddKind::Model,
+        ShuntEntryKey::Route(_) => ShuntAddKind::Route,
+    }
+}
+
+/// Whether the `+ add <kind>` row is offered: upstreams only while the config
+/// declares `[[upstreams]]` (a legacy `[providers.*]` config's providers are
+/// read-only), models and routes always (the groups stay editable on legacy).
+pub(crate) fn add_row_offered(view: &crate::gateway_edit::ConfigView, kind: ShuntAddKind) -> bool {
+    match kind {
+        ShuntAddKind::Upstream => {
+            matches!(view.form, crate::gateway_edit::ProviderForm::Upstreams)
+        }
+        ShuntAddKind::Model | ShuntAddKind::Route => true,
+    }
+}
+
+/// Whether an expanded entry offers a `remove <kind>` row. The engine's
+/// `RemoveUpstream`/`RemoveModel` take the name/id alone and refuse a
+/// duplicated name/id (`Ctx::find` → `Ambiguous`), so a duplicated name or id
+/// has no remove row (`under-scoped`); routes are keyed by position and
+/// always removable.
+pub(crate) fn removable(view: &crate::gateway_edit::ConfigView, key: &ShuntEntryKey) -> bool {
+    match key {
+        ShuntEntryKey::Upstream { name, .. } => {
+            view.upstreams
+                .iter()
+                .filter(|u| entry_name(u.name.as_ref()) == *name)
+                .count()
+                == 1
+        }
+        ShuntEntryKey::Model { id, .. } => {
+            view.models
+                .iter()
+                .filter(|m| entry_name(m.id.as_ref()) == *id)
+                .count()
+                == 1
+        }
+        ShuntEntryKey::Route(_) => true,
+    }
+}
+
+/// The field rows one open draft renders, in render order — the same row model
+/// the focus walk derives from. The upstream draft's mode-dependent rows
+/// follow the draft's own `auth mode` (never the file's), mirroring C2's
+/// existing-entry row set; the model draft's `upstream_model` rows follow the
+/// config's current provider list.
+pub(crate) fn draft_field_keys(
+    view: &crate::gateway_edit::ConfigView,
+    kind: ShuntAddKind,
+    drafts: &ShuntDrafts,
+) -> Vec<ShuntFieldKey> {
+    let at = |field: ShuntDraftField| ShuntFieldKey::Draft { kind, field };
+    let mut keys = Vec::new();
+    match kind {
+        ShuntAddKind::Upstream => {
+            let Some(draft) = &drafts.upstream else {
+                return Vec::new();
+            };
+            let mut fields = vec![
+                ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+                ShuntDraftField::Upstream(UpstreamFieldKind::Provider),
+                ShuntDraftField::Upstream(UpstreamFieldKind::Kind),
+                ShuntDraftField::Upstream(UpstreamFieldKind::BaseUrl),
+                ShuntDraftField::Upstream(UpstreamFieldKind::AuthMode),
+            ];
+            match auth_mode_rows(draft.auth_mode.as_deref()) {
+                AuthModeRows::ApiKey => {
+                    fields.push(ShuntDraftField::Upstream(UpstreamFieldKind::AuthEnv));
+                    fields.push(ShuntDraftField::Upstream(UpstreamFieldKind::AuthHeader));
+                }
+                AuthModeRows::OAuth => {
+                    // A fresh draft offers `accounts` only: `account` appears
+                    // only when set, and a draft never sets it (no `account`
+                    // row), so a one-name list serves a single account.
+                    fields.push(ShuntDraftField::Upstream(UpstreamFieldKind::Accounts));
+                }
+                AuthModeRows::None => {}
+            }
+            fields.push(ShuntDraftField::Upstream(UpstreamFieldKind::Effort));
+            fields.push(ShuntDraftField::Upstream(UpstreamFieldKind::ServiceTier));
+            keys.extend(fields.into_iter().map(at));
+        }
+        ShuntAddKind::Model => {
+            if drafts.model.is_none() {
+                return Vec::new();
+            }
+            keys.push(at(ShuntDraftField::Model(ModelFieldKind::Id)));
+            keys.push(at(ShuntDraftField::Model(ModelFieldKind::DisplayName)));
+            keys.extend(provider_names(view).into_iter().map(|provider| {
+                at(ShuntDraftField::Model(ModelFieldKind::UpstreamModel(
+                    provider,
+                )))
+            }));
+        }
+        ShuntAddKind::Route => {
+            if drafts.route.is_none() {
+                return Vec::new();
+            }
+            keys.extend(
+                [
+                    RouteFieldKind::Model,
+                    RouteFieldKind::Provider,
+                    RouteFieldKind::UpstreamModel,
+                    RouteFieldKind::Effort,
+                    RouteFieldKind::ServiceTier,
+                ]
+                .into_iter()
+                .map(|field| at(ShuntDraftField::Route(field))),
+            );
+        }
+    }
+    keys
+}
+
+/// The provider names a model draft's `upstream_model` rows follow, in config
+/// order and one row per DISTINCT name (first occurrence's order): the
+/// `[[upstreams]]` names, or a legacy `[providers.*]` config's provider keys.
+/// Duplicate upstream names are valid for shunt, but a model maps provider →
+/// slug by name, so two rows would collide on one `ShuntFieldKey` and build a
+/// non-parse TOML map.
+fn provider_names(view: &crate::gateway_edit::ConfigView) -> Vec<String> {
+    let names: Vec<String> = match &view.form {
+        crate::gateway_edit::ProviderForm::Upstreams => view
+            .upstreams
+            .iter()
+            .map(|u| entry_name(u.name.as_ref()))
+            .collect(),
+        crate::gateway_edit::ProviderForm::Legacy { providers } => providers.clone(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    names
+        .into_iter()
+        .filter(|name| seen.insert(name.clone()))
+        .collect()
+}
+
+/// A draft field's committed value, `None` = unset (or the draft of that kind
+/// is closed, which a rendered draft field never is).
+fn draft_field_value(
+    drafts: &ShuntDrafts,
+    kind: ShuntAddKind,
+    field: &ShuntDraftField,
+) -> Option<String> {
+    match (kind, field) {
+        (ShuntAddKind::Upstream, ShuntDraftField::Upstream(field)) => {
+            let draft = drafts.upstream.as_ref()?;
+            match field {
+                UpstreamFieldKind::Name => draft.name.clone(),
+                UpstreamFieldKind::Provider => draft.provider.clone(),
+                UpstreamFieldKind::Kind => draft.kind.clone(),
+                UpstreamFieldKind::BaseUrl => draft.base_url.clone(),
+                UpstreamFieldKind::AuthMode => draft.auth_mode.clone(),
+                UpstreamFieldKind::AuthAccount => draft.account.clone(),
+                UpstreamFieldKind::Accounts => draft.accounts.clone(),
+                UpstreamFieldKind::AuthEnv => draft.env.clone(),
+                UpstreamFieldKind::AuthHeader => draft.header.clone(),
+                UpstreamFieldKind::Effort => draft.effort.clone(),
+                UpstreamFieldKind::ServiceTier => draft.service_tier.clone(),
+            }
+        }
+        (ShuntAddKind::Model, ShuntDraftField::Model(field)) => {
+            let draft = drafts.model.as_ref()?;
+            match field {
+                ModelFieldKind::Id => draft.id.clone(),
+                ModelFieldKind::DisplayName => draft.display_name.clone(),
+                ModelFieldKind::UpstreamModel(provider) => draft
+                    .upstream_model
+                    .iter()
+                    .find(|(name, _)| name == provider)
+                    .and_then(|(_, slug)| slug.clone()),
+            }
+        }
+        (ShuntAddKind::Route, ShuntDraftField::Route(field)) => {
+            let draft = drafts.route.as_ref()?;
+            match field {
+                RouteFieldKind::Model => draft.model.clone(),
+                RouteFieldKind::Provider => draft.provider.clone(),
+                RouteFieldKind::UpstreamModel => draft.upstream_model.clone(),
+                RouteFieldKind::Effort => draft.effort.clone(),
+                RouteFieldKind::ServiceTier => draft.service_tier.clone(),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Commit `value` into a draft field, in memory: empty text unsets it. The
+/// caller rebuilds the config stops afterwards, since a committed auth mode
+/// changes the mode-dependent row set.
+fn set_draft_field_value(
+    drafts: &mut ShuntDrafts,
+    kind: ShuntAddKind,
+    field: &ShuntDraftField,
+    value: &str,
+) {
+    let value = (!value.is_empty()).then(|| value.to_string());
+    match (kind, field) {
+        (ShuntAddKind::Upstream, ShuntDraftField::Upstream(field)) => {
+            let draft = drafts.upstream.get_or_insert_with(UpstreamDraft::default);
+            match field {
+                UpstreamFieldKind::Name => draft.name = value,
+                UpstreamFieldKind::Provider => draft.provider = value,
+                UpstreamFieldKind::Kind => draft.kind = value,
+                UpstreamFieldKind::BaseUrl => draft.base_url = value,
+                UpstreamFieldKind::AuthMode => draft.auth_mode = value,
+                UpstreamFieldKind::AuthAccount => draft.account = value,
+                UpstreamFieldKind::Accounts => draft.accounts = value,
+                UpstreamFieldKind::AuthEnv => draft.env = value,
+                UpstreamFieldKind::AuthHeader => draft.header = value,
+                UpstreamFieldKind::Effort => draft.effort = value,
+                UpstreamFieldKind::ServiceTier => draft.service_tier = value,
+            }
+        }
+        (ShuntAddKind::Model, ShuntDraftField::Model(field)) => {
+            let draft = drafts.model.get_or_insert_with(ModelDraft::default);
+            match field {
+                ModelFieldKind::Id => draft.id = value,
+                ModelFieldKind::DisplayName => draft.display_name = value,
+                ModelFieldKind::UpstreamModel(provider) => {
+                    if let Some((_, slug)) = draft
+                        .upstream_model
+                        .iter_mut()
+                        .find(|(name, _)| name == provider)
+                    {
+                        *slug = value;
+                    } else {
+                        draft.upstream_model.push((provider.clone(), value));
+                    }
+                }
+            }
+        }
+        (ShuntAddKind::Route, ShuntDraftField::Route(field)) => {
+            let draft = drafts.route.get_or_insert_with(RouteDraft::default);
+            match field {
+                RouteFieldKind::Model => draft.model = value,
+                RouteFieldKind::Provider => draft.provider = value,
+                RouteFieldKind::UpstreamModel => draft.upstream_model = value,
+                RouteFieldKind::Effort => draft.effort = value,
+                RouteFieldKind::ServiceTier => draft.service_tier = value,
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The value a field row renders and its editor opens on: the decoded string,
 /// else the file's own TOML text; the inner `None` = unset (renders `—`). The
-/// outer `None` = the key names no editable field.
+/// outer `None` = the key names no editable field. A draft field's value reads
+/// the open draft (the inner `None` = the draft's field is unset).
 pub(crate) fn shunt_field_value(
     view: &crate::gateway_edit::ConfigView,
+    drafts: &ShuntDrafts,
     key: &ShuntFieldKey,
 ) -> Option<Option<String>> {
     match key {
@@ -8423,6 +9718,7 @@ pub(crate) fn shunt_field_value(
         ShuntFieldKey::DefaultProvider => {
             Some(written_value(view.server.default_provider.as_ref()))
         }
+        ShuntFieldKey::Draft { kind, field } => Some(draft_field_value(drafts, *kind, field)),
         ShuntFieldKey::Upstream {
             name,
             occurrence,
@@ -8615,6 +9911,9 @@ pub(crate) fn edit_for_field(
                 value: unset(typed),
             })
         }
+        // A draft field never produces a file edit: its commit lands in the
+        // draft (handled before `edit_for_field` is reached).
+        ShuntFieldKey::Draft { .. } => None,
     }
 }
 
@@ -8678,6 +9977,15 @@ pub(crate) fn cycle_options(key: &ShuntFieldKey) -> &'static [&'static str] {
             field: RouteFieldKind::ServiceTier,
             ..
         } => &SERVICE_TIERS,
+        ShuntFieldKey::Draft { field, .. } => match field {
+            ShuntDraftField::Upstream(UpstreamFieldKind::Provider) => &UPSTREAM_PROVIDERS,
+            ShuntDraftField::Upstream(UpstreamFieldKind::Kind) => &KINDS,
+            ShuntDraftField::Upstream(UpstreamFieldKind::AuthMode) => &AUTH_MODES,
+            ShuntDraftField::Upstream(UpstreamFieldKind::AuthHeader) => &AUTH_HEADERS,
+            ShuntDraftField::Upstream(UpstreamFieldKind::ServiceTier)
+            | ShuntDraftField::Route(RouteFieldKind::ServiceTier) => &SERVICE_TIERS,
+            _ => &[],
+        },
         _ => &[],
     }
 }
@@ -8921,7 +10229,7 @@ fn run_shunt_action(job: ShuntActionJob) -> ShuntActionOutcome {
 fn run_config_edit(
     record: &crate::gateway::GatewayRecord,
     edit: &crate::gateway_edit::Edit,
-    key: ShuntFieldKey,
+    key: ShuntSaveKey,
     confirmed: bool,
 ) -> ShuntActionOutcome {
     use crate::gateway::ConfigEditRefusal;
@@ -15653,10 +16961,15 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             }
         }
         ConfirmAction::RestartBind { key, edit } => {
-            start_field_save(app, key, *edit, true);
+            start_shunt_save(app, ShuntSaveKey::Field(key), *edit, true);
         }
         ConfirmAction::RenameField { key, edit } => {
-            start_field_save(app, key, *edit, false);
+            start_shunt_save(app, ShuntSaveKey::Field(key), *edit, false);
+        }
+        ConfirmAction::RemoveEntry { key, edit } => {
+            // Re-arming a remove clears the stale refusal line under the row.
+            app.services.shunt_remove_refusal.take();
+            start_shunt_save(app, ShuntSaveKey::Remove(key), *edit, false);
         }
         ConfirmAction::Acknowledge => {}
     }

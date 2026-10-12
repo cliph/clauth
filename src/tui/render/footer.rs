@@ -10,9 +10,9 @@ use ratatui::widgets::Paragraph;
 use super::super::app::{
     App, ConfigFocus, ConfigRow, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS, GlobalConfigRow,
     HERDR_OPTIONS, HerdrOption, KeyOwner, LoginSession, Modal, ServiceFix, ServicesFocus,
-    ShuntFieldEdit, ShuntFocus, StatusFocus, Tab, TokenView, build_action_menu, config_rows,
-    fallback_hint, fix_verb, has_sub_focus, herdr_config_writable, is_cycle_field, keyboard_owner,
-    token_model_count,
+    ShuntFieldEdit, ShuntFieldKey, ShuntFocus, ShuntSaveKey, StatusFocus, Tab, TokenView,
+    build_action_menu, config_rows, fallback_hint, field_locked, fix_verb, has_sub_focus,
+    herdr_config_writable, is_cycle_field, keyboard_owner, token_model_count,
 };
 use super::super::theme;
 use super::format::spinner_frame;
@@ -27,6 +27,15 @@ const TYPED_FIELD: &[(&str, &str)] = &[("↵", "save"), ("←→", "caret"), ("e
 
 /// A shunt cycle row's pending pick: no caret to walk, so it sheds `←→ caret`.
 const SHUNT_PICK: &[(&str, &str)] = &[("↵", "save"), ("esc", "revert")];
+
+/// A draft field's typed editor: nothing saves until the form's own
+/// `save <kind>` row, so `↵` reads `done` (the Setup `+ new` form's word); its
+/// `esc` restores the draft value (unlike that form's `esc done`), so it keeps
+/// `esc revert`.
+const DRAFT_FIELD: &[(&str, &str)] = &[("↵", "done"), ("←→", "caret"), ("esc", "revert")];
+
+/// A draft cycle row's pending pick: the `done` word, no caret to walk.
+const DRAFT_PICK: &[(&str, &str)] = &[("↵", "done"), ("esc", "revert")];
 
 /// A field editor whose row is saving is locked: only the editing keys (`esc`,
 /// typing, `↵`, `space`) are inert, so the footer names the non-edit keys that
@@ -166,8 +175,15 @@ fn owner_hints(owner: KeyOwner, app: &App) -> Option<&'static [(&'static str, &'
         // (no `esc revert` / `↵ save`), `↑↓` still moves off the row and `q`
         // ascends, and the outcome surfaces as a toast or the `└` line.
         KeyOwner::ShuntField => match app.services.shunt_field_edit.as_ref() {
-            Some(state) if app.services.saving(&state.key) => Some(LOCKED),
-            Some(state) if matches!(state.edit, ShuntFieldEdit::Pick { .. }) => Some(SHUNT_PICK),
+            Some(state) if field_locked(app, &state.key) => Some(LOCKED),
+            Some(state) if matches!(state.edit, ShuntFieldEdit::Pick { .. }) => {
+                if matches!(state.key, ShuntFieldKey::Draft { .. }) {
+                    Some(DRAFT_PICK)
+                } else {
+                    Some(SHUNT_PICK)
+                }
+            }
+            Some(state) if matches!(state.key, ShuntFieldKey::Draft { .. }) => Some(DRAFT_FIELD),
             _ => Some(TYPED_FIELD),
         },
         // `←→` walk the chips and each space saves, so nothing reads as a
@@ -555,21 +571,47 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 hints.push(("space/↵", "toggle"));
             }
             Some(ShuntFocus::CheckOutput { .. }) => hints.push(("space/↵", "open")),
-            Some(ShuntFocus::Entry { key }) => hints.push((
-                "space/↵",
-                if app.services.shunt_expanded.contains(key) {
-                    "collapse"
-                } else {
-                    "expand"
-                },
-            )),
-            Some(ShuntFocus::Field { key }) if !app.services.saving(key) => {
+            Some(ShuntFocus::Entry { key })
+                if !app.services.saving(&ShuntSaveKey::Remove(key.clone())) =>
+            {
+                hints.push((
+                    "space/↵",
+                    if app.services.shunt_expanded.contains(key) {
+                        "collapse"
+                    } else {
+                        "expand"
+                    },
+                ));
+            }
+            Some(ShuntFocus::Field { key }) if !field_locked(app, key) => {
                 if is_cycle_field(key) {
                     hints.push(("space", "cycle"));
                     hints.push(("↵", "custom"));
                 } else {
                     hints.push(("↵", "edit value"));
                 }
+            }
+            Some(ShuntFocus::Add { kind })
+                if !app.services.saving(&ShuntSaveKey::SaveAdd(*kind)) =>
+            {
+                hints.push((
+                    "space/↵",
+                    if app.services.shunt_drafts.is_open(*kind) {
+                        "collapse"
+                    } else {
+                        "add"
+                    },
+                ));
+            }
+            Some(ShuntFocus::SaveAdd { kind })
+                if !app.services.saving(&ShuntSaveKey::SaveAdd(*kind)) =>
+            {
+                hints.push(("↵", "save"));
+            }
+            Some(ShuntFocus::Remove { key })
+                if !app.services.saving(&ShuntSaveKey::Remove(key.clone())) =>
+            {
+                hints.push(("↵", "remove"));
             }
             _ => {}
         }

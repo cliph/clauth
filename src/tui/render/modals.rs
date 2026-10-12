@@ -509,6 +509,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             | ConfirmAction::AddAdminTable
             | ConfirmAction::StopShunt
             | ConfirmAction::RestartBind { .. }
+            | ConfirmAction::RemoveEntry { .. }
     );
 
     // `AddChainCandidate` names the candidate in its confirm button so the
@@ -523,6 +524,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         ConfirmAction::StopShunt => "stop".to_string(),
         ConfirmAction::RestartBind { .. } => "restart".to_string(),
         ConfirmAction::RenameField { .. } => "rename".to_string(),
+        ConfirmAction::RemoveEntry { .. } => "remove".to_string(),
         _ => "confirm".to_string(),
     };
 

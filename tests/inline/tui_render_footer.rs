@@ -95,3 +95,51 @@ fn the_setup_alert_row_advertises_its_stepper_keys() {
         ]
     );
 }
+
+/// Ruling 10: a draft field's typed editor reads `↵ done   ←→ caret   esc
+/// revert`, a draft cycle row's pending pick `↵ done   esc revert` — the Setup
+/// `+ new` form's `done` word, `esc revert` kept because the draft editor's
+/// `esc` restores. B's P2-B1 plant (routing both to the non-draft hints) reds
+/// this.
+#[test]
+fn the_draft_editors_read_done_not_save() {
+    use crate::tui::app::{
+        InputState, ShuntAddKind, ShuntDraftField, ShuntFieldEdit, ShuntFieldEditState,
+        ShuntFieldKey, UpstreamFieldKind,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let draft_key = ShuntFieldKey::Draft {
+        kind: ShuntAddKind::Upstream,
+        field: ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+    };
+
+    let mut typed = bare_app();
+    typed.services.shunt_field_edit = Some(ShuntFieldEditState {
+        key: draft_key.clone(),
+        edit: ShuntFieldEdit::Typed {
+            input: InputState::new(""),
+            saved: None,
+        },
+        refusal: None,
+    });
+    assert_eq!(
+        owner_hints(KeyOwner::ShuntField, &typed),
+        Some(&[("↵", "done"), ("←→", "caret"), ("esc", "revert")][..]),
+        "a draft field's typed editor reads `↵ done`, never `↵ save`"
+    );
+
+    let mut pick = bare_app();
+    pick.services.shunt_field_edit = Some(ShuntFieldEditState {
+        key: draft_key,
+        edit: ShuntFieldEdit::Pick {
+            saved: None,
+            picked: "api_key".into(),
+        },
+        refusal: None,
+    });
+    assert_eq!(
+        owner_hints(KeyOwner::ShuntField, &pick),
+        Some(&[("↵", "done"), ("esc", "revert")][..]),
+        "a draft cycle row's pending pick reads `↵ done   esc revert`"
+    );
+}

@@ -1004,6 +1004,8 @@ fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &
             vec![(
                 "tokens",
                 &[
+                    ("\u{2191} \u{2193}", "move between cards"),
+                    ("page up / page down", "move a page of cards"),
                     ("c", "count cache in token figures"),
                     (
                         "t",
@@ -1016,6 +1018,8 @@ fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &
         Tab::Tokens if app.token_view == TokenView::Dashboard => vec![(
             "tokens",
             &[
+                ("\u{2191} \u{2193}", "move between cards"),
+                ("page up / page down", "move a page of cards"),
                 ("\u{21b5}", "open per-model breakdown"),
                 ("c", "count cache in token figures"),
                 (

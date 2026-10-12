@@ -347,6 +347,8 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
             &dashboard,
             "TOKENS",
             &[
+                "│    ↑ ↓                 move between cards",
+                "│    page up / page down  move a page of cards",
                 "│    c                   count cache in token figures",
                 "│    t                   cycle period · lifetime / daily / weekly / monthly",
                 "│    r                   reload on-disk stats",
@@ -357,6 +359,8 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
             &populated_dashboard,
             "TOKENS",
             &[
+                "│    ↑ ↓                 move between cards",
+                "│    page up / page down  move a page of cards",
                 "│    ↵                   open per-model breakdown",
                 "│    c                   count cache in token figures",
                 "│    t                   cycle period · lifetime / daily / weekly / monthly",

@@ -26804,3 +26804,486 @@ fn the_walk_agrees_after_an_add_and_a_remove_land() {
     rig.app.services.shunt_ok = None;
     assert_rig_walk_lands_on_own_rows(&mut rig);
 }
+
+// ── Tokens dashboard: card focus + whole-card scroll (tui-fix S3) ────────────
+
+fn dash_app() -> App {
+    use crate::tokens::{ModelTokens, TokenStats};
+    let mut app = bare_app();
+    app.tab = super::Tab::Tokens;
+    app.token_stats = Some(TokenStats {
+        models: vec![ModelTokens {
+            model: "claude-alpha".into(),
+            input: 10_000_000,
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    app
+}
+
+/// Draw the full TUI frame at `w`×`h` and return the cell buffer.
+fn dash_draw(app: &App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    term.backend().buffer().clone()
+}
+
+fn dash_rows(app: &App, w: u16, h: u16) -> Vec<String> {
+    crate::testutil::buffer_rows(&dash_draw(app, w, h))
+}
+
+fn dash_title_cells<'a>(
+    buf: &'a ratatui::buffer::Buffer,
+    title: &str,
+) -> Vec<&'a ratatui::buffer::Cell> {
+    crate::testutil::needle_cells(buf, title).unwrap_or_else(|| panic!("title `{title}` missing"))
+}
+
+/// Cell column of the card whose title sits at `row`: the `╭` corner just
+/// before the title (the side-by-side partner's corner is further left).
+fn dash_card_left(rows: &[String], row: usize, title: &str) -> usize {
+    let byte = rows[row]
+        .find(title)
+        .unwrap_or_else(|| panic!("`{title}` missing"));
+    let before: Vec<char> = rows[row][..byte].chars().collect();
+    before
+        .iter()
+        .rposition(|&c| c == '╭')
+        .unwrap_or_else(|| panic!("no ╭ before `{title}`"))
+}
+
+/// Assert every card top border (`╭`) in the body has its bottom border (`╰`)
+/// in the same column below it, and every bottom border a top above — no card
+/// drawn without a whole frame.
+fn assert_whole_cards(rows: &[String], body_top: usize, body_bottom: usize) {
+    let width = rows[0].chars().count();
+    for x in 0..width {
+        let mut stack = Vec::new();
+        for (y, row) in rows.iter().enumerate().take(body_bottom).skip(body_top) {
+            match row.chars().nth(x) {
+                Some('╭') => stack.push(y),
+                Some('╰') => assert!(stack.pop().is_some(), "orphan bottom border at ({x},{y})"),
+                _ => {}
+            }
+        }
+        assert!(
+            stack.is_empty(),
+            "top border without a bottom border in column {x}"
+        );
+    }
+}
+
+/// Assert exactly one card holds focus: one `╭` corner cell in `LINE_STRONG`.
+fn assert_one_focused_border(buf: &ratatui::buffer::Buffer, body_top: usize, body_bottom: usize) {
+    let strong = crate::tui::theme::line_strong_color();
+    let mut focused = 0;
+    for y in body_top..body_bottom {
+        for x in 0..buf.area.width {
+            let cell = buf.cell((x, y as u16)).unwrap();
+            if cell.symbol() == "╭" && cell.fg == strong {
+                focused += 1;
+            }
+        }
+    }
+    assert_eq!(focused, 1, "exactly one focused card border");
+}
+
+/// Walking `↓` and, separately, `PageDown` from the first to the last card at
+/// the three short sizes, every frame keeps the header intact, draws no card
+/// with a top border but no bottom border, and shows one `LINE_STRONG` focus.
+#[test]
+fn dashboard_walk_scans_every_frame_for_whole_cards_and_intact_header() {
+    use super::{KeyCode, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    for &(w, h) in &[(45u16, 24u16), (80u16, 14u16), (80u16, 24u16)] {
+        for &key in &[KeyCode::Down, KeyCode::PageDown] {
+            let mut app = dash_app();
+            let header: Vec<String> = dash_rows(&app, w, h)[..3].to_vec();
+            let body_bottom = h as usize - 1;
+            for step in 0..7 {
+                let buf = dash_draw(&app, w, h);
+                let rows = crate::testutil::buffer_rows(&buf);
+                assert_eq!(
+                    &rows[..3],
+                    &header[..],
+                    "header intact at {w}x{h} {key:?} step {step}"
+                );
+                assert_whole_cards(&rows, 3, body_bottom);
+                assert_one_focused_border(&buf, 3, body_bottom);
+                if step < 6 {
+                    handle_key(&mut app, crate::testutil::key(key));
+                }
+            }
+        }
+    }
+}
+
+/// The card-focus styles are exact: one strong border + bold title, every other
+/// card blurred, and the first card's title orange in both states.
+#[test]
+fn dashboard_card_focus_styles_are_exact() {
+    use super::{KeyCode, handle_key};
+    use ratatui::style::Modifier;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = dash_app();
+    let (w, h) = (45u16, 24u16);
+    let buf = dash_draw(&app, w, h);
+    let strong = crate::tui::theme::line_strong_color();
+    let line = crate::tui::theme::line_color();
+    let orange = crate::tui::theme::accent_2_color();
+    let dim = crate::tui::theme::text_dim_color();
+
+    assert_eq!(
+        buf.cell((0, 3)).unwrap().fg,
+        strong,
+        "focus starts on the first card (strong border)"
+    );
+    let today = dash_title_cells(&buf, "TODAY");
+    assert!(
+        today.iter().all(|c| c.fg == orange),
+        "first title is orange"
+    );
+    assert!(
+        today.iter().all(|c| c.modifier.contains(Modifier::BOLD)),
+        "focused first title is bold"
+    );
+    assert_eq!(
+        buf.cell((0, 9)).unwrap().fg,
+        line,
+        "the second card's border is blurred"
+    );
+    let total = dash_title_cells(&buf, "TOTAL");
+    assert!(total.iter().all(|c| c.fg == dim), "second title is dim");
+    assert!(
+        total.iter().all(|c| !c.modifier.contains(Modifier::BOLD)),
+        "blurred title is not bold"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let buf = dash_draw(&app, w, h);
+    assert_eq!(
+        buf.cell((0, 3)).unwrap().fg,
+        line,
+        "the first card's border blurs when it loses focus"
+    );
+    let today = dash_title_cells(&buf, "TODAY");
+    assert!(
+        today.iter().all(|c| c.fg == orange),
+        "the first title stays orange when blurred"
+    );
+    assert!(
+        today.iter().all(|c| !c.modifier.contains(Modifier::BOLD)),
+        "the blurred first title drops bold"
+    );
+    assert_eq!(
+        buf.cell((0, 9)).unwrap().fg,
+        strong,
+        "the total card's border is strong when focused"
+    );
+    let total = dash_title_cells(&buf, "TOTAL");
+    assert!(total.iter().all(|c| c.fg == dim), "total title stays dim");
+    assert!(
+        total.iter().all(|c| c.modifier.contains(Modifier::BOLD)),
+        "focused total title is bold"
+    );
+}
+
+/// ↓ wraps from the last card to the first; the page keys stop at the ends.
+#[test]
+fn dashboard_focus_wraps_and_page_keys_stop_at_the_ends() {
+    use super::{KeyCode, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = dash_app();
+    let (w, h) = (45u16, 24u16);
+    dash_rows(&app, w, h);
+    let strong = crate::tui::theme::line_strong_color();
+
+    // ↓ past the last card wraps back to the first.
+    for _ in 0..7 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    let buf = dash_draw(&app, w, h);
+    assert_eq!(
+        buf.cell((0, 3)).unwrap().fg,
+        strong,
+        "wrapping ↓ lands focus back on the first card"
+    );
+
+    // PageDown stops at the last card: a fourth press changes nothing.
+    for _ in 0..4 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    }
+    let buf = dash_draw(&app, w, h);
+    let rows = crate::testutil::buffer_rows(&buf);
+    let title = rows
+        .iter()
+        .position(|r| r.contains(" ACTIVITY "))
+        .expect("activity on screen");
+    let left = rows[title].find('╭').expect("activity has a top border");
+    assert_eq!(
+        buf.cell((left as u16, title as u16)).unwrap().fg,
+        strong,
+        "page down stops with focus on the last card"
+    );
+
+    // PageUp from the first card stays put.
+    for _ in 0..7 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::PageUp));
+    }
+    let buf = dash_draw(&app, w, h);
+    assert_eq!(
+        buf.cell((0, 3)).unwrap().fg,
+        strong,
+        "page up at the first card stays on the first card"
+    );
+}
+
+/// A grid that fits (the two-column reflow) keeps every card visible, still
+/// moves focus, and draws no scrollbar.
+#[test]
+fn dashboard_fits_on_a_big_terminal_with_no_scrollbar() {
+    use super::{KeyCode, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = dash_app();
+    let (w, h) = (160u16, 40u16);
+    let rows = dash_rows(&app, w, h);
+    let out = rows.concat();
+    for title in [
+        " TODAY ",
+        " TOTAL ",
+        " TOP MODELS ",
+        " COMPOSITION ",
+        " HOUR OF DAY ",
+        " ACTIVITY ",
+        " DAILY ",
+    ] {
+        assert!(
+            out.contains(title),
+            "every card renders at {w}x{h}: missing {title}"
+        );
+    }
+    assert!(!out.contains('┊'), "no scrollbar track when the grid fits");
+    assert!(!out.contains('┃'), "no scrollbar thumb when the grid fits");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let buf = dash_draw(&app, w, h);
+    assert_eq!(
+        buf.cell((0, 3)).unwrap().fg,
+        crate::tui::theme::line_color(),
+        "the first card blurs after ↓"
+    );
+    assert_eq!(
+        buf.cell((0, 9)).unwrap().fg,
+        crate::tui::theme::line_strong_color(),
+        "↓ moves focus to the total card"
+    );
+}
+
+/// The scrollbar lives in the body's right padding column, only while the grid
+/// overflows, and never covers a content cell.
+#[test]
+fn dashboard_scrollbar_sits_in_the_padding_column_only_on_overflow() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = dash_app();
+    let (w, h) = (45u16, 24u16);
+    let buf = dash_draw(&app, w, h);
+    let mut saw_thumb = false;
+    for y in 3..(h as usize - 1) {
+        let cell = buf.cell((w - 1, y as u16)).unwrap();
+        assert!(
+            cell.symbol() == "┊" || cell.symbol() == "┃",
+            "right padding column is scrollbar at row {y}, got {:?}",
+            cell.symbol()
+        );
+        saw_thumb |= cell.symbol() == "┃";
+    }
+    assert!(saw_thumb, "the overflow grid shows a thumb");
+
+    // No scrollbar glyph may land in a content column.
+    for y in 3..(h as usize - 1) {
+        for x in 0..(w as usize - 1) {
+            let sym = buf.cell((x as u16, y as u16)).unwrap().symbol();
+            assert_ne!(sym, "┊", "track leaks into content at ({x},{y})");
+            assert_ne!(sym, "┃", "thumb leaks into content at ({x},{y})");
+        }
+    }
+}
+
+/// The scrollbar thumb stays whole and ends on the last body row at the end of
+/// the grid: at 45×24, ↓×6 (focus ACTIVITY) the rightmost column holds exactly
+/// 8 `┃` cells (viewport 20, total 49, hand-computed) at rows 15–22.
+#[test]
+fn dashboard_scrollbar_thumb_fills_to_the_last_row_at_the_end() {
+    use super::{KeyCode, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = dash_app();
+    let (w, h) = (45u16, 24u16);
+    dash_rows(&app, w, h);
+    for _ in 0..6 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    let buf = dash_draw(&app, w, h);
+    let col = w - 1;
+    let thumb: Vec<u16> = (3..(h - 1))
+        .filter(|&y| buf.cell((col, y)).unwrap().symbol() == "┃")
+        .collect();
+    assert_eq!(thumb.len(), 8, "thumb is 8 cells, got {thumb:?}");
+    assert_eq!(*thumb.first().unwrap(), 15, "thumb starts at row 15");
+    assert_eq!(
+        *thumb.last().unwrap(),
+        22,
+        "thumb ends on the last body row"
+    );
+}
+
+/// The first-visible card is derived from the persisted offset, not recomputed
+/// from focus each frame: ↓×6 leaves hour at the top, and ↑ onto the visible
+/// hour keeps it there. A recompute-per-frame plant re-pins and reds.
+#[test]
+fn dashboard_first_visible_card_persists_across_redraws() {
+    use super::{KeyCode, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = dash_app();
+    let (w, h) = (45u16, 24u16);
+    dash_rows(&app, w, h);
+    for _ in 0..6 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    let before = dash_rows(&app, w, h);
+    assert!(
+        before[3].contains(" HOUR OF DAY "),
+        "↓×6 leaves hour at the top, got {:?}",
+        before[3]
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    let after = dash_rows(&app, w, h);
+    assert_eq!(
+        before[3], after[3],
+        "↑ onto a visible card keeps the first-visible card"
+    );
+}
+
+/// After a resize that shrinks the body, the focused card stays on screen whole.
+#[test]
+fn dashboard_resize_shrink_keeps_focus_visible() {
+    use super::{KeyCode, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let strong = crate::tui::theme::line_strong_color();
+    for &((w1, h1), (w2, h2)) in &[
+        ((45u16, 40u16), (80u16, 14u16)),
+        ((45u16, 40u16), (45u16, 24u16)),
+        ((80u16, 24u16), (80u16, 14u16)),
+    ] {
+        let mut app = dash_app();
+        dash_rows(&app, w1, h1);
+        for _ in 0..6 {
+            handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        }
+        let buf = dash_draw(&app, w2, h2);
+        let rows = crate::testutil::buffer_rows(&buf);
+        let title = rows
+            .iter()
+            .position(|r| r.contains(" ACTIVITY "))
+            .unwrap_or_else(|| panic!("activity on screen after {w1}x{h1}→{w2}x{h2}: {rows:#?}"));
+        let left = dash_card_left(&rows, title, " ACTIVITY ");
+        assert_eq!(
+            buf.cell((left as u16, title as u16)).unwrap().fg,
+            strong,
+            "focus stays on activity after {w1}x{h1}→{w2}x{h2}"
+        );
+        assert!(
+            (title + 1..(h2 as usize - 1)).any(|y| rows[y].chars().nth(left) == Some('╰')),
+            "activity drawn whole after {w1}x{h1}→{w2}x{h2}"
+        );
+    }
+}
+
+/// After a resize that grows the body, the view fills it (no blank tail while
+/// cards above stay hidden).
+#[test]
+fn dashboard_resize_grow_fills_the_body() {
+    use super::{KeyCode, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    for &((w1, h1), (w2, h2)) in &[
+        ((80u16, 14u16), (80u16, 24u16)),
+        ((45u16, 24u16), (45u16, 40u16)),
+        // Width-only resizes that swap the narrow layout for the single-column
+        // one at the same height (the clamp must fire on the geometry change).
+        ((45u16, 24u16), (80u16, 24u16)),
+        ((45u16, 22u16), (80u16, 22u16)),
+    ] {
+        let mut app = dash_app();
+        dash_rows(&app, w1, h1);
+        for _ in 0..6 {
+            handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        }
+        let rows = dash_rows(&app, w2, h2);
+        let body_bottom = h2 as usize - 1;
+        let tallest = if w2 < 60 { 9 } else { 7 };
+        let blank = rows[3..body_bottom]
+            .iter()
+            .rev()
+            .take_while(|r| r.chars().all(|c| c == ' ' || c == '┊' || c == '┃'))
+            .count();
+        assert!(
+            blank < tallest,
+            "no blank tail at {w1}x{h1}→{w2}x{h2}, got {blank} blank rows"
+        );
+    }
+}
+
+/// Crossing the two-column gate keeps focus on the same card, not the same
+/// reading-order slot.
+#[test]
+fn dashboard_resize_across_two_column_gate_keeps_the_focused_card() {
+    use super::{KeyCode, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = dash_app();
+    dash_rows(&app, 80, 24);
+    // ↓×2 from the first card lands on the trend card (single-column order).
+    for _ in 0..2 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    let buf = dash_draw(&app, 160, 40);
+    // The two-column layout pins the trend card at the top of the right
+    // column (`CARD_COL_W` = 56), so its top-left corner is a fixed cell.
+    assert_eq!(
+        buf.cell((56, 3)).unwrap().fg,
+        crate::tui::theme::line_strong_color(),
+        "focus stays on trend across the two-column gate"
+    );
+}
+
+/// The overflowing single-column grid clamps to the centered `DASH_MAX_W` band.
+#[test]
+fn dashboard_overflow_clamps_the_single_column_band() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for &(w, h) in &[(200u16, 24u16), (130u16, 24u16)] {
+        let app = dash_app();
+        let rows = dash_rows(&app, w, h);
+        let band_left = (w as usize - 120) / 2;
+        let row3 = &rows[3];
+        let first = row3.chars().position(|c| c == '╭').unwrap_or(0);
+        let last = row3
+            .chars()
+            .rev()
+            .position(|c| c == '╮')
+            .map(|p| row3.chars().count() - 1 - p)
+            .unwrap_or(0);
+        assert!(
+            first >= band_left,
+            "first card opens inside the band at {w}x{h}: {first} vs {band_left}"
+        );
+        assert!(
+            last <= band_left + 120,
+            "first card closes inside the band at {w}x{h}: {last}"
+        );
+    }
+}

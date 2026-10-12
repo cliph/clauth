@@ -1544,6 +1544,19 @@ pub(crate) enum TokenView {
     Models,
 }
 
+/// One card of the Tokens dashboard. Focus is stored as this (not an index)
+/// so it keeps meaning across a resize that changes the layout's reading order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CardKind {
+    First,
+    Total,
+    Trend,
+    Models,
+    Comp,
+    Hour,
+    Activity,
+}
+
 /// Display filter over the Tokens tab's grouped model list (top-models card +
 /// the Models view), set from the tab's action menu. Session-only — a lens,
 /// not a setting. The aggregate cards (today/total/daily/…) stay unfiltered:
@@ -3509,6 +3522,22 @@ pub(crate) struct App {
     /// Model filter over the Tokens tab's model surfaces (action-menu driven).
     pub(crate) token_filter: TokenFilter,
     pub(crate) token_period: TokenPeriod,
+    /// Focused card on the Tokens dashboard. Held across period/filter changes
+    /// and across a resize (it names the card, not a layout slot).
+    pub(crate) token_dash_focus: CardKind,
+    /// First fully-visible card (index into the published reading order),
+    /// reconciled each frame by [`follow_dash_focus`] and held in a `Cell` so
+    /// the render pass can publish its correction (precedent: `token_dash_viewport`).
+    pub(crate) token_dash_first: std::cell::Cell<usize>,
+    /// Dashboard card reading order, published by the render pass so the key
+    /// handler can walk `↑`/`↓` in the same order the frame drew.
+    pub(crate) token_dash_order: std::cell::Cell<[CardKind; 7]>,
+    /// Dashboard card `(top, bottom)` rows in reading order, published by the
+    /// render pass for the key handler's whole-card scroll; empty until the
+    /// first dashboard frame draws.
+    pub(crate) token_dash_rows: std::cell::RefCell<Vec<(u16, u16)>>,
+    /// Dashboard viewport height (body rows), published by the render pass.
+    pub(crate) token_dash_viewport: std::cell::Cell<u16>,
     /// Token-stats load results from the background loader; drained in `on_tick`.
     pub(crate) tokens_events: std::sync::mpsc::Receiver<crate::tokens::TokensEvent>,
     /// Manual-refresh signal to the token loader; a `()` triggers a reload.
@@ -4012,6 +4041,19 @@ impl App {
             model_detail_viewport: std::cell::Cell::new(0),
             token_filter: TokenFilter::default(),
             token_period: TokenPeriod::default(),
+            token_dash_focus: CardKind::First,
+            token_dash_first: std::cell::Cell::new(0),
+            token_dash_order: std::cell::Cell::new([
+                CardKind::First,
+                CardKind::Total,
+                CardKind::Trend,
+                CardKind::Models,
+                CardKind::Comp,
+                CardKind::Hour,
+                CardKind::Activity,
+            ]),
+            token_dash_rows: std::cell::RefCell::new(Vec::new()),
+            token_dash_viewport: std::cell::Cell::new(0),
             tokens_events,
             tokens_refresh,
             price_table: None,
@@ -5331,23 +5373,28 @@ fn reload_token_stats(app: &mut App) {
     app.toast(ToastKind::Info, "reloading token usage");
 }
 
-/// Tokens tab: `c` toggles cache-counting on either view; Dashboard enters
-/// Models on ⏎. From Models, ⏎ descends into the read-only detail.
+/// Tokens tab: `c` toggles cache-counting on either view; the Dashboard moves
+/// card focus with ↑/↓ (wrapping) and the page keys (stopping at the ends), and
+/// ⏎ descends into Models. From Models, ⏎ descends into the read-only detail.
 fn handle_tokens_key(app: &mut App, key: KeyEvent) {
     if key.code == KeyCode::Char('c') {
         toggle_count_cache(app);
         return;
     }
     match app.token_view {
-        TokenView::Dashboard => {
-            // Dashboard is a fixed grid (no scroll); ⏎ descends into Models.
-            if key.code == KeyCode::Enter && token_model_count(app) > 0 {
+        TokenView::Dashboard => match key.code {
+            KeyCode::Enter if token_model_count(app) > 0 => {
                 app.token_view = TokenView::Models;
                 app.model_detail_focus = StatusFocus::List;
                 app.model_detail_scroll = 0;
                 app.token_model_cursor = 0;
             }
-        }
+            KeyCode::Up => dash_move_focus(app, DashDir::Prev),
+            KeyCode::Down => dash_move_focus(app, DashDir::Next),
+            KeyCode::PageUp => dash_move_focus(app, DashDir::PageUp),
+            KeyCode::PageDown => dash_move_focus(app, DashDir::PageDown),
+            _ => {}
+        },
         TokenView::Models => {
             if app.model_detail_focus == StatusFocus::Detail {
                 let max = app.model_detail_max_scroll.get();
@@ -5406,6 +5453,128 @@ fn handle_tokens_key(app: &mut App, key: KeyEvent) {
             }
         }
     }
+}
+
+/// Direction a dashboard key moves card focus.
+enum DashDir {
+    Prev,
+    Next,
+    PageUp,
+    PageDown,
+}
+
+/// Move dashboard card focus one step (or one page) and reconcile the
+/// first-visible card, both through [`follow_dash_focus`].
+fn dash_move_focus(app: &mut App, dir: DashDir) {
+    let (new_focus, new_first) = {
+        let order = app.token_dash_order.get();
+        let rows = app.token_dash_rows.borrow();
+        if rows.len() != 7 {
+            return;
+        }
+        let viewport = app.token_dash_viewport.get();
+        let Some(pos) = order.iter().position(|&k| k == app.token_dash_focus) else {
+            return;
+        };
+        let starts: Vec<usize> = rows.iter().map(|&(top, _)| top as usize).collect();
+        let next = match dir {
+            DashDir::Prev => (pos + 6) % 7,
+            DashDir::Next => (pos + 1) % 7,
+            DashDir::PageUp => page_land_up(pos, &starts, viewport as usize),
+            DashDir::PageDown => page_land_down(pos, &starts, viewport as usize),
+        }
+        .min(6);
+        let focus = order[next];
+        let first = follow_dash_focus(&order, &rows, viewport, focus, app.token_dash_first.get());
+        (focus, first)
+    };
+    app.token_dash_focus = new_focus;
+    app.token_dash_first.set(new_first);
+}
+
+/// Reconcile the persisted first-visible card against the laid-out geometry and
+/// the focused card: it moves only when focus leaves the view. Pure — the key
+/// path and the render pass both call it.
+pub(crate) fn follow_dash_focus(
+    order: &[CardKind; 7],
+    rows: &[(u16, u16)],
+    viewport: u16,
+    focus: CardKind,
+    first: usize,
+) -> usize {
+    if rows.is_empty() || viewport == 0 {
+        return 0;
+    }
+    let last = rows.len() - 1;
+    if rows[last].1 <= rows[0].0 + viewport {
+        return 0; // grid fits: no scroll
+    }
+    let Some(mut focus_idx) = order.iter().position(|&k| k == focus) else {
+        return first.min(last);
+    };
+    focus_idx = focus_idx.min(last);
+    let mut first = dash_row_start(rows, first.min(last));
+    let view_top = rows[first].0;
+    let view_bottom = view_top + viewport;
+    let (f_top, f_bottom) = rows[focus_idx];
+    if f_top < view_top {
+        first = dash_row_start(rows, focus_idx);
+    } else if f_bottom > view_bottom {
+        // Scroll down the minimum that reveals the focused card's bottom.
+        let want = f_bottom.saturating_sub(viewport);
+        let k = (0..=focus_idx)
+            .find(|&k| rows[k].0 >= want)
+            .unwrap_or(focus_idx);
+        first = dash_row_start(rows, k);
+    }
+    first
+}
+
+/// Clamp the first-visible card after a resize: the view never starts past the
+/// last card top that still fills the body (no blank tail while cards above
+/// stay hidden), bounded so the focused card's bottom stays in view. Render-only.
+pub(crate) fn clamp_dash_first(
+    order: &[CardKind; 7],
+    rows: &[(u16, u16)],
+    viewport: u16,
+    focus: CardKind,
+    first: usize,
+) -> usize {
+    if rows.is_empty() || viewport == 0 {
+        return 0;
+    }
+    let last = rows.len() - 1;
+    if rows[last].1 <= rows[0].0 + viewport {
+        return 0; // grid fits
+    }
+    let Some(mut focus_idx) = order.iter().position(|&k| k == focus) else {
+        return first.min(last);
+    };
+    focus_idx = focus_idx.min(last);
+    let first = dash_row_start(rows, first.min(last));
+    if rows[last].1 >= rows[first].0 + viewport {
+        return first; // already fills the body
+    }
+    let max_top = rows[last].1 - viewport;
+    let focus_floor = rows[focus_idx].1.saturating_sub(viewport);
+    let mut k = first;
+    while k > 0 && rows[k].0 > max_top {
+        k -= 1;
+    }
+    if rows[k].0 < focus_floor {
+        while k < last && rows[k].0 < focus_floor {
+            k += 1;
+        }
+    }
+    dash_row_start(rows, k)
+}
+
+/// The first card of `i`'s visual row (side-by-side cards share a top).
+fn dash_row_start(rows: &[(u16, u16)], mut i: usize) -> usize {
+    while i > 0 && rows[i - 1].0 == rows[i].0 {
+        i -= 1;
+    }
+    i
 }
 
 /// Switch the active tab and reset that tab's cursor to a sensible default.
@@ -5491,6 +5660,45 @@ pub(crate) fn page_step(viewport: usize) -> usize {
     viewport.saturating_sub(1).max(1)
 }
 
+/// The page-down landing row: the last row whose start line is within one page
+/// below `cursor`'s start, at least one row forward, stopping at the last row.
+/// Shared by [`page_down_cursor_by_rows`] and the Tokens dashboard page keys.
+pub(crate) fn page_land_down(cursor: usize, starts: &[usize], viewport: usize) -> usize {
+    if starts.is_empty() {
+        return 0;
+    }
+    let last = starts.len() - 1;
+    let cursor = cursor.min(last);
+    if cursor >= last {
+        return last;
+    }
+    let target = starts[cursor] + page_step(viewport);
+    let mut next = cursor + 1;
+    while next < last && starts[next + 1] <= target {
+        next += 1;
+    }
+    next
+}
+
+/// The page-up landing row: the first row whose start line is within one page
+/// above `cursor`'s start, at least one row back, stopping at the first row.
+/// Shared by [`page_up_cursor_by_rows`] and the Tokens dashboard page keys.
+pub(crate) fn page_land_up(cursor: usize, starts: &[usize], viewport: usize) -> usize {
+    if starts.is_empty() {
+        return 0;
+    }
+    let cursor = cursor.min(starts.len() - 1);
+    if cursor == 0 {
+        return 0;
+    }
+    let target = starts[cursor].saturating_sub(page_step(viewport));
+    let mut prev = cursor - 1;
+    while prev > 0 && starts[prev - 1] >= target {
+        prev -= 1;
+    }
+    prev
+}
+
 /// Page down on a read-only scroll offset, clamped to the last render's bound.
 pub(crate) fn page_down_scroll(scroll: usize, max: usize, viewport: usize) -> usize {
     scroll.min(max).saturating_add(page_step(viewport)).min(max)
@@ -5520,16 +5728,8 @@ pub(crate) fn page_down_cursor_by_rows(
     if starts.is_empty() {
         return 0;
     }
-    let last = starts.len() - 1;
-    let cursor = cursor.min(last);
-    if cursor >= last {
-        return last;
-    }
-    let target = starts[cursor] + page_step(viewport);
-    let mut next = cursor + 1;
-    while next < last && starts[next + 1] <= target {
-        next += 1;
-    }
+    let cursor = cursor.min(starts.len() - 1);
+    let mut next = page_land_down(cursor, starts, viewport);
     while next > cursor + 1 {
         let end = block_ends
             .get(next)
@@ -5567,11 +5767,7 @@ pub(crate) fn page_up_cursor_by_rows(
     if cursor == 0 {
         return 0;
     }
-    let target = starts[cursor].saturating_sub(page_step(viewport));
-    let mut prev = cursor - 1;
-    while prev > 0 && starts[prev - 1] >= target {
-        prev -= 1;
-    }
+    let mut prev = page_land_up(cursor, starts, viewport);
     while prev < cursor - 1 {
         let end = block_ends
             .get(prev)

@@ -1,6 +1,6 @@
 # Interface and keys
 
-`clauth` opens on the Overview tab. <kbd>←</kbd> <kbd>→</kbd> move between tabs except while Usage or Tokens model detail has focus: <kbd>←</kbd> returns to the selector and <kbd>→</kbd> does nothing there. <kbd>?</kbd> lists every binding for the tab you are on; <kbd>q</kbd> twice quits from the top level.
+`clauth` opens on the Overview tab. <kbd>←</kbd> <kbd>→</kbd> move between tabs except while Usage or Tokens model detail, or the Services `delegates` detail, has focus: <kbd>←</kbd> returns to the selector and <kbd>→</kbd> does nothing there. <kbd>?</kbd> lists every binding for the tab you are on; <kbd>q</kbd> twice quits from the top level.
 
 ## Tabs
 
@@ -40,7 +40,7 @@ Codex accounts ([Codex](Codex)) sit under the Claude Code rows in a section head
 
 A descended Usage or Tokens model detail scrolls one line with <kbd>↑</kbd> / <kbd>↓</kbd>; <kbd>esc</kbd> or <kbd>←</kbd> returns to its selector without changing the selected account or model. <kbd>PageUp</kbd> / <kbd>PageDown</kbd> move one page, the visible height less one line: a list or form moves its selection about a page and stops at the first or last row, and no line is passed over unseen. Choice dialogs and action menus follow the selected option so it remains visible; an overflowing choice shows a scrollbar. A custom-field overwrite whose consequence cannot fit in the choice dialog opens a confirmation with its full explanation scrollable (<kbd>↑</kbd> / <kbd>↓</kbd> and the page keys, while <kbd>←</kbd> / <kbd>→</kbd> pick the button) and cancel selected by default; a fitting choice acts at once. Toasts stack in the top-right corner, at most three lines each: a longer message ends its third line in `…`, and a failure leads with what went wrong and why.
 
-On the Tokens dashboard, <kbd>↑</kbd> / <kbd>↓</kbd> move focus card to card in reading order (wrapping), <kbd>PageUp</kbd> / <kbd>PageDown</kbd> move about a page and stop at the ends, and the grid scrolls by whole cards when it is taller than the screen: a card that does not fit whole moves below the fold, with a scrollbar in the body's right edge, instead of clipping its border.
+On the Tokens dashboard, <kbd>↑</kbd> / <kbd>↓</kbd> move focus card to card in reading order (wrapping), <kbd>PageUp</kbd> / <kbd>PageDown</kbd> move about a page and stop at the ends, and the grid scrolls by whole cards when it is taller than the screen: a card that does not fit whole moves below the fold, with a scrollbar at the grid's right edge, instead of clipping its border.
 
 ### Tab-dependent
 
@@ -48,7 +48,7 @@ On the Tokens dashboard, <kbd>↑</kbd> / <kbd>↓</kbd> move focus card to card
 |-----|----------|
 | <kbd>r</kbd> | Usage: refresh the selected account only. Tokens / Status / Services: reload that tab's data. Everywhere else: refresh every Claude Code account |
 | <kbd>t</kbd> | Tokens: cycle the period lens. Everywhere else: force-rotate every Claude Code account's token, after a confirm |
-| <kbd>⏎</kbd> | Overview: switch to the selected Claude Code account; inert on a codex row. Usage: descend into the selected account's detail to scroll its full breakdown. Tokens: open the model breakdown, then descend into the selected model's detail; a view with no model has no detail to open. Setup / Fallback: open a detail row, or commit an edit; on a Fallback card's `preferred days` row, open the day picker. Status / Services: open the detail (on the `shunt` card: flip a focused `enabled` row, open a focused `check output`) |
+| <kbd>⏎</kbd> | Overview: switch to the selected Claude Code account; inert on a codex row. Usage: descend into the selected account's detail to scroll its full breakdown. Tokens: open the model breakdown, then descend into the selected model's detail; a view with no model has no detail to open. Setup / Fallback: open a detail row, or commit an edit; on a Fallback card's `preferred days` row, open the day picker. Status / Services: open the detail (the `delegates` detail only while it lists a job) (on the `shunt` card: flip a focused `enabled` row, open a focused `check output`) |
 | <kbd>⇧↑</kbd> <kbd>⇧↓</kbd> | Overview: reorder Claude Code accounts; inert on a codex row. Fallback (chain focus): reorder chain members |
 | <kbd>space</kbd> | Config: cycle a value. Setup `model` row and Fallback toggle rows: flip. Fallback `preferred days`: step `never` → `weekdays` → `weekends` → `every day` and back to `never`, saving each step; a custom set is one more stop after `every day` until you leave the card. Services `shunt` card: flip a focused `enabled` row, open a focused `check output` |
 | <kbd>+</kbd> <kbd>-</kbd> | Fallback detail: step `rotate at` or `weekly at` by 5; Setup: step `alert at` by 5 |

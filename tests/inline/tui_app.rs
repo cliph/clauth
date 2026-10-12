@@ -27287,3 +27287,44 @@ fn dashboard_overflow_clamps_the_single_column_band() {
         );
     }
 }
+
+/// The Overview `+N more · → fallback tab` line names the route it documents:
+/// four `→` presses land on the Fallback tab, whose chain lists every member.
+#[test]
+fn overview_more_line_routes_to_the_fallback_tab() {
+    use super::{KeyCode, handle_key};
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let names: Vec<ProfileName> = (0..28)
+        .map(|i| ProfileName::from(format!("a{i}")))
+        .collect();
+    let app = App::new(AppConfig {
+        state: AppState {
+            fallback_chain: names.clone(),
+            ..AppState::default()
+        },
+        profiles: Vec::new(),
+    });
+    let mut app = app;
+    app.tab = super::Tab::Overview;
+    for _ in 0..4 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    }
+    assert_eq!(
+        app.tab,
+        super::Tab::Fallback,
+        "→ four times lands on fallback"
+    );
+    assert_eq!(
+        app.config().state.fallback_chain.len(),
+        28,
+        "the fallback chain holds every member"
+    );
+    for _ in 0..27 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    assert_eq!(
+        app.chain_cursor, 27,
+        "the last of the 28 members is selectable"
+    );
+}

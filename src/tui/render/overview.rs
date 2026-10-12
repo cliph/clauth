@@ -40,11 +40,16 @@ const ACCOUNTS_MIN: u16 = 7;
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // The chain panel's inner width is independent of the vertical split (both
     // panels span the full body width), so build its lines first and size the
-    // panel to fit them — no clipped members, no wasted rows.
+    // panel to fit them, capped; members that do not fit collapse into
+    // `truncate_chain`'s `+N more` line.
     let probe = Rect { height: 3, ..area };
     let chain_inner_w = section_box("", false, false).inner(probe).width as usize;
-    let chain_lines = fallback_flow_lines(app, chain_inner_w);
-    let chain_height = chain_panel_height(chain_lines.len(), area.height);
+    let (full_lines, member_count) = fallback_flow_lines(app, chain_inner_w);
+    let chain_height = chain_panel_height(full_lines.len(), area.height);
+    // The panel is capped, so its inner height is the budget the member list
+    // must fit: when members are hidden, the last row names how many.
+    let inner_height = chain_height.saturating_sub(2) as usize;
+    let chain_lines = truncate_chain(full_lines, member_count, inner_height);
 
     let [accounts_area, chain_area] = Layout::vertical([
         Constraint::Min(ACCOUNTS_MIN),
@@ -65,6 +70,58 @@ fn chain_panel_height(content_rows: usize, area_height: u16) -> u16 {
     let desired = (content_rows as u16).saturating_add(2);
     let max_chain = area_height.saturating_sub(ACCOUNTS_MIN);
     desired.min(max_chain).max(3)
+}
+
+/// [`fallback_flow_lines`]'s full output cut to `inner_height` content rows.
+/// Members first: when every member fits, draw them all plus the captions that
+/// still fit, with no `+N more` line. Only when a member is hidden does the
+/// last row become `+N more · → fallback tab` (N = hidden members), captions
+/// keeping their rows while the members shrink.
+fn truncate_chain(
+    full: Vec<Line<'static>>,
+    member_count: usize,
+    inner_height: usize,
+) -> Vec<Line<'static>> {
+    // The empty-chain prose is not a member list — never truncate it.
+    if member_count == 0 || full.len() <= inner_height {
+        return full;
+    }
+    let caption_count = full.len() - member_count;
+    if member_count <= inner_height {
+        let captions_kept = (inner_height - member_count).min(caption_count);
+        let mut out = Vec::with_capacity(member_count + captions_kept);
+        out.extend(full[..member_count].iter().cloned());
+        out.extend(
+            full[member_count..member_count + captions_kept]
+                .iter()
+                .cloned(),
+        );
+        return out;
+    }
+    let room = inner_height.saturating_sub(1);
+    let captions_kept = caption_count.min(room);
+    let members_drawn = (room - captions_kept).min(member_count);
+    let hidden = member_count - members_drawn;
+    let mut out = Vec::with_capacity(members_drawn + captions_kept + 1);
+    out.extend(full[..members_drawn].iter().cloned());
+    out.extend(
+        full[member_count..member_count + captions_kept]
+            .iter()
+            .cloned(),
+    );
+    out.push(more_members_line(hidden));
+    out
+}
+
+/// The `+N more · → fallback tab` line: prose faint, the arrow a running-copy
+/// key (`ACCENT + bold`) through the shared tokenizer, like every caption.
+fn more_members_line(hidden: usize) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    spans.extend(prose::spans(
+        &format!("+{hidden} more · {} fallback tab", prose::key("\u{2192}")),
+        theme::faint(),
+    ));
+    Line::from(spans)
 }
 
 /// The accounts panel's title-right meta: one count per harness — both
@@ -863,7 +920,7 @@ fn draw_fallback_overview(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'st
 
 const GAUGE_W: usize = 12;
 
-fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+fn fallback_flow_lines(app: &App, width: usize) -> (Vec<Line<'static>>, usize) {
     // Switch-grade kick blocks feed the blocked-reason markers; read BEFORE the
     // Config lock (rank order: KickBlockState 230 < Config 400).
     let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
@@ -886,7 +943,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             .into_iter()
             .map(|seg| Line::from(Span::styled(seg, theme::dim()))),
         );
-        return lines;
+        return (lines, 0);
     }
 
     let chain = &cfg.state.fallback_chain;
@@ -1045,7 +1102,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             ),
         ]));
     }
-    lines
+    (lines, chain.len())
 }
 
 /// The active profile's projected next switch (action + eta secs), or `None`

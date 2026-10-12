@@ -1132,7 +1132,7 @@ fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &
             &[
                 (
                     "\u{2191} \u{2193}",
-                    "pick row · scroll shunt detail · walk plugin problems · walk herdr options · walk delegates",
+                    "pick row · scroll shunt detail · walk plugin problems · walk herdr fix + options · walk delegates",
                 ),
                 (
                     "page up / page down",

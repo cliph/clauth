@@ -428,7 +428,7 @@ fn the_services_footer_hints_pin_each_focus_state() {
         "the descended delegates detail advertises its walking keys"
     );
 
-    // List on plugin (with a fix): `↵ detail` and the list `f` verb.
+    // List on plugin (with a fix): `↵ detail` and the list `f` walk.
     let app = app_with(plugin_check_with_problems());
     assert_eq!(
         hints(&app),
@@ -436,11 +436,11 @@ fn the_services_footer_hints_pin_each_focus_state() {
             ("↑↓", "row"),
             ("↵", "detail"),
             ("r", "refresh"),
-            ("f", "install plugin"),
+            ("f", "next fix"),
             ("a", "actions"),
             ("?", "help"),
         ],
-        "the list focus advertises the first fixable problem's verb"
+        "the list focus advertises the walk to the first fix line"
     );
 
     // List on herdr (no fix): `↵ detail`, no `f`.
@@ -466,7 +466,8 @@ fn the_services_footer_hints_pin_each_focus_state() {
         vec![
             ("↑↓", "problem"),
             ("r", "refresh"),
-            ("f", "install plugin"),
+            ("↵", "install plugin"),
+            ("f", "next fix"),
             ("a", "actions"),
             ("?", "help"),
         ],
@@ -478,7 +479,8 @@ fn the_services_footer_hints_pin_each_focus_state() {
         vec![
             ("↑↓", "problem"),
             ("r", "refresh"),
-            ("f", "wire mcp server"),
+            ("↵", "wire mcp server"),
+            ("f", "next fix"),
             ("a", "actions"),
             ("?", "help"),
         ],
@@ -500,11 +502,11 @@ fn the_services_footer_hints_pin_each_focus_state() {
     );
 }
 
-/// Q8/Q10: while a shunt action runs, the footer drops the `f`/`space`/`↵`
-/// hints on both the list (the first fix) and the detail (the focused line) —
-/// derived from the same `running` gate the handlers read.
+/// Q8/Q10: while a shunt action runs, the footer drops the focused fix line's
+/// `↵` verb, derived from the same `running` gate the handler reads; `f next
+/// fix` stays, since walking focus starts no action.
 #[test]
-fn a_shunt_action_running_drops_the_footer_fix_hints() {
+fn a_shunt_action_running_drops_the_footer_fix_verb() {
     use crate::tui::app::ServicesFocus;
     let home = crate::testutil::HomeSandbox::new();
     let record = shunt_record(&home, true);
@@ -521,21 +523,21 @@ fn a_shunt_action_running_drops_the_footer_fix_hints() {
     );
     app.services.shunt_action.running = true;
 
-    // List focus: the row's first fix drops its `f` hint while an action runs.
+    // List focus: `f` only walks, which the running action does not gate.
     let hints = super::super::footer::services_hints(&app);
     assert!(
-        !hints.iter().any(|(k, _)| *k == "f"),
-        "no list `f` hint while a shunt action runs: {hints:?}"
+        hints.contains(&("f", "next fix")),
+        "the list keeps the walk while a shunt action runs: {hints:?}"
     );
 
-    // Detail focus: the focused `f add admin key` drops its hint too.
+    // Detail focus: the focused `f add admin key` line drops its `↵` verb.
     app.services.focus = ServicesFocus::Detail;
     app.services
         .set_shunt_focus(Some(crate::tui::app::ShuntFocusLine::Admin));
     let hints = super::super::footer::services_hints(&app);
     assert!(
-        !hints.iter().any(|(k, _)| *k == "f"),
-        "no detail `f` hint while a shunt action runs: {hints:?}"
+        !hints.iter().any(|(_, v)| *v == "add admin key"),
+        "no detail `↵` verb while a shunt action runs: {hints:?}"
     );
 }
 
@@ -584,9 +586,9 @@ fn the_plugin_detail_folds_the_readouts_and_renders_bare_f_lines() {
 }
 
 /// Descending into the plugin detail, ↑↓ walks the fixable problems and the
-/// focused one takes the caret; `f` fires the focused problem's fix.
+/// focused one takes the caret; `↵` opens the focused problem's confirm.
 #[test]
-fn the_plugin_detail_walks_problems_and_f_fixes_the_focused_one() {
+fn the_plugin_detail_walks_problems_and_enter_opens_the_focused_fix() {
     use crate::tui::app::{Modal, ServicesFocus, handle_key};
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
@@ -599,7 +601,7 @@ fn the_plugin_detail_walks_problems_and_f_fixes_the_focused_one() {
     // First problem (install) is focused; the footer names its verb.
     let dump = dump_full(&app);
     assert!(
-        dump.contains("f install plugin"),
+        dump.contains("↵ install plugin"),
         "the footer names the focused problem's verb:\n{dump}"
     );
     let (rows, buf) = render(&app);
@@ -623,15 +625,15 @@ fn the_plugin_detail_walks_problems_and_f_fixes_the_focused_one() {
         "the focused problem line carries the hover tint:\n{screen}"
     );
 
-    // `f` from the focused problem opens the install confirm.
-    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    // `↵` on the focused problem opens the install confirm.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     match app.modals.last() {
         Some(Modal::Confirm(state)) => assert!(
             matches!(
                 state.on_confirm,
                 crate::tui::app::ConfirmAction::InstallPlugin
             ),
-            "f on the focused install problem runs the install"
+            "↵ on the focused install problem runs the install"
         ),
         other => panic!("expected an install confirm, got {other:?}"),
     }
@@ -641,7 +643,7 @@ fn the_plugin_detail_walks_problems_and_f_fixes_the_focused_one() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     let dump = dump_full(&app);
     assert!(
-        dump.contains("f wire mcp server"),
+        dump.contains("↵ wire mcp server"),
         "the footer follows the focus to the wire verb:\n{dump}"
     );
     let (rows, _) = render(&app);
@@ -652,15 +654,15 @@ fn the_plugin_detail_walks_problems_and_f_fixes_the_focused_one() {
         "the caret follows to the wire problem:\n{screen}"
     );
 
-    // `f` now fires the wire fix.
-    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    // `↵` now opens the wire fix.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     match app.modals.last() {
         Some(Modal::Confirm(state)) => assert!(
             matches!(
                 state.on_confirm,
                 crate::tui::app::ConfirmAction::WireMcpServers
             ),
-            "f on the focused wire problem writes the entry"
+            "↵ on the focused wire problem writes the entry"
         ),
         other => panic!("expected a wire confirm, got {other:?}"),
     }
@@ -854,11 +856,20 @@ fn plugin_diagnostics_and_fix_remain_reachable_after_page_scroll() {
         app.services.focused_fix().is_none(),
         "an offscreen fix has no action target"
     );
-    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert!(
         app.modals.is_empty(),
         "offscreen fix must not open a confirmation"
     );
+    // `f` from the paged view walks to the first fix line at or below the
+    // view's top, wrapping to the first one when every fix sits above it.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert_eq!(
+        app.services.focused_fix(),
+        Some(&ServiceFix::InstallPlugin),
+        "f wraps to the first fix line above the paged view"
+    );
+    assert!(app.modals.is_empty(), "f opens nothing");
     assert!(
         last.join("\n").contains('┃'),
         "overflow thumb must reach bottom"
@@ -918,7 +929,7 @@ fn herdr_diagnostics_and_options_remain_reachable_after_page_scroll() {
         app.services.focused_fix().is_none(),
         "hidden herdr fix has no action target"
     );
-    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert!(
         app.modals.is_empty(),
         "hidden herdr fix must not open a confirmation"
@@ -1190,26 +1201,553 @@ fn an_unadopted_shunt_state_reads_dim() {
     );
 }
 
-/// From the list, `f` on the plugin row fixes the FIRST fixable problem shown
-/// (install), never the second.
+/// The Services fix grammar (cloudy 2026-10-08/12): from the list, `f` on a row
+/// with fix lines descends and lands on its FIRST fix line, opening nothing;
+/// repeated `f` walks the row's fix lines and wraps; `↵` on the focused fix
+/// line opens its confirm. `f` never opens a modal.
 #[test]
-fn the_list_f_fixes_the_first_fixable_problem() {
-    use crate::tui::app::{Modal, handle_key};
+fn the_list_f_descends_to_the_first_fix_and_f_walks_the_rows_fixes() {
+    use crate::tui::app::{ConfirmAction, Modal, ServicesFocus, handle_key};
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
 
     let mut app = app_with(plugin_check_with_problems());
+    app.services.problem_cursor = 1;
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert_eq!(app.services.focus, ServicesFocus::Detail, "f descends");
+    assert_eq!(
+        app.services.focused_fix(),
+        Some(&ServiceFix::InstallPlugin),
+        "f lands on the row's first fix line, whatever the cursor held"
+    );
+    assert!(app.modals.is_empty(), "f opens nothing");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert_eq!(
+        app.services.focused_fix(),
+        Some(&ServiceFix::WireMcpServers),
+        "a second f walks to the next fix line"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert_eq!(
+        app.services.focused_fix(),
+        Some(&ServiceFix::InstallPlugin),
+        "f wraps from the last fix line to the first"
+    );
+    assert!(app.modals.is_empty(), "no f press opened a modal");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     match app.modals.last() {
         Some(Modal::Confirm(state)) => assert!(
-            matches!(
-                state.on_confirm,
-                crate::tui::app::ConfirmAction::InstallPlugin
-            ),
-            "list f fixes the first fixable problem (install)"
+            matches!(state.on_confirm, ConfirmAction::InstallPlugin),
+            "↵ on the focused install line opens the install confirm"
         ),
         other => panic!("expected an install confirm, got {other:?}"),
     }
+}
+
+/// `f` on a row with no fix line does nothing: no descend, no modal.
+#[test]
+fn f_on_a_row_without_a_fix_line_is_inert() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(herdr_check(&healthy_probe(), Some(&healthy_config())));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert_eq!(app.services.focus, ServicesFocus::List, "no descend");
+    assert!(app.modals.is_empty(), "no modal");
+    assert_eq!(app.services.focused_fix(), None);
+}
+
+/// The herdr detail's fix line is a walk stop: `f` lands on it from the list
+/// and from any option row, `↑↓` reach it from the options, and `↵` on it
+/// opens the heal confirm while `↵` on an option still activates the option.
+#[test]
+fn the_herdr_fix_line_is_a_walk_stop_reached_by_f_and_the_arrows() {
+    use crate::tui::app::{ConfirmAction, HERDR_OPTIONS, Modal, ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let heal = |app: &App| {
+        matches!(
+            app.services.focused_fix(),
+            Some(ServiceFix::HealHerdrConfig(_))
+        )
+    };
+
+    let mut app = herdr_options_app(config(true, None, SidebarState::Templated));
+    app.tab = crate::tui::app::Tab::Services;
+    app.services.focus = ServicesFocus::List;
+    app.services.herdr_options_cursor = 3;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert_eq!(app.services.focus, ServicesFocus::Detail, "f descends");
+    assert!(heal(&app), "f lands on the heal line");
+    assert!(app.modals.is_empty(), "f opens nothing");
+    let (rows, _) = render(&app);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains('❯') && r.contains("f  heal herdr config")),
+        "the focused heal line takes the caret:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.contains('❯') && r.contains(HERDR_OPTIONS[3].label())),
+        "no option row holds the caret while the fix line does:\n{}",
+        rows.join("\n")
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert!(!heal(&app), "↓ leaves the fix line");
+    assert_eq!(
+        app.services.herdr_options_cursor, 0,
+        "↓ lands on the first option"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert!(
+        heal(&app),
+        "↑ from the first option returns to the fix line"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(
+        app.services.herdr_options_cursor,
+        HERDR_OPTIONS.len() - 1,
+        "↑ from the fix line wraps to the last option"
+    );
+    assert!(!heal(&app));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert!(heal(&app), "↓ from the last option wraps to the fix line");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert!(heal(&app), "f on the only fix line stays there");
+    assert!(app.modals.is_empty(), "no f press opened a modal");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    match app.modals.last() {
+        Some(Modal::Confirm(state)) => assert!(
+            matches!(state.on_confirm, ConfirmAction::HealHerdrConfig(_)),
+            "↵ on the heal line opens the heal confirm"
+        ),
+        other => panic!("expected a heal confirm, got {other:?}"),
+    }
+}
+
+/// A healthy herdr detail has no fix line, so the options walk keeps its six
+/// stops and `f` does nothing there.
+#[test]
+fn a_herdr_detail_without_a_fix_keeps_the_six_option_walk() {
+    use crate::tui::app::{HERDR_OPTIONS, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = herdr_options_app(healthy_config());
+    app.tab = crate::tui::app::Tab::Services;
+    app.services.herdr_options_cursor = HERDR_OPTIONS.len() - 1;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.services.herdr_options_cursor, 0,
+        "↓ wraps to the first option"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(
+        app.services.herdr_options_cursor,
+        HERDR_OPTIONS.len() - 1,
+        "↑ wraps to the last option"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert_eq!(app.services.focused_fix(), None);
+    assert!(app.modals.is_empty());
+}
+
+/// The shunt card's `f` walks its fix lines generically, in card order,
+/// scrolling a fix line below the fold into view, and wraps; config and
+/// toggle stops are skipped. `↵` on a fix line opens its confirm.
+#[test]
+fn the_shunt_f_walks_fix_lines_into_view_and_wraps() {
+    use crate::tui::app::{
+        Check, ConfirmAction, Health, Modal, ServicesFocus, ShuntFocus, ShuntFocusLine, handle_key,
+    };
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut detail: Vec<String> = (0..30).map(|i| format!("plan row {i:02}")).collect();
+    detail[5] = "f  move stores in".to_string();
+    detail[25] = "f  add admin key".to_string();
+    let check = Check {
+        label: "shunt",
+        health: Health::Warn,
+        detail,
+        fix: Some(ServiceFix::MoveStoresIn),
+        problems: Vec::new(),
+        shunt_focus: vec![
+            ShuntFocus::Fix {
+                line: 5,
+                fix: ServiceFix::MoveStoresIn,
+            },
+            ShuntFocus::Enabled { line: 9 },
+            ShuntFocus::Fix {
+                line: 25,
+                fix: ServiceFix::AddAdminKey,
+            },
+        ],
+        shunt_action_start: Some(0),
+    };
+    let mut app = app_with(check);
+    // Publish the card's geometry with the list focused, as the live loop does.
+    let _ = draw_frame(&app, 80, 14);
+    app.services.set_shunt_focus(Some(ShuntFocusLine::Enabled));
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert_eq!(app.services.focus, ServicesFocus::Detail, "f descends");
+    let _ = draw_frame(&app, 80, 14);
+    assert_eq!(
+        app.services.focused_shunt_focus().map(|s| s.kind()),
+        Some(ShuntFocusLine::Move),
+        "f lands on the card's first fix line, not the held toggle"
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    let rows = draw_frame(&app, 80, 14);
+    assert_eq!(
+        app.services.focused_shunt_focus().map(|s| s.kind()),
+        Some(ShuntFocusLine::Admin),
+        "f skips the toggle and scrolls the fold-hidden fix line into view"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains('❯') && r.contains("f  add admin key")),
+        "the scrolled-in fix line holds the caret:\n{}",
+        rows.join("\n")
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    let _ = draw_frame(&app, 80, 14);
+    assert_eq!(
+        app.services.focused_shunt_focus().map(|s| s.kind()),
+        Some(ShuntFocusLine::Move),
+        "f wraps back to the first fix line, scrolling it into view"
+    );
+    assert!(app.modals.is_empty(), "no f press opened a modal");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    let _ = draw_frame(&app, 80, 14);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    match app.modals.last() {
+        Some(Modal::Confirm(state)) => assert!(
+            matches!(state.on_confirm, ConfirmAction::AddAdminKey),
+            "↵ on the admin fix line opens the admin key confirm"
+        ),
+        other => panic!("expected an admin key confirm, got {other:?}"),
+    }
+}
+
+/// A selector row whose detail offers a fix line ends in a trailing `f`
+/// (ACCENT + bold, the key's own style) at the row's last content cell; a row
+/// with no fix line, healthy or not, carries none. The health dot is
+/// unchanged either way.
+#[test]
+fn a_selector_row_with_a_fix_line_ends_in_a_trailing_f() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let unbound = herdr_check(
+        &healthy_probe(),
+        Some(&config(true, None, SidebarState::Templated)),
+    );
+    let too_old = herdr_check(
+        &probe(
+            Some("0.7.0"),
+            Some(entry(true, Some("0.8.0"), vec![])),
+            None,
+        ),
+        Some(&healthy_config()),
+    );
+    assert!(
+        too_old.problems.is_empty(),
+        "fixture: a warn row with no fix"
+    );
+    let app = app_with_checks(vec![
+        plugin_check_with_problems(),
+        delegates_check(&[], &[]),
+        unbound,
+    ]);
+    let (rows, buf) = render(&app);
+    let screen = rows.join("\n");
+    // The selector segment between the pane's two side borders.
+    let seg = |label: &str| -> (usize, String) {
+        let i = rows
+            .iter()
+            .position(|r| r.contains(&format!("● {label}")))
+            .unwrap_or_else(|| panic!("no `{label}` row:\n{screen}"));
+        (i, rows[i].split('│').nth(1).unwrap_or_default().to_string())
+    };
+    let (plugin_row, plugin) = seg("plugin");
+    let (_, delegates) = seg("delegates");
+    let (_, herdr) = seg("herdr");
+    assert!(
+        plugin.ends_with(" f "),
+        "the plugin row ends in `f` before the padding cell: {plugin:?}"
+    );
+    assert!(herdr.ends_with(" f "), "the herdr heal row too: {herdr:?}");
+    assert_eq!(
+        delegates.trim_end(),
+        delegates.trim_end().trim_end_matches(" f"),
+        "a row with no fix line has no trailing f: {delegates:?}"
+    );
+    // The `f` cell: ACCENT + bold, on the row's hover tint (the plugin row is
+    // the selected one).
+    let f_col = 1 + plugin.chars().count() - 2;
+    let cell = &buf.content[plugin_row * W as usize + f_col];
+    assert_eq!(cell.symbol(), "f", "the mark cell:\n{screen}");
+    assert_eq!(cell.fg, super::theme::accent_color(), "the mark is ACCENT");
+    assert!(
+        cell.modifier.contains(ratatui::style::Modifier::BOLD),
+        "the mark is bold"
+    );
+    assert_eq!(
+        cell.bg,
+        super::theme::bg_hover(),
+        "the selected row keeps its tint"
+    );
+
+    let app = app_with(too_old);
+    let (rows, _) = render(&app);
+    let row = rows
+        .iter()
+        .find(|r| r.contains("● herdr"))
+        .expect("herdr row")
+        .split('│')
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !row.trim_end().ends_with(" f"),
+        "a warn row with no fix line has no mark: {row:?}"
+    );
+}
+
+/// A page key hid the plugin walk focus: `f` lands on the first fix line at or
+/// below the top of what the pane shows, and wraps to the first fix line when
+/// every one sits above it.
+#[test]
+fn f_from_a_paged_plugin_detail_lands_on_the_next_fix_below_the_view_top() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(plugin_check_with_problems());
+    app.services.focus = ServicesFocus::Detail;
+    app.services.diagnostic_focus = true;
+    // The fixture's fix lines sit at detail lines 2 (install) and 7 (wire).
+    app.services.displayed_scroll.set(3);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert_eq!(
+        app.services.focused_fix(),
+        Some(&ServiceFix::WireMcpServers),
+        "a view whose top sits between the two fix lines lands on the lower one"
+    );
+    app.services.diagnostic_focus = true;
+    app.services.displayed_scroll.set(7);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert_eq!(
+        app.services.focused_fix(),
+        Some(&ServiceFix::WireMcpServers),
+        "a fix line on the view's top row is the one f lands on"
+    );
+    app.services.diagnostic_focus = true;
+    app.services.displayed_scroll.set(8);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert_eq!(
+        app.services.focused_fix(),
+        Some(&ServiceFix::InstallPlugin),
+        "with every fix line above the view, f wraps to the first"
+    );
+}
+
+/// The shunt walk with nothing focused (every stop scrolled out of view) lands
+/// on the first fix line at or below the top of the view, not the card's first.
+#[test]
+fn the_shunt_f_with_no_focus_lands_on_the_first_fix_below_the_view_top() {
+    use crate::tui::app::{Check, Health, ShuntFocus, ShuntFocusLine, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut detail: Vec<String> = (0..30).map(|i| format!("plan row {i:02}")).collect();
+    detail[5] = "f  move stores in".to_string();
+    detail[25] = "f  add admin key".to_string();
+    let check = Check {
+        label: "shunt",
+        health: Health::Warn,
+        detail,
+        fix: Some(ServiceFix::MoveStoresIn),
+        problems: Vec::new(),
+        shunt_focus: vec![
+            ShuntFocus::Fix {
+                line: 5,
+                fix: ServiceFix::MoveStoresIn,
+            },
+            ShuntFocus::Enabled { line: 9 },
+            ShuntFocus::Fix {
+                line: 25,
+                fix: ServiceFix::AddAdminKey,
+            },
+        ],
+        shunt_action_start: Some(0),
+    };
+    let mut app = app_with(check);
+    let _ = draw_frame(&app, 80, 14);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    let _ = draw_frame(&app, 80, 14);
+    // Rows 12..20 show no stop: the render re-settles focus to none.
+    app.services.detail_scroll = 12;
+    let _ = draw_frame(&app, 80, 14);
+    assert_eq!(
+        app.services.shunt_focus_kind(),
+        None,
+        "fixture: no stop in view"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    let _ = draw_frame(&app, 80, 14);
+    assert_eq!(
+        app.services.focused_shunt_focus().map(|s| s.kind()),
+        Some(ShuntFocusLine::Admin),
+        "f lands on the fix line below the view top, not the one above it"
+    );
+}
+
+/// A heal that lands while the heal line holds focus leaves the option walk
+/// live: the next arrow steps from the option cursor, never from the gone line.
+#[test]
+fn a_heal_that_clears_the_fix_line_hands_focus_back_to_the_options() {
+    use crate::tui::app::handle_key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = herdr_options_app(config(true, None, SidebarState::Templated));
+    app.tab = crate::tui::app::Tab::Services;
+    app.services.herdr_options_cursor = 2;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert!(
+        app.services.focused_fix().is_some(),
+        "fixture: on the heal line"
+    );
+    // The recompute after a landed heal: the check offers no fix line any more.
+    let healed = healthy_config();
+    app.services.herdr_config = Some(healed.clone());
+    app.services.checks = vec![herdr_check(&healthy_probe(), Some(&healed))];
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.services.herdr_options_cursor, 3,
+        "↓ steps from the option cursor once the heal line is gone"
+    );
+    assert_eq!(app.services.focused_fix(), None);
+}
+
+/// `↵` on the herdr row lands on the option cursor, never on a heal line `f`
+/// left focused before an ascend.
+#[test]
+fn enter_descending_into_herdr_lands_on_the_options_not_a_held_heal_line() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = herdr_options_app(config(true, None, SidebarState::Templated));
+    app.tab = crate::tui::app::Tab::Services;
+    app.services.focus = ServicesFocus::List;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert!(
+        app.services.focused_fix().is_some(),
+        "fixture: on the heal line"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(
+        app.services.focus,
+        ServicesFocus::List,
+        "fixture: esc ascends"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail);
+    assert_eq!(
+        app.services.focused_fix(),
+        None,
+        "↵ descends onto the option cursor"
+    );
+}
+
+/// The trailing `f` drops whole where the 3-cell gap cannot fit: `  ● delegates`
+/// is 13 cells, so the mark needs 13 + 3 + 1 = 17.
+#[test]
+fn the_trailing_f_drops_whole_when_its_gap_does_not_fit() {
+    let text = |w: usize| -> String {
+        super::selector_row(Health::Warn, "delegates", true, false, false, w)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    };
+    assert_eq!(text(17), "  ● delegates   f");
+    assert_eq!(text(16), "  ● delegates   ");
+}
+
+/// The footer names what each key does under the fix grammar: on a focused
+/// fix line `↵ <verb>`; `f next fix` only while the press would move focus
+/// (another fix line, or focus off every fix line).
+#[test]
+fn the_footer_names_enter_for_the_focused_fix_and_f_for_the_next() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let hints = |app: &App| super::super::footer::services_hints(app);
+
+    let mut app = app_with(plugin_check_with_problems());
+    assert_eq!(
+        hints(&app),
+        vec![
+            ("↑↓", "row"),
+            ("↵", "detail"),
+            ("r", "refresh"),
+            ("f", "next fix"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "the list advertises f as the walk, never as a fix"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert_eq!(app.services.focus, ServicesFocus::Detail);
+    assert_eq!(
+        hints(&app),
+        vec![
+            ("↑↓", "problem"),
+            ("r", "refresh"),
+            ("↵", "install plugin"),
+            ("f", "next fix"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "a focused fix line names ↵ with its verb, and f the next fix"
+    );
+
+    let mut app = herdr_options_app(config(true, None, SidebarState::Templated));
+    app.tab = crate::tui::app::Tab::Services;
+    app.services.focus = ServicesFocus::List;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert_eq!(
+        hints(&app),
+        vec![
+            ("↑↓", "row"),
+            ("↵", "heal herdr config"),
+            ("r", "refresh"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "on the only fix line f would not move, so it has no hint"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        hints(&app),
+        vec![
+            ("↑↓", "row"),
+            ("space/↵", "cycle / toggle"),
+            ("r", "refresh"),
+            ("f", "next fix"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "off the fix line, f walks back to it"
+    );
 }
 
 // ── delegates detail ────────────────────────────────────────────────────────────
@@ -3588,10 +4126,10 @@ fn down_scrolls_the_refused_card_one_line_each_to_its_last_words() {
     );
 }
 
-/// `f` on the focused `move stores in` line — reachable only by walking, even
+/// `↵` on the focused `move stores in` line — reachable only by walking, even
 /// while an admin fix is also owed — opens the move confirm.
 #[test]
-fn f_on_the_focused_move_line_opens_the_move_confirm() {
+fn enter_on_the_focused_move_line_opens_the_move_confirm() {
     use crate::tui::app::{ConfirmAction, Modal, MovePlanOutcome, handle_key};
     use ratatui::crossterm::event::KeyCode;
     let home = crate::testutil::HomeSandbox::new();
@@ -3614,11 +4152,11 @@ fn f_on_the_focused_move_line_opens_the_move_confirm() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     assert_eq!(caret_stop(&draw_frame(&app, 120, 24)), Some("move"));
 
-    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     match app.modals.last() {
         Some(Modal::Confirm(state)) => assert!(
             matches!(state.on_confirm, ConfirmAction::MoveStoresIn(_)),
-            "f on the focused move line opens the move confirm, got {:?}",
+            "↵ on the focused move line opens the move confirm, got {:?}",
             state.on_confirm
         ),
         other => panic!("expected the move confirm, got {other:?}"),
@@ -3719,16 +4257,12 @@ fn a_resize_pushing_focus_off_screen_resettles_to_the_first_line_in_view() {
         "the re-settled enabled row offers its toggle verb: {hints:?}"
     );
     assert!(
-        hints.iter().all(|(k, _)| *k != "f"),
-        "no `f` verb for the off-screen move line: {hints:?}"
+        hints.iter().all(|(_, v)| *v != "move stores in"),
+        "no verb for the off-screen move line: {hints:?}"
     );
-
-    // `f` opens no confirm: the re-settled `enabled` row has no fix.
-    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
     assert!(
-        app.modals.is_empty(),
-        "no action on the off-screen move line: {:?}",
-        app.modals
+        hints.contains(&("f", "next fix")),
+        "f still walks to a fix line: {hints:?}"
     );
 
     // `space` flips the re-settled `enabled` row for real.
@@ -3804,8 +4338,12 @@ fn a_card_change_pushing_every_stop_off_screen_resettles_to_none() {
     assert_eq!(app.services.shunt_focus_kind(), None);
     let hints = super::super::footer::services_hints(&app);
     assert!(
-        hints.iter().all(|(k, _)| *k != "f" && *k != "space/↵"),
+        hints.iter().all(|(k, _)| *k != "↵" && *k != "space/↵"),
         "no verb offered with no focused line: {hints:?}"
+    );
+    assert!(
+        hints.contains(&("f", "next fix")),
+        "f walks to the off-screen fix lines: {hints:?}"
     );
 
     // `space` does not toggle the off-screen `enabled` row.

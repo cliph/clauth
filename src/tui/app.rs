@@ -1747,8 +1747,9 @@ pub(crate) fn incident_is_active(incident: &Incident) -> bool {
 // ── Services tab ───────────────────────────────────────────────────────────────
 
 /// Which Services pane has focus. `List`: the row selector (↑↓ moves, ⏎
-/// descends, `f` fixes). `Detail`: the selected row's readout (↑↓ scrolls, or
-/// walks the plugin problems / herdr options).
+/// descends, `f` descends onto the row's first fix line). `Detail`: the
+/// selected row's readout (↑↓ scrolls, or walks the plugin problems / herdr
+/// options).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ServicesFocus {
     List,
@@ -1766,9 +1767,9 @@ pub(crate) enum Health {
     Idle,
 }
 
-/// A one-key fix offered on a service row. `WireMcpServers` writes the manual
-/// entry (a [`ConfirmAction`]); the verb `f` renders in the footer and under the
-/// problem it fixes is [`fix_verb`].
+/// A fix offered on a service row. `WireMcpServers` writes the manual
+/// entry (a [`ConfirmAction`]); the verb the footer's `↵` hint and the
+/// `f  <verb>` line under the problem render is [`fix_verb`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ServiceFix {
     WireMcpServers,
@@ -1788,8 +1789,8 @@ pub(crate) enum ServiceFix {
 }
 
 /// One focusable line inside a service row's detail. When the detail pane is
-/// descended, ↑↓ walks these problems and `f` applies the focused one; the
-/// footer's `f <verb>` and the dim `f  <verb>` detail line follow the focus.
+/// descended, ↑↓ and `f` walk these problems and `↵` opens the focused one's
+/// confirm; the footer's `↵ <verb>` follows the focus.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Problem {
     /// The detail-line index of this problem's `f  <verb>` line.
@@ -1802,7 +1803,8 @@ pub(crate) struct Problem {
 /// whose `↵`/`space` toggles it expanded, or a field row whose `↵`/`space` opens
 /// it and `space` cycles a cycle row). Descended, ↑↓ pages the card one line at
 /// a time; an actionable line takes focus as it scrolls into view, read-only
-/// rows never do, and `f`/`space`/`↵` act only on the focused one.
+/// rows never do, and `space`/`↵` act only on the focused one (`↵` on a fix
+/// line opens its confirm; `f` walks between fix lines).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ShuntFocus {
     /// An `f  <verb>` line at this detail index.
@@ -2312,10 +2314,11 @@ pub(crate) enum ShuntConfigRead {
     Refused(String),
 }
 
-/// A computed service row. `fix` is the list-focus `f` (the first fixable
-/// problem); `problems` is the detail-pane focus walk (empty on rows whose
-/// detail has no per-problem focus); `shunt_focus` is the `shunt` card's own
-/// focus walk (a mix of fix lines and the `enabled` row).
+/// A computed service row. `fix` is the row's first fix line's fix (its
+/// presence marks the row in the selector and gates `f`); `problems` is the
+/// detail-pane focus walk (empty on rows whose detail has no per-problem
+/// focus); `shunt_focus` is the `shunt` card's own focus walk (a mix of fix
+/// lines and the `enabled` row).
 #[derive(Debug, Clone)]
 pub(crate) struct Check {
     pub(crate) label: &'static str,
@@ -2337,8 +2340,21 @@ pub(crate) struct Check {
     pub(crate) shunt_action_start: Option<usize>,
 }
 
+impl Check {
+    /// How many `f  <verb>` lines the detail shows: the plugin and herdr
+    /// problems plus the shunt card's fix stops, the lines `f` walks.
+    pub(crate) fn fix_line_count(&self) -> usize {
+        self.problems.len()
+            + self
+                .shunt_focus
+                .iter()
+                .filter(|stop| stop.fix().is_some())
+                .count()
+    }
+}
+
 /// The one verb per fix, used identically in the detail's dim `f  <verb>` line
-/// and the footer's `f <verb>` hint. One verb per fix, never the bracketed
+/// and the footer's `↵ <verb>` hint. One verb per fix, never the bracketed
 /// `[f] repair credentials` anti-pattern.
 pub(crate) fn fix_verb(fix: &ServiceFix) -> &'static str {
     match fix {
@@ -2832,13 +2848,18 @@ pub(crate) struct ServicesState {
     /// then on the blurred pane keeps the last-selected row's tint and offset.
     pub(crate) delegates_has_descended: bool,
     /// Cursor over the plugin detail's fixable problems ([`Check::problems`]).
-    /// While the plugin detail is descended, ↑↓ walks these instead of
-    /// scrolling the prose; `f` applies the focused one.
+    /// While the plugin detail is descended, ↑↓ and `f` walk these instead of
+    /// scrolling the prose; `↵` opens the focused one's confirm.
     pub(crate) problem_cursor: usize,
     /// Cursor over the herdr detail's options rows ([`HERDR_OPTIONS`]). The
     /// herdr detail is the one detail pane that takes per-row focus: while it
     /// is descended, ↑↓ walks these rows instead of scrolling the prose.
     pub(crate) herdr_options_cursor: usize,
+    /// Whether the herdr detail's focus sits on its `f  heal herdr config`
+    /// line rather than on [`Self::herdr_options_cursor`]'s option. Read only
+    /// while the check still offers that fix, so a heal that clears it hands
+    /// focus back to the option.
+    pub(crate) herdr_fix_focus: bool,
     /// Typed editor for the `tag refresh` stepper — the Config-tab
     /// refresh-interval editor's shape. `None` = not editing.
     pub(crate) herdr_tag_draft: Option<InputState>,
@@ -2908,6 +2929,7 @@ impl Default for ServicesState {
             delegates_has_descended: false,
             problem_cursor: 0,
             herdr_options_cursor: 0,
+            herdr_fix_focus: false,
             herdr_tag_draft: None,
             herdr_config: None,
             land_on_herdr: false,
@@ -2926,34 +2948,39 @@ impl ServicesState {
         self.checks.get(self.cursor)
     }
 
-    /// The fix offered by the row under the cursor, if any.
-    pub(crate) fn selected_fix(&self) -> Option<&ServiceFix> {
-        self.selected_check().and_then(|check| check.fix.as_ref())
+    /// Whether the row under the cursor shows at least one fix line, the rows
+    /// `f` walks and the selector marks.
+    pub(crate) fn selected_has_fix(&self) -> bool {
+        self.selected_check()
+            .is_some_and(|check| check.fix.is_some())
     }
 
-    /// The fix `f` applies this frame: the list-focus fix, or — on the plugin
-    /// detail, whose problems walk, and the shunt detail, whose focusable
-    /// lines walk — the focused problem's fix. The footer's `f <verb>` and the
-    /// dim `f  <verb>` detail line follow this.
+    /// The fix whose line holds the detail's focus, the one `↵` opens: the
+    /// plugin's focused problem, the herdr heal line while focus sits on it,
+    /// or the shunt card's focused fix line. `None` with the list focused or
+    /// while a page key hid the plugin/herdr action focus. The footer's
+    /// `↵ <verb>` follows this.
     pub(crate) fn focused_fix(&self) -> Option<&ServiceFix> {
-        match self.focus {
-            ServicesFocus::List => self.selected_fix(),
-            ServicesFocus::Detail => {
-                let check = self.selected_check()?;
-                if check.label == "plugin" {
-                    if self.diagnostic_focus {
-                        return None;
-                    }
-                    check.problems.get(self.problem_cursor).map(|p| &p.fix)
-                } else if check.label == "shunt" {
-                    self.focused_shunt_focus().and_then(ShuntFocus::fix)
-                } else if check.label == "herdr" && self.diagnostic_focus {
-                    None
-                } else {
-                    self.selected_fix()
-                }
-            }
+        if self.focus == ServicesFocus::List {
+            return None;
         }
+        let check = self.selected_check()?;
+        match check.label {
+            "shunt" => self.focused_shunt_focus().and_then(ShuntFocus::fix),
+            _ if self.diagnostic_focus => None,
+            "herdr" => self
+                .herdr_fix_focus
+                .then(|| check.problems.first().map(|p| &p.fix))
+                .flatten(),
+            _ => check.problems.get(self.problem_cursor).map(|p| &p.fix),
+        }
+    }
+
+    /// Whether `f` would move focus: the row shows a fix line other than the
+    /// one already focused. The footer's `f next fix` reads this.
+    pub(crate) fn f_moves(&self) -> bool {
+        let lines = self.selected_check().map_or(0, Check::fix_line_count);
+        lines > 1 || (lines == 1 && self.focused_fix().is_none())
     }
 
     /// The shunt detail's focused actionable line, resolved by the focus
@@ -6151,10 +6178,11 @@ fn trigger_status_refresh(app: &mut App) {
 
 /// Services tab keymap. List focus: ↑↓ moves the cursor (wrapping), ⏎ descends
 /// to the detail pane (the `delegates` detail only while it lists a job), `f`
-/// applies the selected row's fix. Detail focus: the plugin detail walks its
-/// fixable problems, the herdr detail walks its options rows, the delegates
-/// detail walks its jobs, every other detail scrolls (clamped by the render pass);
-/// `f` still fixes the focused problem.
+/// descends onto the selected row's first fix line. Detail focus: the plugin
+/// detail walks its fixable problems, the herdr detail walks its heal line and
+/// options rows, the delegates detail walks its jobs, every other detail
+/// scrolls (clamped by the render pass); `f` walks to the next fix line and `↵`
+/// on a focused one opens its confirm.
 fn handle_services_key(app: &mut App, key: KeyEvent) {
     match app.services.focus {
         ServicesFocus::List => {
@@ -6201,6 +6229,7 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                         app.services.focus = ServicesFocus::Detail;
                         app.services.detail_scroll = 0;
                         app.services.diagnostic_focus = false;
+                        app.services.herdr_fix_focus = false;
                         if delegates {
                             app.services.settle_delegates_selection();
                             app.services.delegates_offset.set(0);
@@ -6212,7 +6241,7 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                 }
                 KeyCode::Char('f') => {
                     app.services.land_on_herdr = false;
-                    apply_service_fix(app);
+                    walk_to_next_fix(app);
                 }
                 _ => {}
             }
@@ -6277,7 +6306,6 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                             app.services.detail_viewport.get() as usize,
                         ) as u16;
                     }
-                    KeyCode::Char('f') => apply_service_fix(app),
                     _ => {}
                 }
             }
@@ -6285,9 +6313,101 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// The plugin detail's problem walk: ↑↓ moves over the fixable problems
-/// (wrapping), `f` applies the focused one. The render keeps the focused line
-/// on screen; there is no manual scroll offset to maintain here.
+/// `f` under the Services fix grammar (cloudy 2026-10-08, scoped to the
+/// selected row 2026-10-12): focus moves to the selected row's next fix line
+/// in detail order, wrapping, and from the list it descends onto the row's
+/// first one. It never opens a fix; `↵` on the focused line does. A row with
+/// no fix line leaves everything as it was.
+fn walk_to_next_fix(app: &mut App) {
+    if !app.services.selected_has_fix() {
+        return;
+    }
+    let Some(check) = app.services.selected_check() else {
+        return;
+    };
+    let label = check.label;
+    let problems: Vec<usize> = check.problems.iter().map(|p| p.line).collect();
+    let from_list = app.services.focus == ServicesFocus::List;
+    if from_list {
+        app.services.focus = ServicesFocus::Detail;
+        app.services.detail_scroll = 0;
+    }
+    match label {
+        "shunt" => shunt_walk_to_next_fix(app, from_list),
+        "herdr" => {
+            app.services.diagnostic_focus = false;
+            app.services.herdr_fix_focus = true;
+        }
+        _ if problems.is_empty() => {}
+        _ => {
+            // A page key hid the walk focus: "next" starts from the top of
+            // what the pane shows.
+            let next = if from_list {
+                0
+            } else if app.services.diagnostic_focus {
+                let top = app.services.displayed_scroll.get() as usize;
+                problems.iter().position(|&line| line >= top).unwrap_or(0)
+            } else {
+                (app.services.problem_cursor + 1) % problems.len()
+            };
+            app.services.diagnostic_focus = false;
+            app.services.problem_cursor = next;
+        }
+    }
+}
+
+/// The shunt card's half of [`walk_to_next_fix`]: the next fix stop after the
+/// focused one in card order (the first one from the list, or the first at or
+/// below the top of the view when nothing holds focus), wrapping, scrolled
+/// just far enough to bring it into view.
+fn shunt_walk_to_next_fix(app: &mut App, from_list: bool) {
+    let Some(stops) = app.services.selected_check().map(|c| c.shunt_focus.clone()) else {
+        return;
+    };
+    let fixes: Vec<usize> = (0..stops.len())
+        .filter(|&i| stops[i].fix().is_some())
+        .collect();
+    let Some(&first) = fixes.first() else {
+        return;
+    };
+    let rows = app.services.shunt_stop_rows.borrow().clone();
+    let geometry = rows.len() == stops.len();
+    let viewport = app.services.shunt_viewport.get() as usize;
+    let max = app.services.detail_max_scroll.get();
+    let scroll = app.services.detail_scroll.min(max);
+    let target = if from_list {
+        first
+    } else {
+        match app
+            .services
+            .focused_shunt_focus()
+            .and_then(|f| stops.iter().position(|s| s == f))
+        {
+            Some(cur) => fixes.iter().copied().find(|&i| i > cur).unwrap_or(first),
+            None if geometry => fixes
+                .iter()
+                .copied()
+                .find(|&i| rows[i] >= scroll as usize)
+                .unwrap_or(first),
+            None => first,
+        }
+    };
+    app.services.set_shunt_focus(Some(stops[target].kind()));
+    if geometry && !shunt_in_view(scroll, viewport, rows[target]) {
+        let row = rows[target];
+        let scroll = if row < scroll as usize {
+            row
+        } else {
+            row + 1 - viewport.max(1)
+        };
+        app.services.detail_scroll = scroll.min(max as usize) as u16;
+    }
+}
+
+/// The plugin detail's problem walk: ↑↓ and `f` move over the fixable
+/// problems (wrapping), `↵` opens the focused one's confirm. The render keeps
+/// the focused line on screen; there is no manual scroll offset to maintain
+/// here.
 fn handle_plugin_problems_key(app: &mut App, key: KeyEvent) {
     let len = app
         .services
@@ -6303,7 +6423,8 @@ fn handle_plugin_problems_key(app: &mut App, key: KeyEvent) {
             app.services.diagnostic_focus = false;
             app.services.problem_cursor = (app.services.problem_cursor + 1) % len;
         }
-        KeyCode::Char('f') => apply_service_fix(app),
+        KeyCode::Char('f') => walk_to_next_fix(app),
+        KeyCode::Enter => apply_service_fix(app),
         _ => {}
     }
 }
@@ -6377,9 +6498,10 @@ fn track_delegates_selection(app: &mut App) {
 
 /// The shunt detail's keymap: ↑↓ walks the actionable lines (landing on each
 /// as it scrolls into view, one line at a time through the read-only text),
-/// `f` applies the focused fix, `space`/`↵` act on the focused line (flip the
-/// `enabled` toggle, open the `check output` modal, expand/collapse a config
-/// entry, or open/step a config field editor — `space` cycles a cycle field).
+/// `f` walks to the next fix line, `↵` opens the focused fix's confirm, and
+/// `space`/`↵` act on any other focused line (flip the `enabled` toggle, open
+/// the `check output` modal, expand/collapse a config entry, or open/step a
+/// config field editor — `space` cycles a cycle field).
 /// Focus is the key handler's own state (a [`ShuntFocusLine`] identity); the
 /// render reads it and re-settles it (the descend rule) when a resize or a
 /// card change pushed the held line out of view. Only the shunt detail routes
@@ -6391,7 +6513,7 @@ fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
         KeyCode::Down => shunt_step(app, true),
         KeyCode::PageUp => shunt_page(app, false),
         KeyCode::PageDown => shunt_page(app, true),
-        KeyCode::Char('f') => apply_service_fix(app),
+        KeyCode::Char('f') => walk_to_next_fix(app),
         KeyCode::Enter => match app.services.focused_shunt_focus() {
             Some(ShuntFocus::Enabled { .. }) => toggle_shunt_enabled(app),
             Some(ShuntFocus::CheckOutput { .. }) => open_check_output_modal(app),
@@ -6409,7 +6531,8 @@ fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
                 let key = key.clone();
                 confirm_shunt_remove(app, &key);
             }
-            Some(ShuntFocus::Fix { .. }) | None => {}
+            Some(ShuntFocus::Fix { .. }) => apply_service_fix(app),
+            None => {}
         },
         KeyCode::Char(' ') => match app.services.focused_shunt_focus() {
             Some(ShuntFocus::Enabled { .. }) => toggle_shunt_enabled(app),
@@ -7647,28 +7770,57 @@ fn stays_word(k: usize) -> &'static str {
     if k == 1 { "stays" } else { "stay" }
 }
 
-/// The herdr detail's options keymap: ↑↓ walks the six rows (wrapping), space
-/// and ⏎ activate the focused row, `+`/`-` step the tag-refresh stepper, `f`
-/// still applies the check's fix. Only the herdr detail routes here — every
-/// other detail keeps the scroll-only keymap.
+/// The herdr detail's keymap: ↑↓ walks the `f  heal herdr config` line (while
+/// the check offers it, the stop above the first option) and the six option
+/// rows, wrapping; `f` walks to the fix line; `↵` on it opens the heal
+/// confirm; space and ⏎ activate a focused option, `+`/`-` step the
+/// tag-refresh stepper. Only the herdr detail routes here — every other
+/// detail keeps the scroll-only keymap.
 fn handle_herdr_options_key(app: &mut App, key: KeyEvent) {
+    let has_fix = app
+        .services
+        .selected_check()
+        .is_some_and(|c| !c.problems.is_empty());
+    if !has_fix {
+        app.services.herdr_fix_focus = false;
+    }
+    let on_fix = app.services.herdr_fix_focus;
     let cursor = app.services.herdr_options_cursor;
     let rows = HERDR_OPTIONS.len();
     match key.code {
         KeyCode::Up => {
             app.services.diagnostic_focus = false;
-            app.services.herdr_options_cursor = (cursor + rows - 1) % rows;
+            if on_fix {
+                app.services.herdr_fix_focus = false;
+                app.services.herdr_options_cursor = rows - 1;
+            } else if has_fix && cursor == 0 {
+                app.services.herdr_fix_focus = true;
+            } else {
+                app.services.herdr_options_cursor = (cursor + rows - 1) % rows;
+            }
         }
         KeyCode::Down => {
             app.services.diagnostic_focus = false;
-            app.services.herdr_options_cursor = (cursor + 1) % rows;
+            if on_fix {
+                app.services.herdr_fix_focus = false;
+                app.services.herdr_options_cursor = 0;
+            } else if has_fix && cursor == rows - 1 {
+                app.services.herdr_fix_focus = true;
+            } else {
+                app.services.herdr_options_cursor = (cursor + 1) % rows;
+            }
         }
-        KeyCode::Char('f') => apply_service_fix(app),
-        KeyCode::Enter | KeyCode::Char(' ') if !app.services.diagnostic_focus => {
+        KeyCode::Char('f') => walk_to_next_fix(app),
+        KeyCode::Enter if on_fix => apply_service_fix(app),
+        KeyCode::Enter | KeyCode::Char(' ') if !app.services.diagnostic_focus && !on_fix => {
             activate_herdr_option(app, HERDR_OPTIONS[cursor]);
         }
-        KeyCode::Char('+') if !app.services.diagnostic_focus => step_herdr_tag_refresh(app, 1),
-        KeyCode::Char('-') if !app.services.diagnostic_focus => step_herdr_tag_refresh(app, -1),
+        KeyCode::Char('+') if !app.services.diagnostic_focus && !on_fix => {
+            step_herdr_tag_refresh(app, 1);
+        }
+        KeyCode::Char('-') if !app.services.diagnostic_focus && !on_fix => {
+            step_herdr_tag_refresh(app, -1);
+        }
         _ => {}
     }
 }
@@ -9402,7 +9554,7 @@ pub(crate) fn gateway_health(state: GatewayState) -> Health {
 /// stderr is held, the codex pool note (or `pool` error), and the MOVE PLAN
 /// section. Fills the card's [`Check::shunt_focus`] (the fix lines, the
 /// `enabled` row and the `check output` row — the only actionable lines) and
-/// its list-focus [`Check::fix`].
+/// its first fix line's [`Check::fix`].
 ///
 /// `daemon_absent` is the header chip's no-daemon liveness (the same
 /// [`crate::daemon::DaemonHealth::Absent`] the `[ daemon ]` chip reads):
@@ -9586,7 +9738,7 @@ pub(crate) fn shunt_card(
         }
     }
 
-    // The list-focus `f` is the card's first fix, never the `enabled` row.
+    // The row's first fix line, never the `enabled` row.
     check.fix = check.shunt_focus.iter().find_map(ShuntFocus::fix).cloned();
     check
 }
@@ -11007,7 +11159,7 @@ pub(crate) const OUTDATED_PLUGIN_MARK: &str = "this clauth is";
 /// on PATH and the data dir, a blank line between the three groups. The
 /// install leads because installing is the fix a fresh box needs, and it also
 /// registers the server. Health is the worst of the four; the fixable problems
-/// walk in detail order, so list-level `f` installs first. `clauth_path` is
+/// walk in detail order, so list-level `f` lands on install first. `clauth_path` is
 /// passed in (the recompute also gates the start probe on it) so the verdict
 /// logic unit-tests without a live `PATH`.
 fn plugin_check(
@@ -11221,8 +11373,8 @@ fn plugin_check(
             .unwrap_or_else(|_| "\u{2014}".to_string())
     ));
 
-    // List-focus `f` fixes the first fixable problem shown, in the same order
-    // the detail walk presents them (install, then wire).
+    // The first fix line shown, in the order the detail walk presents them
+    // (install, then wire).
     let fix = problems.first().map(|p| p.fix.clone());
 
     Check {
@@ -13703,7 +13855,7 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
                 actions.push(OpenIncidentLink);
             }
         }
-        // Services: `r` re-runs checks, `f` fixes, ⏎/esc navigate.
+        // Services: `r` re-runs checks, `f` walks the fix lines, ⏎/esc navigate.
         Tab::Services => {}
     }
     // Every tab: the daemon verb that applies, none while one is in flight.

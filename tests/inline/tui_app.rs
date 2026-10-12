@@ -362,7 +362,7 @@ fn the_plugin_check_folds_the_readouts_and_lists_problems_in_order() {
     assert_eq!(
         check.fix,
         Some(super::ServiceFix::InstallPlugin),
-        "list `f` fixes the first fixable problem shown: the install"
+        "list `f` lands on the first fixable problem shown: the install"
     );
     assert_eq!(
         check
@@ -602,10 +602,11 @@ fn the_plugin_check_reads_a_fresh_box_in_three_groups() {
 }
 
 /// On a fresh box (nothing installed, no `mcpServers` entry anywhere) list-level
-/// `f` on the plugin row opens the install confirm, never the manual wire: the
-/// install also registers the server, so it is the one fix such a box needs.
+/// `f` on the plugin row lands on the install line and `↵` opens the install
+/// confirm, never the manual wire: the install also registers the server, so
+/// it is the one fix such a box needs.
 #[test]
-fn list_f_on_a_fresh_box_opens_the_install_confirm() {
+fn list_f_on_a_fresh_box_lands_on_the_install_line() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     app.tab = super::Tab::Services;
@@ -621,10 +622,15 @@ fn list_f_on_a_fresh_box_opens_the_install_confirm() {
         &mut app,
         crate::testutil::key(ratatui::crossterm::event::KeyCode::Char('f')),
     );
+    assert!(app.modals.is_empty(), "f only moves focus");
+    super::handle_key(
+        &mut app,
+        crate::testutil::key(ratatui::crossterm::event::KeyCode::Enter),
+    );
     match app.modals.last() {
         Some(super::Modal::Confirm(state)) => assert!(
             matches!(state.on_confirm, super::ConfirmAction::InstallPlugin),
-            "list f on a fresh box installs, got {:?}",
+            "list f on a fresh box lands on the install, got {:?}",
             state.on_confirm
         ),
         other => panic!("expected the install confirm, got {other:?}"),
@@ -667,7 +673,7 @@ fn the_delegates_detail_names_rate_limited_traffic() {
 }
 
 /// A fix landing under a focused problem shrinks the problem set; the recompute
-/// clamps the cursor so the surviving problem is the one `f` fixes.
+/// clamps the cursor so the surviving problem is the one `↵` opens.
 #[test]
 fn the_problem_cursor_clamps_when_a_fix_lands_under_focus() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -699,7 +705,7 @@ fn the_problem_cursor_clamps_when_a_fix_lands_under_focus() {
     assert_eq!(
         app.services.focused_fix(),
         Some(&super::ServiceFix::InstallPlugin),
-        "and `f` fixes the surviving install problem"
+        "and `↵` opens the surviving install problem"
     );
 }
 
@@ -1619,10 +1625,10 @@ fn plugin_check_names_the_user_scope_record_when_one_exists() {
 // ── the install fix drives agentgear at user scope ────────────────────────
 
 /// The confirm gate every mutating fix owes (tab spec: "confirm modal first,
-/// default choice = cancel"): `f` on the plugin row must open a
+/// default choice = cancel"): `↵` on the focused install line must open a
 /// [`ConfirmAction::InstallPlugin`] modal that defaults to cancel and runs
 /// nothing until confirmed. The server is already wired so the install is the
-/// first fixable problem the list `f` reaches.
+/// plugin detail's first fixable problem.
 #[test]
 fn the_install_fix_opens_a_default_cancel_confirm_before_installing() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -1636,6 +1642,8 @@ fn the_install_fix_opens_a_default_cancel_confirm_before_installing() {
         .position(|c| c.label == "plugin")
         .expect("plugin check present");
     app.services.cursor = idx;
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services.problem_cursor = 0;
 
     super::apply_service_fix(&mut app);
 
@@ -20958,6 +20966,7 @@ fn the_shunt_confirms_carry_the_approved_copy() {
     app.tab = super::Tab::Services;
     app.services.checks = vec![card];
     app.services.cursor = 0;
+    super::walk_to_next_fix(&mut app);
     super::apply_service_fix(&mut app);
     match app.modals.last() {
         Some(Modal::Confirm(state)) => {
@@ -21006,6 +21015,7 @@ fn the_shunt_confirms_carry_the_approved_copy() {
     app.services.checks = vec![card];
     app.services.cursor = 0;
     app.services.move_plan = Some(super::MovePlanOutcome::Plan(plan));
+    super::walk_to_next_fix(&mut app);
     super::apply_service_fix(&mut app);
     match app.modals.last() {
         Some(Modal::Confirm(state)) => {
@@ -21040,6 +21050,7 @@ fn the_shunt_confirms_carry_the_approved_copy() {
     app.services.checks = vec![card];
     app.services.cursor = 0;
     app.services.move_plan = Some(super::MovePlanOutcome::Plan(plan));
+    super::walk_to_next_fix(&mut app);
     super::apply_service_fix(&mut app);
     match app.modals.last() {
         Some(Modal::Confirm(state)) => {
@@ -21066,6 +21077,7 @@ fn the_shunt_confirms_carry_the_approved_copy() {
     app.tab = super::Tab::Services;
     app.services.checks = vec![card];
     app.services.cursor = 0;
+    super::walk_to_next_fix(&mut app);
     super::apply_service_fix(&mut app);
     match app.modals.last() {
         Some(Modal::Confirm(state)) => {
@@ -21095,6 +21107,7 @@ fn the_shunt_confirms_carry_the_approved_copy() {
     app.tab = super::Tab::Services;
     app.services.checks = vec![card];
     app.services.cursor = 0;
+    super::walk_to_next_fix(&mut app);
     super::apply_service_fix(&mut app);
     match app.modals.last() {
         Some(Modal::Confirm(state)) => {
@@ -21205,6 +21218,7 @@ fn the_move_confirm_counts_n_and_k_separately() {
     app.services.checks = vec![card];
     app.services.cursor = 0;
     app.services.move_plan = Some(super::MovePlanOutcome::Plan(plan));
+    super::walk_to_next_fix(&mut app);
     super::apply_service_fix(&mut app);
     match app.modals.last() {
         Some(Modal::Confirm(state)) => {
@@ -21824,7 +21838,7 @@ fn a_landed_add_admin_key_re_settles_focus_to_the_enabled_row() {
             .is_some_and(|f| matches!(f, super::ServiceFix::AddAdminKey)),
         "the walk lands on the admin fix"
     );
-    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('y')));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
 
@@ -21897,7 +21911,7 @@ fn a_landed_move_re_settles_focus_to_the_enabled_row() {
             .is_some_and(|f| matches!(f, super::ServiceFix::MoveStoresIn)),
         "the walk lands on the move fix"
     );
-    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('y')));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
 
@@ -22086,6 +22100,7 @@ fn app_prose_styles_keys_and_commands_on_every_surface() {
     app.tab = Tab::Services;
     app.services.checks = vec![heal];
     app.services.cursor = 0;
+    super::walk_to_next_fix(&mut app);
     super::apply_service_fix(&mut app);
     assert!(matches!(app.modals.last(), Some(super::Modal::Confirm(_))));
     assert_prose_part(
@@ -24387,7 +24402,7 @@ fn a_saving_row_sheds_its_edit_hints_in_the_footer() {
     let footer = footer_row(&rig.app, 120, 40);
     assert_eq!(
         footer.trim(),
-        "←→ tabs   ↑↓ row   r refresh   a actions   ? help   q back",
+        "←→ tabs   ↑↓ row   r refresh   f next fix   a actions   ? help   q back",
         "a saving typed row sheds `↵ edit value`"
     );
 
@@ -24400,7 +24415,7 @@ fn a_saving_row_sheds_its_edit_hints_in_the_footer() {
     let footer = footer_row(&rig.app, 120, 40);
     assert_eq!(
         footer.trim(),
-        "←→ tabs   ↑↓ row   r refresh   ↵ edit value   a actions   ? help   q back",
+        "←→ tabs   ↑↓ row   r refresh   ↵ edit value   f next fix   a actions   ? help   q back",
         "a row beside a saving one keeps its `↵ edit value` hint"
     );
 
@@ -24420,7 +24435,7 @@ fn a_saving_row_sheds_its_edit_hints_in_the_footer() {
     let footer = footer_row(&rig.app, 120, 40);
     assert_eq!(
         footer.trim(),
-        "←→ tabs   ↑↓ row   r refresh   a actions   ? help   q back",
+        "←→ tabs   ↑↓ row   r refresh   f next fix   a actions   ? help   q back",
         "a saving cycle row sheds `space cycle` and `↵ custom`"
     );
 }

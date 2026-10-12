@@ -4,11 +4,13 @@
 //! the 3-panel budget.
 //!
 //! The left panel is one cursor-driven selector over the service rows. Each row
-//! is a status dot + label, the verdict in the detail pane. Enter descends into
-//! the detail pane; `f` applies the focused row's (or, on the plugin detail,
-//! focused problem's) fix. All data is recomputed synchronously on tab focus
-//! and `r`, the herdr probe excepted: it runs on a worker, its row appears when
-//! it lands, and the title spinner shows while it runs.
+//! is a status dot + label, the verdict in the detail pane, plus a trailing
+//! `f` on a row with a fix line. Enter descends into the detail pane; `f`
+//! walks to the selected row's next fix line (descending from the list) and
+//! `↵` on a focused fix line opens its confirm. All data is recomputed
+//! synchronously on tab focus and `r`, the herdr probe excepted: it runs on a
+//! worker, its row appears when it lands, and the title spinner shows while it
+//! runs.
 //!
 //! The delegates detail is a descendable job list: `↵` on the row descends when
 //! at least one job is listed, ↑↓ walks the jobs, and the selected job expands
@@ -92,6 +94,7 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ListItem::new(selector_row(
                 check.health,
                 check.label,
+                check.fix.is_some(),
                 idx == app.services.cursor,
                 focused,
                 content_w,
@@ -107,14 +110,31 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-/// One selector row: `❯ ● label`. Rows are dot-only — the dot color carries the
-/// verdict and the full readout lives in the detail pane — so there is no
-/// `[f]` cue on the row. The hover tint spans the full content width when
-/// selected (the ratatui filler-tint gotcha); the caret shows only in the
-/// focused pane.
+/// The selector's trailing `f` on a row with a fix line, styled as the key it
+/// names; the help modal's legend row draws this same span.
+pub(super) fn fix_mark() -> Span<'static> {
+    Span::styled(
+        "f",
+        Style::default()
+            .fg(theme::accent_color())
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+/// The contract's minimum gap between content and a right-aligned column.
+const RIGHT_COLUMN_GAP: usize = 3;
+
+/// One selector row: `❯ ● label`, the dot color carrying the verdict and the
+/// full readout living in the detail pane. A row whose detail shows a fix
+/// line ends in a right-aligned `f` (the key's own ACCENT + bold, cloudy
+/// 2026-10-12), kept apart from the dot so health and fixability stay two
+/// signals; it drops whole where the 3-cell gap cannot fit. The hover tint
+/// spans the full content width when selected (the ratatui filler-tint
+/// gotcha); the caret shows only in the focused pane.
 fn selector_row(
     health: Health,
     label: &str,
+    has_fix: bool,
     selected: bool,
     focused: bool,
     content_w: usize,
@@ -145,10 +165,16 @@ fn selector_row(
     };
 
     let mut spans = vec![caret, dot, Span::styled(label.to_string(), label_style)];
-    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let pad = content_w.saturating_sub(used);
+    let used: usize = spans.iter().map(Span::width).sum();
+    let mark = has_fix && used + RIGHT_COLUMN_GAP < content_w;
+    let pad = content_w.saturating_sub(used + usize::from(mark));
     if pad > 0 {
         spans.push(Span::styled(" ".repeat(pad), with_bg(Style::default())));
+    }
+    if mark {
+        let f = fix_mark();
+        let style = with_bg(f.style);
+        spans.push(f.style(style));
     }
     Line::from(spans)
 }
@@ -244,14 +270,15 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .unwrap_or(0)
         .min(18);
 
-    // The plugin detail walks its fixable problems while descended; its fix
-    // line carries the caret + hover tint then.
-    let problem_focus = if focused
-        && check.label == "plugin"
-        && !app.services.diagnostic_focus
-        && !check.problems.is_empty()
-    {
+    // The plugin detail walks its fixable problems while descended, and the
+    // herdr detail's heal line is a walk stop; the focused fix line carries
+    // the caret + hover tint.
+    let problem_focus = if !focused || app.services.diagnostic_focus || check.problems.is_empty() {
+        None
+    } else if check.label == "plugin" {
         Some(app.services.problem_cursor)
+    } else if check.label == "herdr" && app.services.herdr_fix_focus {
+        Some(0)
     } else {
         None
     };
@@ -276,7 +303,10 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // The herdr detail appends its options section and takes per-row focus;
     // every other detail keeps the scroll-only path below.
     if check.label == "herdr" {
-        draw_herdr_detail(frame, inner, app, lines);
+        let fix_focus = problem_focus
+            .and_then(|i| check.problems.get(i))
+            .map(|p| p.line);
+        draw_herdr_detail(frame, inner, app, lines, fix_focus);
         return;
     }
 
@@ -1716,12 +1746,22 @@ fn draw_delegates_empty(frame: &mut Frame<'_>, body: Rect) {
 /// `draw_scrolled_lines` shape, so the prose scrolls to follow the cursor
 /// rather than holding a manual offset. The section header underlines while
 /// focus rests on one of its rows.
-fn draw_herdr_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, mut lines: Vec<Line<'static>>) {
+/// `fix_focus` is the detail line of the heal fix while focus sits on it;
+/// the option rows then hold no selection.
+fn draw_herdr_detail(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    app: &App,
+    mut lines: Vec<Line<'static>>,
+    fix_focus: Option<usize>,
+) {
     let focused = app.services.focus == ServicesFocus::Detail;
 
     lines.push(Line::from(""));
     let mut section_style = theme::label();
-    if focused {
+    // The eyebrow underlines while focus rests on one of its rows, never while
+    // it sits on the heal line above the section.
+    if focused && fix_focus.is_none() {
         section_style = section_style.underlined();
     }
     lines.push(Line::from(Span::styled("OPTIONS", section_style)));
@@ -1731,12 +1771,14 @@ fn draw_herdr_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, mut lines: V
     let writable = herdr_config_writable(app);
     // The focused row's block (row + its tooltip lines) for the scroll focus,
     // and the native-cursor slot for the tag editor.
-    let mut focus = (0usize, 1usize);
+    let mut focus = fix_focus.map_or((0usize, 1usize), |line| (line, line + 1));
     let mut caret: Option<(u16, usize)> = None;
 
     for (i, row) in HERDR_OPTIONS.iter().enumerate() {
-        let selected =
-            focused && !app.services.diagnostic_focus && i == app.services.herdr_options_cursor;
+        let selected = focused
+            && fix_focus.is_none()
+            && !app.services.diagnostic_focus
+            && i == app.services.herdr_options_cursor;
         let row_editing = if *row == HerdrOption::TagRefresh {
             editing
         } else {

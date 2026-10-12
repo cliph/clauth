@@ -484,10 +484,10 @@ fn shed_to_width(hints: &mut Vec<(&str, &str)>, width: usize) {
     }
 }
 
-/// Services tab hints. `f` only fixes a row (or, on the plugin detail, a
-/// problem) that actually offers one — never advertised where pressing it is a
-/// no-op, and its label is the fix's verb. `pub(super)` so the Services render
-/// tests pin each focus state's whole hint list by equality.
+/// Services tab hints under the fix grammar: `↵ <verb>` on a focused fix line
+/// (dropped while an in-flight shunt action gates it), `f next fix` only while
+/// the press would move focus to a fix line. `pub(super)` so the Services
+/// render tests pin each focus state's whole hint list by equality.
 pub(super) fn services_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     match app.services.focus {
         ServicesFocus::List => {
@@ -498,10 +498,8 @@ pub(super) fn services_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 hints.push(("↵", "detail"));
             }
             hints.push(("r", "refresh"));
-            if let Some(fix) = app.services.focused_fix()
-                && !(app.services.shunt_action.running && shunt_fix(fix))
-            {
-                hints.push(("f", fix_verb(fix)));
+            if app.services.f_moves() {
+                hints.push(NEXT_FIX);
             }
             hints.extend([("a", "actions"), ("?", "help")]);
             hints
@@ -510,9 +508,12 @@ pub(super) fn services_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     }
 }
 
+/// The `f` hint under the fix grammar: the key walks, it never applies.
+const NEXT_FIX: (&str, &str) = ("f", "next fix");
+
 /// True for the four fixes an in-flight shunt action gates (a second shunt
 /// press starts nothing); the plugin and herdr fixes keep working, so their
-/// `f` hint stays while a shunt action runs.
+/// `↵` hint stays while a shunt action runs.
 fn shunt_fix(fix: &ServiceFix) -> bool {
     matches!(
         fix,
@@ -527,7 +528,12 @@ fn shunt_fix(fix: &ServiceFix) -> bool {
 /// keys, the plugin detail walks its fixable problems, every other detail
 /// scrolls.
 fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
-    let verb = app.services.focused_fix().map(fix_verb);
+    let verb = app
+        .services
+        .focused_fix()
+        .filter(|fix| !(app.services.shunt_action.running && shunt_fix(fix)))
+        .map(fix_verb);
+    let next_fix = app.services.f_moves().then_some(NEXT_FIX);
     let label = app.services.selected_check().map(|c| c.label);
 
     // The delegates detail walks its job list while descended. Every group
@@ -547,10 +553,10 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     // The shunt detail walks its actionable lines one at a time: `↑↓ row`
     // while a press would move focus (there are ≥2 stops), `↑↓ scroll` while
     // a press would only scroll the read-only text, and no `↑↓` at all when
-    // neither applies (a fitting one-stop card, audit N4). `f`/`space/↵` act
-    // only on the focused line, and drop while an action runs or nothing holds
-    // focus — derived from the same gates the handlers read, never copied per
-    // branch.
+    // neither applies (a fitting one-stop card, audit N4). `space/↵` act only
+    // on the focused line, and drop while an action runs or nothing holds
+    // focus; `f next fix` stays while the walk can move — derived from the
+    // same gates the handlers read, never copied per branch.
     if label == Some("shunt") {
         let focus = app.services.focused_shunt_focus();
         let stops = app
@@ -569,14 +575,15 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             hints.push(("↑↓", "scroll"));
         }
         hints.push(("r", "refresh"));
-        // Each hint derives from the same predicate its handler acts on: `f`
-        // and the `enabled` toggle read `shunt_action.running` and drop with
-        // it; a field row's edit hints read `saving(&key)` and drop while its
-        // save checks (the row is busy — `↵`/`space` are inert); expanding an
-        // entry and opening the check output never read either, so those stay.
+        // Each hint derives from the same predicate its handler acts on: a fix
+        // line's `↵` and the `enabled` toggle read `shunt_action.running` and
+        // drop with it; a field row's edit hints read `saving(&key)` and drop
+        // while its save checks (the row is busy — `↵`/`space` are inert);
+        // expanding an entry and opening the check output never read either,
+        // so those stay.
         match focus {
             Some(ShuntFocus::Fix { fix, .. }) if !app.services.shunt_action.running => {
-                hints.push(("f", fix_verb(fix)));
+                hints.push(("↵", fix_verb(fix)));
             }
             Some(ShuntFocus::Enabled { .. }) if !app.services.shunt_action.running => {
                 hints.push(("space/↵", "toggle"));
@@ -626,6 +633,7 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             }
             _ => {}
         }
+        hints.extend(next_fix);
         hints.extend([("a", "actions"), ("?", "help")]);
         return hints;
     }
@@ -646,8 +654,9 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         }
         hints.push(("r", "refresh"));
         if let Some(v) = verb {
-            hints.push(("f", v));
+            hints.push(("↵", v));
         }
+        hints.extend(next_fix);
         hints.extend([("a", "actions"), ("?", "help")]);
         return hints;
     }
@@ -657,14 +666,24 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         if app.services.detail_max_scroll.get() > 0 {
             hints.push(("page up/down", "read"));
         }
-        hints.extend([("r", "refresh"), ("a", "actions"), ("?", "help")]);
+        hints.push(("r", "refresh"));
+        hints.extend(next_fix);
+        hints.extend([("a", "actions"), ("?", "help")]);
         return hints;
     }
 
-    // The herdr options rows: `r` and `f` keep working while the options rows
-    // hold the cursor, so they keep their hints (f only when the check offers
-    // a fix).
+    // The herdr heal line holds focus: `↵` opens its confirm. Otherwise the
+    // options rows name their own keys; `r` and `f` keep working there, `f`
+    // advertised only while the check offers a fix line to walk to.
     let mut hints = match HERDR_OPTIONS.get(app.services.herdr_options_cursor) {
+        _ if verb.is_some() => {
+            let mut hints = vec![("↑↓", "row")];
+            hints.extend(verb.map(|v| ("↵", v)));
+            hints.push(("r", "refresh"));
+            hints.extend(next_fix);
+            hints.extend([("a", "actions"), ("?", "help")]);
+            hints
+        }
         Some(HerdrOption::TagRefresh) => {
             let mut hints = vec![
                 ("↑↓", "row"),
@@ -673,17 +692,13 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 ("↵", "type"),
                 ("r", "refresh"),
             ];
-            if let Some(v) = verb {
-                hints.push(("f", v));
-            }
+            hints.extend(next_fix);
             hints.extend([("a", "actions"), ("?", "help")]);
             hints
         }
         Some(HerdrOption::DelegateRowText) if herdr_config_writable(app) => {
             let mut hints = vec![("↑↓", "row"), ("space/↵", "rewrite row"), ("r", "refresh")];
-            if let Some(v) = verb {
-                hints.push(("f", v));
-            }
+            hints.extend(next_fix);
             hints.extend([("a", "actions"), ("?", "help")]);
             hints
         }
@@ -691,9 +706,7 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         // no-op there.
         Some(HerdrOption::DelegateRowText) => {
             let mut hints = vec![("↑↓", "row"), ("r", "refresh")];
-            if let Some(v) = verb {
-                hints.push(("f", v));
-            }
+            hints.extend(next_fix);
             hints.extend([("a", "actions"), ("?", "help")]);
             hints
         }
@@ -703,9 +716,7 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 ("space/↵", "cycle / toggle"),
                 ("r", "refresh"),
             ];
-            if let Some(v) = verb {
-                hints.push(("f", v));
-            }
+            hints.extend(next_fix);
             hints.extend([("a", "actions"), ("?", "help")]);
             hints
         }

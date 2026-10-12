@@ -1138,10 +1138,10 @@ fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &
                     "page up / page down",
                     "scroll a page · read plugin / herdr diagnostics · page delegates",
                 ),
-                ("\u{21b5}", "open detail · activate an option"),
+                ("\u{21b5}", "open detail · activate · open fix"),
                 ("space", "activate the focused herdr option"),
                 ("+ / -", "step the tag refresh"),
-                ("f", "apply the focused fix"),
+                ("f", "next fix"),
                 ("r", "re-run all checks"),
                 ("esc", "back to the list · close the editor"),
             ][..],
@@ -1299,8 +1299,8 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 /// Legend for the 1-cell marks the account surfaces carry, with no key of their
 /// own to document them: the Overview row's leading `●` and `⇄`, the Overview
-/// chain's projected-switch `↲`, and every blocked-reason marker on the
-/// Fallback chain.
+/// chain's projected-switch `↲`, every blocked-reason marker on the Fallback
+/// chain, and the Services selector's trailing `f`.
 ///
 /// Each blocked-reason row takes its glyph AND its hue from [`reason_marker`]
 /// itself, so the legend cannot drift from what the chain renders. `⊖` and `⊘`
@@ -1345,6 +1345,7 @@ fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
         ),
         reason(BlockedReason::WeeklySoft { pct: 0.0 }, DIAG_WEEKLY_SOFT),
         reason(BlockedReason::Stale, DIAG_STALE),
+        (super::services::fix_mark(), "has a fix"),
     ]
 }
 

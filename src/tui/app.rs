@@ -2815,6 +2815,22 @@ pub(crate) struct ServicesState {
     /// who re-derives it and misses by half. What binds is the order: single-
     /// digit ms in release, roughly ten times that in debug.
     pub(crate) delegates: Vec<crate::mcp::jobs::StoredJob>,
+    /// Cursor over the delegates detail's job list while it is descended.
+    pub(crate) delegates_cursor: usize,
+    /// The selected job's id, tracked across a refresh so a newer job inserting
+    /// above the selection does not move it onto a different job.
+    pub(crate) delegates_selected_id: Option<String>,
+    /// The delegates detail's persisted scroll offset and published geometry,
+    /// parallel to the member card's `fallback_detail_*`: the offset survives
+    /// across frames, and the page keys step against the last render's viewport.
+    pub(crate) delegates_offset: std::cell::Cell<usize>,
+    pub(crate) delegates_viewport: std::cell::Cell<usize>,
+    pub(crate) delegates_total: std::cell::Cell<usize>,
+    pub(crate) delegates_starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) delegates_block_ends: std::cell::RefCell<Vec<usize>>,
+    /// True once the delegates detail has been descended at least once: from
+    /// then on the blurred pane keeps the last-selected row's tint and offset.
+    pub(crate) delegates_has_descended: bool,
     /// Cursor over the plugin detail's fixable problems ([`Check::problems`]).
     /// While the plugin detail is descended, ↑↓ walks these instead of
     /// scrolling the prose; `f` applies the focused one.
@@ -2882,6 +2898,14 @@ impl Default for ServicesState {
             shunt_viewport: std::cell::Cell::new(0),
             last_plan_env_source: None,
             delegates: Vec::new(),
+            delegates_cursor: 0,
+            delegates_selected_id: None,
+            delegates_offset: std::cell::Cell::new(0),
+            delegates_viewport: std::cell::Cell::new(0),
+            delegates_total: std::cell::Cell::new(0),
+            delegates_starts: std::cell::RefCell::new(Vec::new()),
+            delegates_block_ends: std::cell::RefCell::new(Vec::new()),
+            delegates_has_descended: false,
             problem_cursor: 0,
             herdr_options_cursor: 0,
             herdr_tag_draft: None,
@@ -3013,6 +3037,46 @@ impl ServicesState {
             return;
         }
         self.set_shunt_focus(shunt_first_in_view(stops, rows, scroll, viewport));
+    }
+
+    /// Re-settle the delegates selection against the current job list: the
+    /// selection follows the job id across a refresh, and clamps to the last
+    /// job when that id left the list. Called after every `delegates` refresh.
+    pub(crate) fn settle_delegates_selection(&mut self) {
+        let len = self.delegates.len();
+        if len == 0 {
+            self.delegates_cursor = 0;
+            self.delegates_selected_id = None;
+            return;
+        }
+        if let Some(id) = self.delegates_selected_id.clone()
+            && let Some(pos) = self.delegates.iter().position(|j| j.record.job_id == id)
+        {
+            self.delegates_cursor = pos;
+            return;
+        }
+        self.delegates_cursor = self.delegates_cursor.min(len - 1);
+        self.delegates_selected_id = self
+            .delegates
+            .get(self.delegates_cursor)
+            .map(|j| j.record.job_id.clone());
+    }
+
+    /// Whether `↵` on the row under the cursor descends into its detail: every
+    /// row except a delegates row, which descends only while it lists a job.
+    /// The one predicate the key handler and the footer both read.
+    pub(crate) fn enter_descends(&self) -> bool {
+        !self
+            .selected_check()
+            .is_some_and(|c| c.label == "delegates")
+            || !self.delegates.is_empty()
+    }
+
+    /// Whether ↑↓/PageUp/PageDown move the delegates selection (≥2 jobs; a
+    /// single job wraps to itself). The footer derives its descended hints
+    /// from this, so a press that cannot move anything advertises nothing.
+    pub(crate) fn delegates_selection_moves(&self) -> bool {
+        self.delegates.len() > 1
     }
 }
 
@@ -4934,6 +4998,17 @@ pub(crate) fn has_sub_focus(app: &App) -> bool {
         || (app.tab == Tab::Tokens && app.token_view == TokenView::Models)
 }
 
+/// True while focus is descended into the delegates detail: `←` ascends and
+/// `→` is inert there, the master-detail arrow-trap, instead of switching tabs.
+fn services_delegates_descended(app: &App) -> bool {
+    app.tab == Tab::Services
+        && app.services.focus == ServicesFocus::Detail
+        && app
+            .services
+            .selected_check()
+            .is_some_and(|c| c.label == "delegates")
+}
+
 /// What owns the keyboard this frame: every key it claims ([`KeyOwner::claims`]),
 /// `←`/`→` included, reaches it before any tab switch or global binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5091,12 +5166,19 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             app.model_detail_focus = StatusFocus::List;
             return;
         }
+        KeyCode::Left if services_delegates_descended(app) => {
+            leave_shunt_detail(app);
+            return;
+        }
         KeyCode::Right
             if (app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail)
                 || (app.tab == Tab::Tokens
                     && app.token_view == TokenView::Models
                     && app.model_detail_focus == StatusFocus::Detail) =>
         {
+            return;
+        }
+        KeyCode::Right if services_delegates_descended(app) => {
             return;
         }
         KeyCode::Right | KeyCode::Tab => {
@@ -6108,17 +6190,24 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                     // The user has acted: any still-pending herdr landing is
                     // cancelled, whether or not this descends.
                     app.services.land_on_herdr = false;
-                    // The delegates detail binds no key, so it never takes
-                    // pane focus.
-                    if !app
+                    let delegates = app
                         .services
                         .selected_check()
-                        .is_some_and(|c| c.label == "delegates")
-                    {
+                        .is_some_and(|c| c.label == "delegates");
+                    // A delegates detail with no jobs has nothing to select, so
+                    // `↵` does not descend into it (S2/S6 precedent: a pane
+                    // with nothing to select advertises no inert `↵`).
+                    if app.services.enter_descends() {
                         app.services.focus = ServicesFocus::Detail;
                         app.services.detail_scroll = 0;
                         app.services.diagnostic_focus = false;
-                        settle_shunt_focus(app);
+                        if delegates {
+                            app.services.settle_delegates_selection();
+                            app.services.delegates_offset.set(0);
+                            app.services.delegates_has_descended = true;
+                        } else {
+                            settle_shunt_focus(app);
+                        }
                     }
                 }
                 KeyCode::Char('f') => {
@@ -6157,6 +6246,8 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                 handle_plugin_problems_key(app, key);
             } else if label == Some("shunt") {
                 handle_shunt_detail_key(app, key);
+            } else if label == Some("delegates") {
+                handle_delegates_detail_key(app, key);
             } else {
                 match key.code {
                     KeyCode::Up => {
@@ -6215,6 +6306,73 @@ fn handle_plugin_problems_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('f') => apply_service_fix(app),
         _ => {}
     }
+}
+
+/// The delegates detail's keymap while descended: ↑↓ walks the job list
+/// (wrapping), PageUp/PageDown page through the S8 page helper, stopping at
+/// the ends. The selection follows the job id, so a refresh that inserts a
+/// newer job above keeps the same job selected. No stop/cancel key exists —
+/// stopping a delegate stays `monitor`'s job, and the pane binds nothing else.
+fn handle_delegates_detail_key(app: &mut App, key: KeyEvent) {
+    let len = app.services.delegates.len();
+    if len == 0 {
+        return;
+    }
+    app.services.delegates_cursor = app.services.delegates_cursor.min(len - 1);
+    match key.code {
+        KeyCode::Up => {
+            app.services.delegates_cursor =
+                (app.services.delegates_cursor + len - 1).rem_euclid(len);
+            track_delegates_selection(app);
+        }
+        KeyCode::Down => {
+            app.services.delegates_cursor = (app.services.delegates_cursor + 1).rem_euclid(len);
+            track_delegates_selection(app);
+        }
+        KeyCode::PageUp => {
+            let next = {
+                let starts = app.services.delegates_starts.borrow();
+                let block_ends = app.services.delegates_block_ends.borrow();
+                page_up_cursor_by_rows(
+                    app.services.delegates_cursor,
+                    &starts,
+                    &block_ends,
+                    &[],
+                    app.services.delegates_viewport.get(),
+                    app.services.delegates_offset.get(),
+                    app.services.delegates_total.get(),
+                )
+            };
+            app.services.delegates_cursor = next;
+            track_delegates_selection(app);
+        }
+        KeyCode::PageDown => {
+            let next = {
+                let starts = app.services.delegates_starts.borrow();
+                let block_ends = app.services.delegates_block_ends.borrow();
+                page_down_cursor_by_rows(
+                    app.services.delegates_cursor,
+                    &starts,
+                    &block_ends,
+                    app.services.delegates_viewport.get(),
+                    app.services.delegates_offset.get(),
+                    app.services.delegates_total.get(),
+                )
+            };
+            app.services.delegates_cursor = next;
+            track_delegates_selection(app);
+        }
+        _ => {}
+    }
+}
+
+/// Mirror the delegates cursor onto the tracked job id (the refresh anchor).
+fn track_delegates_selection(app: &mut App) {
+    app.services.delegates_selected_id = app
+        .services
+        .delegates
+        .get(app.services.delegates_cursor)
+        .map(|j| j.record.job_id.clone());
 }
 
 /// The shunt detail's keymap: ↑↓ walks the actionable lines (landing on each
@@ -7912,7 +8070,7 @@ pub(crate) fn herdr_check(
 
 /// Whether a recompute re-runs the shunt card's plan and pool workers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShuntRefresh {
+pub(crate) enum ShuntRefresh {
     /// Cheap recompute: start a worker only when its cache is empty.
     Keep,
     /// Drop the plan/pool caches and restart their workers (respecting their
@@ -7928,7 +8086,7 @@ enum ShuntRefresh {
 /// starts on a worker when none is cached or on `r`, and the shunt plan/pool
 /// workers, which [`ShuntRefresh::Restart`] re-runs on tab entry and after a
 /// shunt action lands.
-fn recompute_services_checks(app: &mut App, refresh_version: bool, shunt: ShuntRefresh) {
+pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, shunt: ShuntRefresh) {
     use crate::plugin_probe as probe;
 
     app.services.error = None;
@@ -8149,6 +8307,7 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool, shunt: ShuntR
     // delegates row — the job store is also its detail, so read it first and
     // derive the dot from what it holds now, not the previous tick's.
     app.services.delegates = crate::mcp::jobs::list_banded(crate::usage::now_ms());
+    app.services.settle_delegates_selection();
     checks.push(delegates_check(&app.services.delegates, &rate_limited));
 
     // plugin row — the folded readout, over the cached probes + the PATH read.
@@ -8197,6 +8356,19 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool, shunt: ShuntR
         .saturating_sub(1);
     if app.services.problem_cursor > problems {
         app.services.problem_cursor = problems;
+    }
+
+    // A delegates detail that emptied while descended has nothing left to
+    // select: ascend to the selector so the footer and the pane focus cannot
+    // stay stuck on a dead pane.
+    if app.services.focus == ServicesFocus::Detail
+        && app
+            .services
+            .selected_check()
+            .is_some_and(|c| c.label == "delegates")
+        && app.services.delegates.is_empty()
+    {
+        leave_shunt_detail(app);
     }
 
     // A pending herdr landing (the first herdr launch; its probe lands on a

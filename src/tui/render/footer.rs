@@ -492,12 +492,9 @@ pub(super) fn services_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     match app.services.focus {
         ServicesFocus::List => {
             let mut hints = vec![("↑↓", "row")];
-            // The delegates detail binds no key, so ⏎ does not descend into it.
-            if !app
-                .services
-                .selected_check()
-                .is_some_and(|c| c.label == "delegates")
-            {
+            // `↵` descends only where the handler descends (a job-less
+            // delegates row advertises no inert `↵`) — one shared predicate.
+            if app.services.enter_descends() {
                 hints.push(("↵", "detail"));
             }
             hints.push(("r", "refresh"));
@@ -532,6 +529,20 @@ fn shunt_fix(fix: &ServiceFix) -> bool {
 fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     let verb = app.services.focused_fix().map(fix_verb);
     let label = app.services.selected_check().map(|c| c.label);
+
+    // The delegates detail walks its job list while descended. Every group
+    // derives from the same count the handler steps over: ↑↓ and page keys
+    // move the selection only with ≥2 jobs, so a press that cannot move
+    // anything advertises nothing.
+    if label == Some("delegates") {
+        let mut hints = Vec::new();
+        if app.services.delegates_selection_moves() {
+            hints.push(("↑↓", "row"));
+            hints.push(("page up/down", "read"));
+        }
+        hints.extend([("r", "refresh"), ("a", "actions"), ("?", "help")]);
+        return hints;
+    }
 
     // The shunt detail walks its actionable lines one at a time: `↑↓ row`
     // while a press would move focus (there are ≥2 stops), `↑↓ scroll` while

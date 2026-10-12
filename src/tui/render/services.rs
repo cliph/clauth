@@ -10,10 +10,10 @@
 //! and `r`, the herdr probe excepted: it runs on a worker, its row appears when
 //! it lands, and the title spinner shows while it runs.
 //!
-//! The delegates detail is read-only and takes no keys at all: stopping a
-//! delegate is `monitor({job_ids, cancel: true})`'s job, and a second stop path
-//! would need its own confirm. That is also why its overflow reads `+N more`
-//! rather than carrying a scrollbar — see [`delegate_lines`].
+//! The delegates detail is a descendable job list: `↵` on the row descends when
+//! at least one job is listed, ↑↓ walks the jobs, and the selected job expands
+//! under itself into its full facts and run directory. Stopping a delegate is
+//! `monitor({job_ids, cancel: true})`'s job, so the pane binds no stop key.
 
 use std::collections::HashSet;
 
@@ -37,10 +37,11 @@ use super::super::theme;
 use super::format::{middle_truncate, spinner_frame};
 use super::header::pulse_name_spans;
 use super::panes::{
-    bold_when, cycle_row_lines, draw_following_list, draw_scrollbar, draw_scrolled_lines,
-    empty_state, head_cols, help_tooltip_lines, help_tooltip_lines_at, highlight_row,
-    invalid_tooltip_lines, key_cell, label_style, master_detail, section_box, value_caret,
-    wrap_words,
+    bold_when, chunk_graphemes, cycle_row_lines, draw_following_list, draw_scrollbar,
+    draw_scrolled_lines, draw_scrolled_lines_with_footnote, empty_state, empty_state_lines,
+    footnote_lines, footnote_split, head_cols, help_tooltip_lines, help_tooltip_lines_at,
+    highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, section_box,
+    select_line, value_caret, wrap_words,
 };
 use super::prose;
 use crate::format::truncate;
@@ -1622,15 +1623,19 @@ fn shunt_action_lines(text: &str, width: usize) -> Vec<Line<'static>> {
 fn problem_index(check: &Check, line: usize) -> Option<usize> {
     check.problems.iter().position(|p| p.line == line)
 }
-/// The `delegates` detail: the job list, capped with `+N more`, the closing
-/// steer line underneath. The delegates check's one `key: value` detail line
-/// (the rate-limit warning) rides above the list when it applies. No key
-/// reaches it, so no scrollbar.
+/// The `delegates` detail: a descendable job list whose selected row expands
+/// under itself into its full facts and run directory. The delegates check's
+/// one `key: value` detail line (the rate-limit warning) rides above the list
+/// when it applies; the steer line pins as a footnote under the list. While
+/// the selector holds focus the list renders blurred (no selection, no
+/// expansion, top-anchored); while the detail is descended, the selection's
+/// row expands and the list scrolls to follow it.
 fn draw_delegates_detail(frame: &mut Frame<'_>, inner: Rect, app: &App) {
     if inner.height == 0 {
         return;
     }
-    let rows = delegate_cells(&app.services.delegates, crate::usage::now_ms());
+    let descended = app.services.focus == ServicesFocus::Detail;
+    let cells = delegate_cells(&app.services.delegates, crate::usage::now_ms());
     let mut body = inner;
     if let Some(line) = app
         .services
@@ -1651,20 +1656,56 @@ fn draw_delegates_detail(frame: &mut Frame<'_>, inner: Rect, app: &App) {
         );
         body = rest;
     }
-    let [list_area, steer_area] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(body);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(DELEGATES_STEER, theme::faint())))
-            .style(theme::base()),
-        steer_area,
-    );
 
-    if rows.is_empty() {
-        frame.render_widget(empty_state("no delegates", "r", "to refresh"), list_area);
+    if cells.is_empty() {
+        draw_delegates_empty(frame, body);
         return;
     }
-    let lines = delegate_lines(&rows, list_area.height as usize, list_area.width as usize);
-    frame.render_widget(Paragraph::new(lines).style(theme::base()), list_area);
+
+    let width = body.width as usize;
+    // A selection shows once the user has descended at least once: descended
+    // gains the caret + expansion; blurred keeps the last row's tint only.
+    let selection = (descended || app.services.delegates_has_descended)
+        .then_some(app.services.delegates_cursor.min(cells.len() - 1));
+    let (lines, starts, block_ends) = delegate_job_lines(&cells, selection, descended, width);
+    // The selected job's block (row + expansion) is what the scroll follows;
+    // a blurred pane follows the row alone, and never-descended is top-anchored.
+    let focus = match selection {
+        Some(sel) if descended => (starts[sel], block_ends[sel]),
+        Some(sel) => (starts[sel], starts[sel] + 1),
+        None => (0, 0),
+    };
+    let draw = draw_scrolled_lines_with_footnote(
+        frame,
+        body,
+        lines,
+        focus,
+        Some(&app.services.delegates_offset),
+        Some(DELEGATES_STEER),
+    );
+    app.services.delegates_viewport.set(draw.viewport);
+    app.services.delegates_total.set(draw.total);
+    app.services.delegates_starts.replace(starts);
+    app.services.delegates_block_ends.replace(block_ends);
+}
+
+/// The empty delegates detail: the framed empty state in the scroll area and
+/// the steer line in the footnote area when both fit; on a pane too short to
+/// hold the framed box (or inlined), the bare lines compose with the steer
+/// through the shared helper.
+fn draw_delegates_empty(frame: &mut Frame<'_>, body: Rect) {
+    let foot = footnote_lines(DELEGATES_STEER, body.width as usize);
+    let (scroll_area, foot_area) = footnote_split(body, foot.len());
+    // The framed empty state needs its 4 rows (2 borders + 2 lines).
+    if let Some(area) = foot_area
+        && scroll_area.height >= 4
+    {
+        frame.render_widget(empty_state("no delegates", "r", "to refresh"), scroll_area);
+        frame.render_widget(Paragraph::new(foot).style(theme::base()), area);
+    } else {
+        let lines = empty_state_lines("no delegates", "r", "to refresh");
+        draw_scrolled_lines_with_footnote(frame, body, lines, (0, 0), None, Some(DELEGATES_STEER));
+    }
 }
 
 /// The herdr detail: the read-only prose above, then an `options` section of
@@ -2001,48 +2042,88 @@ const NAME_W_MAX: usize = 18;
 /// tree, so it is dropped whole instead.
 const CWD_MIN_W: usize = 12;
 
-/// The line under the list. Owner's words, verbatim: the pane takes no keys, so
-/// this is the whole of what it offers beyond the list itself.
+/// The line under the list, verbatim.
 const DELEGATES_STEER: &str = "manage delegates in clauth app on web or mobile (coming soon)";
 
-/// The rows that fit, plus a `+N more` line naming what did not.
-///
-/// **House deviation**: everywhere else a scrollbar is the only legal overflow
-/// signal. This pane binds no key, so a scrollbar here would advertise
-/// a scroll that cannot happen; a count says the same thing and promises
-/// nothing.
-fn delegate_lines(rows: &[DelegateCells], viewport: usize, width: usize) -> Vec<Line<'static>> {
-    if viewport == 0 {
-        return Vec::new();
-    }
-    let (shown, hidden) = if rows.len() > viewport {
-        (viewport - 1, rows.len() - (viewport - 1))
-    } else {
-        (rows.len(), 0)
-    };
-    let visible = &rows[..shown];
-    let name_w = visible
+/// The whole job list as scroll content: one row per job, the selected job's
+/// expansion under it. Returns the lines plus the per-job geometry the scroll
+/// follow and the page keys read: each job's start line and its focused block
+/// end (its own row plus the expansion it gains once selected). `selected` is
+/// the tinted job (`None` before the first descent); `descended` adds the
+/// caret, label promotion and expansion to the selected job.
+fn delegate_job_lines(
+    cells: &[DelegateCells],
+    selected: Option<usize>,
+    descended: bool,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<usize>, Vec<usize>) {
+    let name_w = cells
         .iter()
-        .map(|r| r.profile.chars().count())
+        .map(|c| c.profile.chars().count())
         .max()
         .unwrap_or(0)
         .min(NAME_W_MAX);
-    let mut lines: Vec<Line<'static>> = visible
-        .iter()
-        .map(|row| delegate_line(row, name_w, width))
-        .collect();
-    if hidden > 0 {
-        lines.push(Line::from(Span::styled(
-            format!("+{hidden} more"),
-            theme::faint(),
-        )));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut starts = Vec::with_capacity(cells.len());
+    let mut block_ends = Vec::with_capacity(cells.len());
+    for (i, cell) in cells.iter().enumerate() {
+        starts.push(lines.len());
+        let is_selected = selected == Some(i);
+        let focused = descended && is_selected;
+        lines.push(delegate_row_line(cell, name_w, width, is_selected, focused));
+        let expansion = delegate_expansion_lines(cell, width);
+        block_ends.push(lines.len() + expansion.len());
+        if focused {
+            lines.extend(expansion);
+        }
+    }
+    (lines, starts, block_ends)
+}
+
+/// The selected row's full facts: each fact on its own line, then the full
+/// run directory, wrapped at the content width instead of middle-truncated.
+fn delegate_expansion_lines(cells: &DelegateCells, width: usize) -> Vec<Line<'static>> {
+    let wrap_w = width.saturating_sub(2).max(8);
+    let mut lines = Vec::new();
+    for fact in &cells.facts {
+        for seg in wrap_words(fact, wrap_w) {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(seg, theme::dim()),
+            ]));
+        }
+    }
+    if let Some(cwd) = &cells.cwd {
+        // A directory is chunked by display width, never on whitespace: a name
+        // holding runs of spaces keeps every byte.
+        for seg in chunk_graphemes(cwd, wrap_w) {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(seg, theme::faint()),
+            ]));
+        }
     }
     lines
 }
 
-/// One delegate row: `● running  account  facts …  cwd`.
-fn delegate_line(cells: &DelegateCells, name_w: usize, width: usize) -> Line<'static> {
+/// One delegate row: `  ● state  account  facts  cwd`, the 2-cell caret gutter
+/// reserved on every row (`❯ ` on the focused one). `selected` carries the
+/// `BG_HOVER` tint; `focused` adds the caret and promotes only the account
+/// label to `TEXT + bold`.
+fn delegate_row_line(
+    cells: &DelegateCells,
+    name_w: usize,
+    width: usize,
+    selected: bool,
+    focused: bool,
+) -> Line<'static> {
+    let caret = if selected && focused {
+        Span::styled("❯ ", theme::accent().add_modifier(Modifier::BOLD))
+    } else {
+        Span::raw("  ")
+    };
     let mut spans = vec![
+        caret,
         Span::styled(
             format!("{} ", state_mark(cells.state)),
             Style::default().fg(state_color(cells.state)),
@@ -2050,7 +2131,11 @@ fn delegate_line(cells: &DelegateCells, name_w: usize, width: usize) -> Line<'st
         Span::styled(key_cell(cells.state.label(), STATE_W, 2), theme::dim()),
         Span::styled(
             key_cell(&truncate(&cells.profile, name_w), name_w, 2),
-            theme::body(),
+            if selected && focused {
+                theme::body().add_modifier(Modifier::BOLD)
+            } else {
+                theme::body()
+            },
         ),
         Span::styled(cells.facts.join(" · "), theme::dim()),
     ];
@@ -2065,7 +2150,7 @@ fn delegate_line(cells: &DelegateCells, name_w: usize, width: usize) -> Line<'st
             theme::faint(),
         ));
     }
-    Line::from(spans)
+    select_line(Line::from(spans), selected, focused, width as u16)
 }
 
 // How a delegate row reads: `JobPhase`, the crate's one classification of a

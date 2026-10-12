@@ -700,11 +700,11 @@ fn services_help_names_diagnostic_paging_without_mislabeling_arrows() {
         &[
             (
                 "↑ ↓",
-                "pick row · scroll shunt detail · walk plugin problems · walk herdr options",
+                "pick row · scroll shunt detail · walk plugin problems · walk herdr options · walk delegates",
             ),
             (
                 "page up / page down",
-                "scroll a page · read plugin / herdr diagnostics",
+                "scroll a page · read plugin / herdr diagnostics · page delegates",
             ),
             ("↵", "open detail · activate an option"),
             ("space", "activate the focused herdr option"),

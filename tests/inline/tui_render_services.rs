@@ -1,8 +1,8 @@
 //! Services-tab render tests. Each row is a dot + label in the selector; the
 //! verdict lives in the detail pane. The `herdr` row's verdict logic is
 //! unit-tested in `tests/inline/tui_app.rs`; these pin the render per drift
-//! state. The delegates detail shows the job list; its rows, overflow marker
-//! and empty state are pinned here too.
+//! state. The delegates detail shows the job list; its rows, the selected
+//! job's expansion and the empty state are pinned here too.
 
 use crate::herdr::{ConfigStatus, HerdrProbe, RegistryEntry, SidebarState};
 use crate::mcp::jobs::{self, JobRecord, JobState, RecordKind, RunningSpec};
@@ -381,7 +381,7 @@ fn the_services_footer_hints_pin_each_focus_state() {
     let _home = crate::testutil::HomeSandbox::new();
     let hints = |app: &App| super::super::footer::services_hints(app);
 
-    // List on delegates: no `↵ detail`, no `f`.
+    // List on a job-less delegates row: no `↵ detail`, no `f`.
     let app = app_with_checks(vec![
         delegates_check(&[], &[]),
         plugin_check_with_problems(),
@@ -394,7 +394,38 @@ fn the_services_footer_hints_pin_each_focus_state() {
             ("a", "actions"),
             ("?", "help"),
         ],
-        "a selected delegates row binds no key beyond the shared ones"
+        "a job-less delegates row binds no `↵` beyond the shared keys"
+    );
+
+    // List on a delegates row WITH jobs: `↵ detail` appears, no `f`.
+    let app = app_with_delegates(seed_walk_jobs(3));
+    assert_eq!(
+        hints(&app),
+        vec![
+            ("↑↓", "row"),
+            ("↵", "detail"),
+            ("r", "refresh"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "a delegates row with jobs advertises `↵ detail`"
+    );
+
+    // Descended into the delegates detail (overflowing): `↑↓ row` +
+    // `page up/down read` + the shared keys.
+    let mut app = app_with_delegates(seed_walk_jobs(22));
+    app.services.focus = ServicesFocus::Detail;
+    render(&app); // publish the geometry the page hint derives from
+    assert_eq!(
+        hints(&app),
+        vec![
+            ("↑↓", "row"),
+            ("page up/down", "read"),
+            ("r", "refresh"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "the descended delegates detail advertises its walking keys"
     );
 
     // List on plugin (with a fix): `↵ detail` and the list `f` verb.
@@ -1337,21 +1368,21 @@ fn a_delegate_row_carries_the_figures_its_own_record_holds() {
     };
     let row = |account: &str| {
         let cell = cells.iter().find(|c| c.profile == account).unwrap();
-        line_text(&super::delegate_line(cell, 8, 100))
+        line_text(&super::delegate_row_line(cell, 8, 100, false, false))
     };
     assert_eq!(
         row("uwuclxdy"),
-        "● running   uwuclxdy  elapsed 2m 14s · spawned by cld · idle-kill in 4m 48s  /home/u/repos/app",
+        "  ● running   uwuclxdy  elapsed 2m 14s · spawned by cld · idle-kill in 4m 48s  /home/u/repos/app",
         "the run's directory closes the row, never its last words",
     );
     assert_eq!(
         row("kerry"),
-        "● blocking  kerry     elapsed 40s · idle-kill in 4m 30s",
+        "  ● blocking  kerry     elapsed 40s · idle-kill in 4m 30s",
         "a record with no origin ends on its facts",
     );
     assert_eq!(
         row("DS8"),
-        "● done      DS8       finished 15m ago · spawned by uwuclxdy  /home/u/repos/api",
+        "  ● done      DS8       finished 15m ago · spawned by uwuclxdy  /home/u/repos/api",
     );
     assert_eq!(
         facts("glm1"),
@@ -1533,10 +1564,12 @@ fn the_delegates_detail_reports_what_monitor_reports_for_the_same_record() {
     );
 }
 
-/// More delegates than the detail holds: the last row names the EXACT count that
-/// did not fit, computed off the rows that actually rendered.
+/// More delegates than the detail holds: every job is a row and the list
+/// scrolls, so no `+N more` row ever renders — blurred or descended.
 #[test]
-fn the_delegates_detail_marks_its_overflow_with_a_count() {
+fn the_delegates_detail_never_caps_the_list_with_a_more_row() {
+    use crate::tui::app::handle_key;
+    use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
     let now = crate::usage::now_ms();
     for i in 0..22 {
@@ -1553,29 +1586,25 @@ fn the_delegates_detail_marks_its_overflow_with_a_count() {
         .unwrap();
     }
     let app = app_with_delegates(jobs::list_banded(now));
+
     let (rows, _) = render(&app);
     let screen = rows.join("\n");
-
     assert!(
         screen.contains("acct0"),
-        "the newest delegate is the one kept:\n{screen}"
+        "the newest delegate is the first row:\n{screen}"
     );
     assert!(
-        !screen.contains("acct21"),
-        "the oldest is the one dropped:\n{screen}"
+        !screen.contains("more"),
+        "no `+N more` row when blurred:\n{screen}"
     );
-    let marker = rows
-        .iter()
-        .find(|r| r.contains(" more"))
-        .unwrap_or_else(|| panic!("no overflow marker:\n{screen}"));
-    let shown = rows.iter().filter(|r| r.contains("● running")).count();
+
+    let mut descended = app;
+    handle_key(&mut descended, crate::testutil::key(KeyCode::Enter));
+    let (rows, _) = render(&descended);
+    let screen = rows.join("\n");
     assert!(
-        shown < 22,
-        "fixture control: some rows did not fit:\n{screen}"
-    );
-    assert!(
-        marker.contains(&format!("+{} more", 22 - shown)),
-        "the marker names the exact hidden count:\n{screen}"
+        !screen.contains("more"),
+        "no `+N more` row when descended:\n{screen}"
     );
 }
 
@@ -1603,11 +1632,11 @@ fn a_delegate_cwd_renders_control_and_bidi_characters_escaped() {
     );
 }
 
-/// The pure `delegate_lines` contract: the overflow marker counts exactly, and
-/// the run's directory is what gives way (a middle `…`, then the whole of it)
-/// when the row runs out of width.
+/// The pure row/expansion contract: the run's directory is what gives way (a
+/// middle `…`, then the whole of it) on the one-line row, and the selected
+/// row's expansion carries the whole directory, wrapped instead of truncated.
 #[test]
-fn delegate_lines_pin_the_overflow_count_and_the_directory_exactly() {
+fn delegate_line_and_expansion_pin_the_directory_exactly() {
     use crate::mcp::jobs::JobPhase;
     use ratatui::text::Line;
     let line_text = |line: &Line| {
@@ -1618,30 +1647,6 @@ fn delegate_lines_pin_the_overflow_count_and_the_directory_exactly() {
     };
 
     let _home = crate::testutil::HomeSandbox::new();
-    let now = crate::usage::now_ms();
-    for i in 0..5 {
-        jobs::write_heartbeat(
-            &running_spec(
-                &format!("d-t-{i}"),
-                &format!("acct{i}"),
-                now - 10_000 - i as u64,
-                RecordKind::Collectable,
-            ),
-            now - 1_000 - i as u64,
-            "working",
-        )
-        .unwrap();
-    }
-    let stored = jobs::list_banded(now);
-    let cells = super::delegate_cells(&stored, now);
-
-    // 5 rows into a 3-row viewport: 2 shown, the marker names the other 3.
-    let lines = super::delegate_lines(&cells, 3, 100);
-    assert_eq!(
-        line_text(lines.last().expect("marker line")),
-        "+3 more",
-        "the marker names the exact hidden count"
-    );
 
     // One running row with a long directory: at full width it rides whole; at
     // a narrow width it gives way in the middle, keeping the tree and the
@@ -1653,36 +1658,750 @@ fn delegate_lines_pin_the_overflow_count_and_the_directory_exactly() {
         cwd: Some("/home/u/repos/rs/clauth".to_string()),
     };
     assert_eq!(
-        line_text(&super::delegate_line(&one, 4, 100)),
-        "● running   acct  elapsed 5s  /home/u/repos/rs/clauth",
+        line_text(&super::delegate_row_line(&one, 4, 100, false, false)),
+        "  ● running   acct  elapsed 5s  /home/u/repos/rs/clauth",
         "the directory rides whole when it fits",
     );
-    // 28 cells of row and a 2-cell gap before the directory: 45 leaves it 15,
-    // 42 leaves it exactly `CWD_MIN_W`, 41 one short of it.
+    // 30 cells of row (the reserved 2-cell gutter included) and a 2-cell gap
+    // before the directory: 45 leaves it 13, 44 leaves it exactly `CWD_MIN_W`,
+    // 43 one short of it.
     assert_eq!(
-        line_text(&super::delegate_line(&one, 4, 45)),
-        "● running   acct  elapsed 5s  /home/u…/clauth",
+        line_text(&super::delegate_row_line(&one, 4, 45, false, false)),
+        "  ● running   acct  elapsed 5s  /home/…clauth",
         "a narrow row keeps both ends of the directory",
     );
     assert_eq!(
-        line_text(&super::delegate_line(&one, 4, 42)),
-        "● running   acct  elapsed 5s  /home/…lauth",
+        line_text(&super::delegate_row_line(&one, 4, 44, false, false)),
+        "  ● running   acct  elapsed 5s  /home/…lauth",
         "the narrowest room a directory still renders in",
     );
     assert_eq!(
-        line_text(&super::delegate_line(&one, 4, 41)),
-        "● running   acct  elapsed 5s",
+        line_text(&super::delegate_row_line(&one, 4, 43, false, false)),
+        "  ● running   acct  elapsed 5s",
         "a row with no room for a readable directory drops it",
+    );
+
+    // The expansion carries the whole directory, wrapped at the width the row
+    // would have truncated it at, each line indented under the row.
+    let expanded = super::delegate_expansion_lines(&one, 45);
+    let expanded: Vec<String> = expanded.iter().map(line_text).collect();
+    assert_eq!(
+        expanded,
+        vec!["  elapsed 5s", "  /home/u/repos/rs/clauth"],
+        "the expansion keeps the fact and the whole directory, no `…`",
+    );
+    // A directory longer than the row width wraps onto indented continuation
+    // lines instead of truncating.
+    let long = super::DelegateCells {
+        state: JobPhase::Running,
+        profile: "acct".to_string(),
+        facts: vec!["elapsed 5s".to_string()],
+        cwd: Some("/home/u/a/very/long/run/directory/that/overflows/the/pane/width".to_string()),
+    };
+    let expanded: Vec<String> = super::delegate_expansion_lines(&long, 45)
+        .iter()
+        .map(line_text)
+        .collect();
+    assert!(
+        expanded
+            .iter()
+            .all(|l| l.chars().count() <= 45 && l.starts_with("  ")),
+        "every expansion line is indented and fits the pane: {expanded:?}"
+    );
+    let joined: String = expanded
+        .iter()
+        .map(|l| l.trim_start())
+        .collect::<Vec<_>>()
+        .join("");
+    assert_eq!(
+        joined, "elapsed 5s/home/u/a/very/long/run/directory/that/overflows/the/pane/width",
+        "the full directory survives, wrapped, never middle-truncated: {expanded:?}"
     );
 }
 
-/// A live row must survive the truncation that a burst of finished ones causes.
+/// The delegates detail's content rendered directly (no panel chrome), so the
+/// footnote and scrollbar geometry is readable row-by-row.
+fn render_delegates_detail(app: &App, w: u16, h: u16) -> Vec<String> {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw_delegates_detail(f, f.area(), app))
+        .unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+/// The detail pane's content of a rendered full-frame row (after the `││` seam),
+/// trimmed of the pane border and its 1-cell padding.
+fn detail_of(row: &str) -> &str {
+    row.split("││")
+        .nth(1)
+        .unwrap_or("")
+        .trim_matches('│')
+        .trim()
+}
+
+/// Seed `count` running jobs, newest first, returning their banded listing.
+fn seed_walk_jobs(count: usize) -> Vec<jobs::StoredJob> {
+    let now = crate::usage::now_ms();
+    for i in 0..count {
+        jobs::write_heartbeat(
+            &running_spec(
+                &format!("d-walk-{i:02}"),
+                &format!("acct{i:02}"),
+                now - 10_000 - i as u64,
+                RecordKind::Collectable,
+            ),
+            now - 1_000 - i as u64,
+            "working",
+        )
+        .unwrap();
+    }
+    jobs::list_banded(now)
+}
+
+// #B1: `↵` descends; walking ↓ visits every job in order and wraps; PageDown
+// reaches the last job and stops; each selected job is drawn on screen.
+#[test]
+fn walking_the_delegates_detail_visits_every_job_and_wraps() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let count = 22;
+    let mut app = app_with_delegates(seed_walk_jobs(count));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.services.focus,
+        ServicesFocus::Detail,
+        "↵ descends into the detail"
+    );
+
+    for i in 0..count {
+        assert_eq!(app.services.delegates_cursor, i, "cursor at job {i}");
+        let (rows, _) = render(&app);
+        let screen = rows.join("\n");
+        // The caret must sit on the job's own row in the DETAIL half — the
+        // selector pane's caret shares the physical row and must not satisfy it.
+        assert!(
+            rows.iter().any(|r| {
+                detail_of(r).contains('❯') && detail_of(r).contains(&format!("acct{i:02}"))
+            }),
+            "job {i} is drawn on screen after each step:\n{screen}"
+        );
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    assert_eq!(
+        app.services.delegates_cursor, 0,
+        "↓ past the last job wraps to the first"
+    );
+
+    // PageDown pages toward the end and stops there, however many presses.
+    for _ in 0..count {
+        render(&app);
+        handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    }
+    assert_eq!(
+        app.services.delegates_cursor,
+        count - 1,
+        "PageDown stops at the last job"
+    );
+    let (rows, _) = render(&app);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains('❯') && r.contains(&format!("acct{:02}", count - 1))),
+        "the last job is drawn on screen:\n{}",
+        rows.join("\n")
+    );
+}
+
+// #B2: at 45 columns the selected job's expansion shows its whole run
+// directory, pinned by equality on the expansion rows — the row drops the
+// directory (too narrow) and the expansion never middle-truncates it.
+#[test]
+fn the_selected_delegate_expansion_shows_the_whole_directory_at_45_columns() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let cwd = "/very/long/run/directory/here";
+    jobs::write_heartbeat(
+        &RunningSpec {
+            cwd: Some(cwd.to_string()),
+            spawned_by: Some("cld".to_string()),
+            idle_secs: None,
+            ..running_spec("d-exp-0", "acct", now - 5_000, RecordKind::Collectable)
+        },
+        now - 1_000,
+        "working",
+    )
+    .unwrap();
+    let mut app = app_with_delegates(jobs::list_banded(now));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail);
+
+    let rows = render_delegates_detail(&app, 45, 20);
+    let trimmed: Vec<&str> = rows.iter().map(|r| r.trim_end()).collect();
+    let screen = trimmed.join("\n");
+    assert!(
+        trimmed.contains(&"  /very/long/run/directory/here"),
+        "the whole directory pins by equality on its expansion row:\n{screen}"
+    );
+    assert!(
+        trimmed.contains(&"  spawned by cld"),
+        "the spawner pins by equality on its expansion row:\n{screen}"
+    );
+    assert!(
+        !screen.contains('…'),
+        "no ellipsis anywhere — the directory is never truncated:\n{screen}"
+    );
+}
+
+// #B4: the steer line sits on the pane's last interior row with a margin row
+// above it, descended and blurred; the scrollbar spans the scroll area only.
+#[test]
+fn the_delegates_steer_line_pins_with_a_margin_and_a_scoped_scrollbar() {
+    use crate::tui::app::handle_key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let jobs = seed_walk_jobs(22);
+    let blurred = app_with_delegates(jobs.clone());
+    let mut descended = app_with_delegates(jobs);
+    handle_key(&mut descended, crate::testutil::key(KeyCode::Enter));
+
+    for (label, app) in [("blurred", &blurred), ("descended", &descended)] {
+        let (rows, _) = render(app);
+        let screen = rows.join("\n");
+        let steer = rows
+            .iter()
+            .position(|r| detail_of(r).starts_with("manage delegates"))
+            .unwrap_or_else(|| panic!("[{label}] no steer line:\n{screen}"));
+        assert_eq!(
+            steer,
+            H as usize - 2,
+            "[{label}] the steer line pins on the last interior row:\n{screen}"
+        );
+        assert!(
+            detail_of(&rows[steer - 1]).is_empty(),
+            "[{label}] a blank margin row sits above the steer line:\n{screen}"
+        );
+        // The scrollbar's column is the detail pane's right-padding cell (x=W-2).
+        let track = |row_idx: usize| rows[row_idx].chars().nth(W as usize - 2).unwrap_or(' ');
+        assert!(
+            !matches!(track(steer - 1), '┊' | '┃') && !matches!(track(steer), '┊' | '┃'),
+            "[{label}] the margin and steer rows carry no scrollbar cell:\n{screen}"
+        );
+        assert!(
+            (0..steer - 1).any(|idx| matches!(track(idx), '┊' | '┃')),
+            "[{label}] the scroll area itself overflows and draws the track:\n{screen}"
+        );
+    }
+}
+
+// #B5: `esc` and `←` ascend; with zero jobs `↵` does not descend and the
+// footer advertises no `↵` for the row.
+#[test]
+fn delegates_ascend_and_zero_jobs_do_not_descend() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with_delegates(seed_walk_jobs(2));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(app.services.focus, ServicesFocus::List, "esc ascends");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Left));
+    assert_eq!(app.services.focus, ServicesFocus::List, "← ascends");
+
+    let mut empty = app_with_delegates(Vec::new());
+    handle_key(&mut empty, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        empty.services.focus,
+        ServicesFocus::List,
+        "↵ does not descend into a job-less detail"
+    );
+    let hints = super::super::footer::services_hints(&empty);
+    assert!(
+        !hints.iter().any(|(k, _)| *k == "↵"),
+        "the footer advertises no `↵` for a job-less delegates row: {hints:?}"
+    );
+}
+
+// #B6: a refresh that adds a newer job above the selected one keeps the same
+// job selected — the selection follows the job id, not its index.
+#[test]
+fn a_refresh_that_inserts_a_newer_job_keeps_the_same_job_selected() {
+    use crate::tui::app::ServicesFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    jobs::write_heartbeat(
+        &running_spec("d-b", "b", now - 20_000, RecordKind::Collectable),
+        now - 2_000,
+        "working",
+    )
+    .unwrap();
+    jobs::write_heartbeat(
+        &running_spec("d-a", "a", now - 10_000, RecordKind::Collectable),
+        now - 1_000,
+        "working",
+    )
+    .unwrap();
+    let mut app = app_with_delegates(jobs::list_banded(now));
+    app.services.focus = ServicesFocus::Detail;
+    // Select job `d-b` (the older one, index 1).
+    app.services.delegates_cursor = 1;
+    app.services.delegates_selected_id = Some("d-b".to_string());
+
+    // A refresh lands a newer job above it, driven through the production
+    // refresh path (which owns the settle call), not by calling the settle
+    // directly.
+    jobs::write_heartbeat(
+        &running_spec("d-c", "c", now - 5_000, RecordKind::Collectable),
+        now - 500,
+        "working",
+    )
+    .unwrap();
+    crate::tui::app::recompute_services_checks(
+        &mut app,
+        false,
+        crate::tui::app::ShuntRefresh::Keep,
+    );
+
+    assert_eq!(
+        app.services.delegates_cursor, 2,
+        "the selection follows `d-b` to its new index"
+    );
+    assert_eq!(
+        app.services.delegates_selected_id.as_deref(),
+        Some("d-b"),
+        "the tracked id is unchanged"
+    );
+}
+
+// #B7: no key while descended removes, cancels or stops a job — every bound
+// key leaves the job store untouched.
+#[test]
+fn no_key_while_descended_stops_or_removes_a_job() {
+    use crate::tui::app::handle_key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    for i in 0..5 {
+        jobs::write_heartbeat(
+            &running_spec(
+                &format!("d-stop-{i}"),
+                &format!("acct{i}"),
+                now - 10_000 - i as u64,
+                RecordKind::Collectable,
+            ),
+            now - 1_000 - i as u64,
+            "working",
+        )
+        .unwrap();
+    }
+    let snapshot: Vec<String> = jobs::list_banded(now)
+        .iter()
+        .map(|j| serde_json::to_string(&j.record).expect("record serializes"))
+        .collect();
+
+    let keys = [
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::PageUp,
+        KeyCode::PageDown,
+        KeyCode::Left,
+        KeyCode::Right,
+        KeyCode::Esc,
+        KeyCode::Enter,
+        KeyCode::Char(' '),
+        KeyCode::Char('f'),
+        KeyCode::Char('q'),
+        KeyCode::Char('a'),
+        KeyCode::Char('?'),
+        KeyCode::Char('x'),
+        KeyCode::Char('c'),
+        KeyCode::Char('d'),
+        KeyCode::Char('s'),
+        KeyCode::Delete,
+        KeyCode::Backspace,
+    ];
+    for code in keys {
+        let mut app = app_with_delegates(jobs::list_banded(now));
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        handle_key(&mut app, crate::testutil::key(code));
+        let after: Vec<String> = jobs::list_banded(now)
+            .iter()
+            .map(|j| serde_json::to_string(&j.record).expect("record serializes"))
+            .collect();
+        assert_eq!(
+            after, snapshot,
+            "key {code:?} changed the job store while descended"
+        );
+    }
+}
+
+// #F4: the expansion keeps every byte of the escaped directory — a name with a
+// run of spaces keeps them, since chunking is by display width, never on
+// whitespace.
+#[test]
+fn the_delegate_expansion_keeps_every_byte_of_the_directory() {
+    use crate::mcp::jobs::JobPhase;
+    let _home = crate::testutil::HomeSandbox::new();
+    let cells = super::DelegateCells {
+        state: JobPhase::Running,
+        profile: "acct".to_string(),
+        facts: vec!["elapsed 5s".to_string()],
+        cwd: Some("/home/u/My  Dir/x".to_string()),
+    };
+    let lines: Vec<String> = super::delegate_expansion_lines(&cells, 45)
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect();
+    assert_eq!(
+        lines,
+        vec!["  elapsed 5s", "  /home/u/My  Dir/x"],
+        "the directory's double space survives, never collapsed"
+    );
+}
+
+// #F5: every delegate row reserves the 2-cell caret gutter, so selecting a row
+// does not shift its columns — the state word opens at col 4 on every row.
+#[test]
+fn every_delegate_row_reserves_the_caret_gutter() {
+    use crate::tui::app::handle_key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_delegates(seed_walk_jobs(3));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let rows = render_delegates_detail(&app, 70, 20);
+    // Three job rows (the expansion lines carry no state word); every one
+    // reserves the gutter so `running` opens at col 4.
+    let job_rows: Vec<&String> = rows.iter().filter(|r| r.contains("running")).collect();
+    assert_eq!(
+        job_rows.len(),
+        3,
+        "three job rows render:\n{}",
+        rows.join("\n")
+    );
+    for (i, row) in job_rows.iter().enumerate() {
+        let byte = row.find("running").unwrap();
+        assert_eq!(
+            row[..byte].chars().count(),
+            4,
+            "the state word opens at col 4 (gutter + dot) on job row {i}:\n{}",
+            rows.join("\n")
+        );
+    }
+}
+
+// #F6: once descended and ascended, the blurred pane keeps the last-selected
+// job's tint and scroll offset; the caret and expansion drop, and the list is
+// not snapped to the top.
+#[test]
+fn the_blurred_delegates_detail_keeps_the_last_selected_tint_and_offset() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_delegates(seed_walk_jobs(22));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    for _ in 0..20 {
+        render(&app);
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    assert_eq!(app.services.delegates_cursor, 20);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(app.services.focus, ServicesFocus::List);
+
+    let (rows, buf) = render(&app);
+    let screen = rows.join("\n");
+    let row_idx = rows
+        .iter()
+        .position(|r| detail_of(r).contains("acct20"))
+        .unwrap_or_else(|| panic!("the held offset keeps job 20 on screen:\n{screen}"));
+    let full = &rows[row_idx];
+    assert!(
+        !detail_of(full).starts_with('❯'),
+        "the blurred pane drops the caret:\n{screen}"
+    );
+    let byte = full.find("acct20").expect("job 20's account renders");
+    let col = full[..byte].chars().count();
+    assert_eq!(
+        buf.content[row_idx * W as usize + col].bg,
+        super::theme::bg_hover(),
+        "the blurred pane keeps the last-selected tint:\n{screen}"
+    );
+}
+
+// #F8: a page press steps a page, not one row. From the top, one PageDown
+// lands on the job the S8 rule predicts from hand-computed row starts (17 with
+// the seed's 2-line expansion), and PageUp mirrors it back more than one row.
+#[test]
+fn a_page_press_steps_a_page_not_one_row() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_delegates(seed_walk_jobs(22));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail);
+    render(&app); // publish the cursor-0 geometry the page key reads
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(
+        app.services.delegates_cursor, 17,
+        "one PageDown from the top lands on the predicted job, not one row"
+    );
+    render(&app); // publish the cursor-17 geometry
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageUp));
+    assert!(
+        app.services.delegates_cursor < 16,
+        "one PageUp steps a page back, not one row (cursor={})",
+        app.services.delegates_cursor
+    );
+}
+
+// #F1: the descended footer derives from the count the handler steps over —
+// one job advertises no `↑↓`/page group, two or more advertise both.
+#[test]
+fn the_descended_delegates_footer_derives_from_the_selection_count() {
+    use crate::tui::app::ServicesFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    let hints = |app: &App| super::super::footer::services_hints(app);
+
+    let mut one = app_with_delegates(seed_walk_jobs(1));
+    one.services.focus = ServicesFocus::Detail;
+    assert_eq!(
+        hints(&one),
+        vec![("r", "refresh"), ("a", "actions"), ("?", "help")],
+        "a single job cannot move, so no ↑↓ or page group"
+    );
+
+    let mut many = app_with_delegates(seed_walk_jobs(22));
+    many.services.focus = ServicesFocus::Detail;
+    assert_eq!(
+        hints(&many),
+        vec![
+            ("↑↓", "row"),
+            ("page up/down", "read"),
+            ("r", "refresh"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "two or more jobs advertise the walking keys"
+    );
+}
+
+// #N1: on the inline short pane the selected row's caret stays visible on
+// every frame — when the last block plus the footnote do not fit, the block
+// wins and the footnote stays below the fold.
+#[test]
+fn the_selected_job_stays_visible_on_the_inline_short_pane() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    // 4 jobs with a 2-line expansion at a 3-row body: inline mode, the last
+    // block (3 lines) plus the steer (1) exceed the viewport.
+    let mut app = app_with_delegates(seed_walk_jobs(4));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail);
+    for _ in 0..4 {
+        let rows = render_delegates_detail(&app, 70, 3);
+        let screen = rows.join("\n");
+        assert!(
+            rows.iter().any(|r| r.starts_with('❯')),
+            "the selected job's caret stays on screen:\n{screen}"
+        );
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+}
+
+// #N1: the inline steer IS reached when the last block plus the footnote fit
+// in the viewport together (a 1-line expansion leaves room for the steer).
+#[test]
+fn the_inline_steer_is_reached_when_the_last_block_plus_it_fits() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    for i in 0..4 {
+        jobs::write_heartbeat(
+            &RunningSpec {
+                idle_secs: None,
+                ..running_spec(
+                    &format!("d-fit-{i}"),
+                    &format!("acct{i}"),
+                    now - 10_000 - i as u64,
+                    RecordKind::Collectable,
+                )
+            },
+            now - 1_000 - i as u64,
+            "working",
+        )
+        .unwrap();
+    }
+    let mut app = app_with_delegates(jobs::list_banded(now));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail);
+    let mut reached = false;
+    for _ in 0..4 {
+        let rows = render_delegates_detail(&app, 70, 3);
+        if rows.iter().any(|r| r.contains("manage delegates")) {
+            reached = true;
+        }
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    assert!(
+        reached,
+        "the inline steer is reached when the last block plus it fits"
+    );
+}
+
+// #N2: with zero jobs and a pinned footnote area the empty state renders its
+// rounded frame, and the bare fallback shows only where the framed box cannot
+// fit.
+#[test]
+fn the_empty_delegates_detail_keeps_its_frame_when_pinned() {
+    use crate::tui::app::handle_key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let steer = "manage delegates in clauth app on web or mobile (coming soon)";
+    let pad = |s: &str| format!("{s:<70}");
+    let boxed = |s: &str| format!("│{s:<68}│");
+    let top = format!("╭{}╮", "─".repeat(68));
+    let bottom = format!("╰{}╯", "─".repeat(68));
+    // 70x6: one steer row and one margin row leave a 4-row scroll area, the
+    // smallest that holds the framed box whole.
+    let framed_6 = vec![
+        top.clone(),
+        boxed("no delegates"),
+        boxed("r to refresh"),
+        bottom.clone(),
+        pad(""),
+        pad(steer),
+    ];
+    // 70x5: the scroll area is 3 rows, one short of the box, so the bare
+    // lines render and the action line `r to refresh` still shows.
+    let bare_5 = vec![
+        pad("no delegates"),
+        pad("r to refresh"),
+        pad(""),
+        pad(""),
+        pad(steer),
+    ];
+    let mut framed_12 = vec![top.clone(), boxed("no delegates"), boxed("r to refresh")];
+    framed_12.extend(std::iter::repeat_n(boxed(""), 6));
+    framed_12.extend([bottom.clone(), pad(""), pad(steer)]);
+    for (h, want) in [(6u16, framed_6), (5, bare_5), (12, framed_12)] {
+        let mut app = app_with_delegates(Vec::new());
+        handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(render_delegates_detail(&app, 70, h), want, "70x{h}");
+    }
+
+    // 100x24 keeps the frame too.
+    let mut app = app_with_delegates(Vec::new());
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let rows = render_delegates_detail(&app, 100, 24);
+    assert_eq!(
+        rows[0],
+        format!("╭{}╮", "─".repeat(98)),
+        "100x24 top border"
+    );
+    assert_eq!(
+        rows[21],
+        format!("╰{}╯", "─".repeat(98)),
+        "100x24 bottom border"
+    );
+    assert_eq!(rows[23], format!("{steer:<100}"), "100x24 steer row");
+
+    // The smallest height can't hold the 4-row box: the bare lines fall back,
+    // and the steer is still carried.
+    let mut app = app_with_delegates(Vec::new());
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let rows = render_delegates_detail(&app, 70, 3);
+    let screen = rows.join("\n");
+    assert!(
+        screen.contains("no delegates") && screen.contains("manage delegates"),
+        "the bare fallback carries the empty state and the steer:\n{screen}"
+    );
+}
+
+// #F3: the zero-jobs empty state also carries the steer line on a short pane
+// (inline mode), never dropping it.
+#[test]
+fn the_empty_delegates_detail_keeps_the_steer_on_a_short_pane() {
+    use crate::tui::app::handle_key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_delegates(Vec::new());
+    // No job, so `↵` does not descend; the detail renders the empty state.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let rows = render_delegates_detail(&app, 70, 3);
+    let screen = rows.join("\n");
+    assert!(
+        screen.contains("no delegates"),
+        "the empty state renders on the short pane:\n{screen}"
+    );
+    assert!(
+        screen.contains("manage delegates"),
+        "the steer line is still carried, never dropped:\n{screen}"
+    );
+}
+
+// #B2 (strengthened): the render fixture's directory is longer than the row
+// width, so the expansion must wrap it, pinned by equality.
+#[test]
+fn the_selected_delegate_expansion_wraps_a_directory_longer_than_the_row() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    let cwd = "/home/u/a/very/long/run/directory/that/overflows/the/pane/width";
+    jobs::write_heartbeat(
+        &RunningSpec {
+            cwd: Some(cwd.to_string()),
+            idle_secs: None,
+            ..running_spec("d-wrap-0", "acct", now - 5_000, RecordKind::Collectable)
+        },
+        now - 1_000,
+        "working",
+    )
+    .unwrap();
+    let mut app = app_with_delegates(jobs::list_banded(now));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail);
+    let rows = render_delegates_detail(&app, 45, 20);
+    let trimmed: Vec<&str> = rows.iter().map(|r| r.trim_end()).collect();
+    let screen = trimmed.join("\n");
+    // The expansion is the span between the selected (caret) row and the
+    // steer line, never selected by an indent prefix that an unselected row
+    // would also carry.
+    let caret = trimmed
+        .iter()
+        .position(|r| r.starts_with('❯'))
+        .expect("the selected row renders");
+    let steer = trimmed
+        .iter()
+        .position(|r| r.starts_with("manage delegates"))
+        .expect("the steer renders");
+    let joined: String = trimmed[caret + 1..steer]
+        .iter()
+        .filter(|r| !r.contains("elapsed"))
+        .map(|r| r.trim())
+        .collect::<Vec<_>>()
+        .join("");
+    assert_eq!(
+        joined, cwd,
+        "the wrapped lines reassemble the whole directory:\n{screen}"
+    );
+}
+
+/// A live row must band ahead of the finished burst that would crowd it out.
 ///
 /// `jobs::list` orders on the retention anchor, which for a `done` record is its
 /// FINISH — so every background job that landed a second ago outranks a blocking
-/// run that last spoke twenty seconds ago. On anchor order alone the row this
-/// detail exists for is the first one evicted, and the detail binds no key, so
-/// nothing reaches it afterwards.
+/// run that last spoke twenty seconds ago. On anchor order alone the live row
+/// sinks below the fold; the band keeps it first, where it stays visible.
 #[test]
 fn a_live_delegate_outranks_finished_ones_however_recently_they_landed() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -1729,13 +2448,14 @@ fn a_live_delegate_outranks_finished_ones_however_recently_they_landed() {
     let screen = rows.join("\n");
 
     assert!(
-        rows.iter().any(|r| r.contains("more")),
-        "fixture control: more delegates than the detail holds, so something is \
-         evicted:\n{screen}"
+        rows.iter().any(|r| r.contains('┊') || r.contains('┃')),
+        "fixture control: more delegates than the detail holds, so the list \
+         overflows:\n{screen}"
     );
     assert!(
         screen.contains("kerry") && screen.contains("fresh"),
-        "and it is never a live one — BOTH survive, whatever their anchors:\n{screen}"
+        "and it is never a live one — BOTH band first and stay on screen, \
+         whatever their anchors:\n{screen}"
     );
     assert!(
         rows.iter()

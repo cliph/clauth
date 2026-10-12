@@ -703,11 +703,16 @@ fn the_problem_cursor_clamps_when_a_fix_lands_under_focus() {
     );
 }
 
-/// ↵ never descends into the delegates detail (it binds no key).
+/// `↵` descends into the delegates detail only while it lists at least one
+/// job; a job-less detail has nothing to select, so `↵` stays on the list.
 #[test]
-fn enter_does_not_descend_into_the_delegates_detail() {
+fn enter_descends_into_the_delegates_detail_only_with_a_job() {
     use super::{KeyCode, handle_key};
+    use crate::mcp::jobs::{self, RecordKind, RunningSpec};
     let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+
+    // No jobs: `↵` does not descend.
     let mut app = bare_app();
     app.tab = super::Tab::Services;
     super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
@@ -717,7 +722,100 @@ fn enter_does_not_descend_into_the_delegates_detail() {
     assert_eq!(
         app.services.focus,
         super::ServicesFocus::List,
-        "↵ does not descend into the delegates detail"
+        "a job-less delegates detail does not descend"
+    );
+
+    // One job: `↵` descends.
+    jobs::write_heartbeat(
+        &RunningSpec {
+            job_id: "d-descend-0".to_string(),
+            profile: "acct".to_string(),
+            started_at: now - 5_000,
+            recorded_at: now - 5_000,
+            timeout_secs: 0,
+            endpoint: None,
+            provider: None,
+            isolated: false,
+            cwd: None,
+            spawned_by: None,
+            host_session: None,
+            host_pid: 0,
+            idle_secs: Some(300),
+            kind: RecordKind::Collectable,
+            owner_pid: 0,
+            owner_started_at: 0,
+        },
+        now - 1_000,
+        "working",
+    )
+    .unwrap();
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    app.services.cursor = 1;
+    app.services.focus = super::ServicesFocus::List;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.services.focus,
+        super::ServicesFocus::Detail,
+        "a delegates detail with a job descends"
+    );
+}
+
+/// A delegates detail that empties while descended ascends to the selector on
+/// the refresh that empties it, so focus and the footer cannot stay stuck.
+#[test]
+fn a_delegates_detail_that_empties_while_descended_ascends() {
+    use super::{KeyCode, handle_key};
+    use crate::mcp::jobs::{self, RecordKind, RunningSpec};
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    jobs::write_heartbeat(
+        &RunningSpec {
+            job_id: "d-empt-0".to_string(),
+            profile: "acct".to_string(),
+            started_at: now - 5_000,
+            recorded_at: now - 5_000,
+            timeout_secs: 0,
+            endpoint: None,
+            provider: None,
+            isolated: false,
+            cwd: None,
+            spawned_by: None,
+            host_session: None,
+            host_pid: 0,
+            idle_secs: Some(300),
+            kind: RecordKind::Collectable,
+            owner_pid: 0,
+            owner_started_at: 0,
+        },
+        now - 1_000,
+        "working",
+    )
+    .unwrap();
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    app.services.cursor = 1;
+    app.services.focus = super::ServicesFocus::List;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, super::ServicesFocus::Detail);
+
+    // The store reaps the job (its file is gone), so the next refresh empties
+    // the list while the detail is still descended.
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+        if entry.file_name().to_string_lossy().contains("d-empt-0") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    assert_eq!(
+        app.services.focus,
+        super::ServicesFocus::List,
+        "the refresh that empties the list ascends to the selector"
     );
 }
 

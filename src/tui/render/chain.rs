@@ -29,7 +29,7 @@ use super::global_config::default_reminder;
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED,
     DIAG_DISABLED, DIAG_KEY_REJECTED, DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT,
-    bold_when, cycle_row_lines, draw_scrolled_lines, draw_selector_list, head_cols,
+    bold_when, cycle_row_lines, draw_scrolled_lines_with_footnote, draw_selector_list, head_cols,
     help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail,
     name_color, pill, rail_hint_lines, section_box, section_box_verbatim, select_line, value_caret,
     wrap_words,
@@ -211,83 +211,84 @@ fn draw_chain_detail(
     let mut add_tips: Vec<usize> = Vec::new();
     let mut member_tips: Vec<usize> = Vec::new();
     let mut member_block_ends: Vec<usize> = Vec::new();
-    let (title, is_name, lines, spans): (String, bool, Vec<Line<'static>>, RowSpans) =
-        match selected {
-            Some(ChainItemKind::Member(i)) => {
-                let cfg = app.config();
-                let name = cfg.state.fallback_chain.get(i).cloned().unwrap_or_default();
-                let kick_lift = kick_lifts.get(name.as_str()).copied();
-                let day_picker = match edit {
-                    Some(CardEdit::Days(picker)) => Some(picker.cursor),
-                    _ => None,
-                };
-                let day_stop = app
-                    .fallback_day_stop
-                    .as_ref()
-                    .filter(|stop| stop.member == name)
-                    .map(|stop| stop.state.as_slice());
-                let (lines, spans) = member_detail(
-                    &cfg,
-                    &name,
-                    MemberCard {
-                        focused: detail_focused,
-                        row_cursor: app.fallback_detail_cursor,
-                        armed_remove: matches!(edit, Some(CardEdit::ArmedRemove)),
-                        editing: typed(FallbackRow::Threshold),
-                        max_spend_editing: typed(FallbackRow::MaxSpend),
-                        weekly_editing: typed(FallbackRow::WeeklyAt),
-                        day_picker,
-                        day_stop,
-                        width: inner_w,
-                        kick_lift,
-                        sessions: app.live_sessions.member(&name),
-                    },
-                    key_rejected,
-                );
-                // Publish each row's focused block end: the drawn span plus the
-                // hint the row gains when it becomes focused (V2).
-                if let Some(profile) = cfg.find(&name) {
-                    for (j, row) in FALLBACK_ROWS.iter().enumerate() {
-                        let tip_len = member_focused_tip_len(
-                            *row,
-                            profile,
-                            &cfg,
-                            &name,
-                            key_rejected,
-                            inner_w,
-                        );
-                        let selected = detail_focused && j == app.fallback_detail_cursor;
-                        member_tips.push(tip_len);
-                        member_block_ends.push(if selected {
-                            spans[j].end
-                        } else {
-                            spans[j].end + tip_len
-                        });
-                    }
+    let (title, is_name, lines, spans, footnote): (
+        String,
+        bool,
+        Vec<Line<'static>>,
+        RowSpans,
+        Option<String>,
+    ) = match selected {
+        Some(ChainItemKind::Member(i)) => {
+            let cfg = app.config();
+            let name = cfg.state.fallback_chain.get(i).cloned().unwrap_or_default();
+            let kick_lift = kick_lifts.get(name.as_str()).copied();
+            let day_picker = match edit {
+                Some(CardEdit::Days(picker)) => Some(picker.cursor),
+                _ => None,
+            };
+            let day_stop = app
+                .fallback_day_stop
+                .as_ref()
+                .filter(|stop| stop.member == name)
+                .map(|stop| stop.state.as_slice());
+            let (lines, spans, footnote) = member_detail(
+                &cfg,
+                &name,
+                MemberCard {
+                    focused: detail_focused,
+                    row_cursor: app.fallback_detail_cursor,
+                    armed_remove: matches!(edit, Some(CardEdit::ArmedRemove)),
+                    editing: typed(FallbackRow::Threshold),
+                    max_spend_editing: typed(FallbackRow::MaxSpend),
+                    weekly_editing: typed(FallbackRow::WeeklyAt),
+                    day_picker,
+                    day_stop,
+                    width: inner_w,
+                    kick_lift,
+                    sessions: app.live_sessions.member(&name),
+                },
+                key_rejected,
+            );
+            // Publish each row's focused block end: the drawn span plus the
+            // hint the row gains when it becomes focused (V2).
+            if let Some(profile) = cfg.find(&name) {
+                for (j, row) in FALLBACK_ROWS.iter().enumerate() {
+                    let tip_len =
+                        member_focused_tip_len(*row, profile, &cfg, &name, key_rejected, inner_w);
+                    let selected = detail_focused && j == app.fallback_detail_cursor;
+                    member_tips.push(tip_len);
+                    member_block_ends.push(if selected {
+                        spans[j].end
+                    } else {
+                        spans[j].end + tip_len
+                    });
                 }
-                (name.to_string(), true, lines, spans)
             }
-            Some(ChainItemKind::Add) => {
-                let d = add_detail(app, detail_focused, inner_w, key_rejected);
-                add_focus = d.focus;
-                add_starts = d.starts;
-                add_block_ends = d.block_ends;
-                add_tips = d.tips;
-                let lines = d.lines;
-                (
-                    "add to chain".to_string(),
-                    false,
-                    lines,
-                    std::array::from_fn(|_| 0..0),
-                )
-            }
-            None => (
-                "chain".to_string(),
+            (name.to_string(), true, lines, spans, footnote)
+        }
+        Some(ChainItemKind::Add) => {
+            let d = add_detail(app, detail_focused, inner_w, key_rejected);
+            add_focus = d.focus;
+            add_starts = d.starts;
+            add_block_ends = d.block_ends;
+            add_tips = d.tips;
+            let lines = d.lines;
+            (
+                "add to chain".to_string(),
                 false,
-                empty_detail(),
+                lines,
                 std::array::from_fn(|_| 0..0),
-            ),
-        };
+                None,
+            )
+        }
+        None => (
+            "chain".to_string(),
+            false,
+            empty_detail(),
+            std::array::from_fn(|_| 0..0),
+            None,
+        ),
+    };
 
     let block = if is_name {
         section_box_verbatim(&title, detail_focused, false)
@@ -333,8 +334,6 @@ fn draw_chain_detail(
         Some(ChainItemKind::Add) => add_focus,
         Some(ChainItemKind::Member(_)) | None => (0, 0),
     };
-    app.fallback_detail_viewport.set(inner.height as usize);
-    app.fallback_detail_total.set(lines.len());
     app.fallback_detail_row_starts.replace(match selected {
         Some(ChainItemKind::Member(_)) => spans.iter().map(|r| r.start).collect(),
         Some(ChainItemKind::Add) => add_starts,
@@ -350,13 +349,17 @@ fn draw_chain_detail(
         Some(ChainItemKind::Add) => add_tips,
         None => Vec::new(),
     });
-    let scroll = draw_scrolled_lines(
+    let draw = draw_scrolled_lines_with_footnote(
         frame,
         inner,
         lines,
         focus,
         Some(&app.fallback_detail_offset),
+        footnote.as_deref(),
     );
+    let scroll = draw.offset;
+    app.fallback_detail_viewport.set(draw.viewport);
+    app.fallback_detail_total.set(draw.total);
 
     // Position the native terminal cursor for whichever field is being typed,
     // matching the post-draw cursor path the other edit screens use. This is not
@@ -747,7 +750,7 @@ fn member_detail(
     name: &crate::profile::ProfileName,
     card: MemberCard<'_>,
     key_rejected: &HashSet<crate::profile::ProfileName>,
-) -> (Vec<Line<'static>>, RowSpans) {
+) -> (Vec<Line<'static>>, RowSpans, Option<String>) {
     let MemberCard {
         focused,
         row_cursor,
@@ -768,6 +771,7 @@ fn member_detail(
                 theme::danger(),
             ))],
             std::array::from_fn(|_| 0..0),
+            None,
         );
     };
 
@@ -997,18 +1001,16 @@ fn member_detail(
     // All-exhausted sibling of the Overview projection line: when EVERY chain
     // member is currently maxed, name whichever one resumes first instead of
     // leaving the recovery implicit (issue #10 follow-up). Chain-wide, so it
-    // renders under whichever member happens to be selected.
-    if let Some((resume_name, eta)) = soonest_resume(cfg, key_rejected) {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!(
-                "resumes: {resume_name} {}",
-                reset_resume(eta, ResetFmt::from_state(&cfg.state))
-            ),
-            theme::faint(),
-        )));
-    }
-    (lines, spans)
+    // renders under whichever member happens to be selected — pinned as a
+    // footnote below the scroll content rather than scrolled with it (on a pane
+    // too short to pin, the helper inlines it as the content's last line).
+    let footnote = soonest_resume(cfg, key_rejected).map(|(resume_name, eta)| {
+        format!(
+            "resumes: {resume_name} {}",
+            reset_resume(eta, ResetFmt::from_state(&cfg.state))
+        )
+    });
+    (lines, spans, footnote)
 }
 
 /// Hint under the `last resort` toggle — phrased for the state flipping it

@@ -379,23 +379,30 @@ pub(super) fn picker_row(
     select_line(line, selected, focused, width)
 }
 
-/// Empty-state widget: rounded frame in `LINE`, hint on first line `TEXT_DIM`,
-/// hotkey `ACCENT` + action on second line.
-pub(super) fn empty_state(hint: &str, hotkey: &str, action: &str) -> Paragraph<'static> {
-    Paragraph::new(vec![
+/// The empty state's two text lines (dim hint, hotkey-accented action), shared
+/// by the bordered [`empty_state`] widget and a caller that renders them bare
+/// so a pinned footnote composes with them.
+pub(super) fn empty_state_lines(hint: &str, hotkey: &str, action: &str) -> Vec<Line<'static>> {
+    vec![
         Line::from(Span::styled(hint.to_string(), theme::dim())),
         Line::from(prose::spans(
             &format!("{} {action}", prose::key(hotkey)),
             theme::dim(),
         )),
-    ])
-    .block(
-        Block::bordered()
-            .border_set(border::ROUNDED)
-            .border_style(Style::default().fg(theme::line_color())),
-    )
-    .style(theme::base())
-    .wrap(Wrap { trim: false })
+    ]
+}
+
+/// Empty-state widget: rounded frame in `LINE`, hint on first line `TEXT_DIM`,
+/// hotkey `ACCENT` + action on second line.
+pub(super) fn empty_state(hint: &str, hotkey: &str, action: &str) -> Paragraph<'static> {
+    Paragraph::new(empty_state_lines(hint, hotkey, action))
+        .block(
+            Block::bordered()
+                .border_set(border::ROUNDED)
+                .border_style(Style::default().fg(theme::line_color())),
+        )
+        .style(theme::base())
+        .wrap(Wrap { trim: false })
 }
 
 /// Renders a scrollbar into the 1-cell right-padding column of a panel.
@@ -477,6 +484,153 @@ pub(super) fn draw_scrolled_lines(
     );
     draw_scrollbar(frame, inner, total, offset, viewport);
     offset
+}
+
+/// The footnote's wrapped lines: raw text cut to the content width, each line
+/// `TEXT_FAINT`.
+pub(super) fn footnote_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    wrap_words(text, width)
+        .into_iter()
+        .map(|seg| Line::from(Span::styled(seg, theme::faint())))
+        .collect()
+}
+
+/// How a pinned footnote splits the pane interior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FootnoteLayout {
+    /// No footnote: the scroll area is the whole interior.
+    Absent,
+    /// Footnote pinned below the scroll area with `margin` blank rows above it.
+    Pinned { scroll: usize, margin: usize },
+    /// Interior too short to pin: the footnote renders as the scroll content's
+    /// last line instead.
+    Inline,
+}
+
+/// The split a pinned footnote produces for an `inner_h`-row interior and a
+/// `footnote_h`-line footnote: pinned with a margin while the scroll area keeps
+/// 3 rows, margin dropped next, inlined past that. `footnote_h == 0` is absent.
+pub(super) fn footnote_layout(inner_h: usize, footnote_h: usize) -> FootnoteLayout {
+    if footnote_h == 0 {
+        FootnoteLayout::Absent
+    } else if inner_h >= footnote_h + 1 + 3 {
+        FootnoteLayout::Pinned {
+            scroll: inner_h - footnote_h - 1,
+            margin: 1,
+        }
+    } else if inner_h >= footnote_h + 3 {
+        FootnoteLayout::Pinned {
+            scroll: inner_h - footnote_h,
+            margin: 0,
+        }
+    } else {
+        FootnoteLayout::Inline
+    }
+}
+
+/// Split `inner` for a `foot_h`-line footnote: the scroll area and the footnote
+/// area (absent when the footnote is inlined into the content or missing). The
+/// one place the pinned geometry lives — the scrolled-footnote helper and a
+/// bare empty state both read it.
+pub(super) fn footnote_split(inner: Rect, foot_h: usize) -> (Rect, Option<Rect>) {
+    match footnote_layout(inner.height as usize, foot_h) {
+        FootnoteLayout::Pinned { scroll, margin } => {
+            let scroll_area = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: scroll as u16,
+            };
+            let foot_area = Rect {
+                x: inner.x,
+                y: inner.y + scroll as u16 + margin as u16,
+                width: inner.width,
+                height: foot_h as u16,
+            };
+            (scroll_area, Some(foot_area))
+        }
+        FootnoteLayout::Absent | FootnoteLayout::Inline => (inner, None),
+    }
+}
+
+/// What a [`draw_scrolled_lines_with_footnote`] frame drew: the applied offset,
+/// the scroll viewport (a pinned footnote shrinks it) and the total line count
+/// (an inline footnote is part of the scroll content, so it counts).
+pub(super) struct ScrolledDraw {
+    pub(crate) offset: usize,
+    pub(crate) viewport: usize,
+    pub(crate) total: usize,
+}
+
+/// A pane note pinned under a scrolled form (cloudy-tui "Pinned footnote"):
+/// one blank margin row above the wrapped note, the scroll area shrunk by the
+/// footnote's height plus that margin, the overflow scrollbar spanning the
+/// scroll area only. `footnote` is the raw one-fragment text; it wraps at the
+/// content width, renders `TEXT_FAINT`, never scrolls, never takes focus and
+/// never carries a key. `None` leaves the scroll area at the full height.
+///
+/// Short pane: when the scroll area would fall under 3 rows the margin drops
+/// first, and past that the footnote renders as the scroll content's last line
+/// instead of pinning — there the focused block's follow carries it, so walking
+/// to the last row still reaches it.
+pub(super) fn draw_scrolled_lines_with_footnote(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    lines: Vec<Line<'static>>,
+    focus: (usize, usize),
+    saved: Option<&Cell<usize>>,
+    footnote: Option<&str>,
+) -> ScrolledDraw {
+    let foot: Vec<Line<'static>> = footnote
+        .map(|text| footnote_lines(text, inner.width as usize))
+        .unwrap_or_default();
+    match footnote_layout(inner.height as usize, foot.len()) {
+        FootnoteLayout::Absent => {
+            let total = lines.len();
+            let offset = draw_scrolled_lines(frame, inner, lines, focus, saved);
+            ScrolledDraw {
+                offset,
+                viewport: inner.height as usize,
+                total,
+            }
+        }
+        FootnoteLayout::Inline => {
+            let pre = lines.len();
+            let mut lines = lines;
+            lines.extend(foot);
+            let viewport = inner.height as usize;
+            // When the focused block ends at the old last line AND the block
+            // plus the footnote fit in the viewport together, extend the block
+            // over the footnote so the follow reaches it; otherwise the block
+            // wins — the cursor stays visible and the footnote stays below the
+            // fold at that pane height.
+            let focus = if focus.1 == pre && lines.len() - focus.0 <= viewport {
+                (focus.0, lines.len())
+            } else {
+                focus
+            };
+            let total = lines.len();
+            let offset = draw_scrolled_lines(frame, inner, lines, focus, saved);
+            ScrolledDraw {
+                offset,
+                viewport,
+                total,
+            }
+        }
+        FootnoteLayout::Pinned { .. } => {
+            let total = lines.len();
+            let (scroll_area, foot_area) = footnote_split(inner, foot.len());
+            let offset = draw_scrolled_lines(frame, scroll_area, lines, focus, saved);
+            if let Some(area) = foot_area {
+                frame.render_widget(Paragraph::new(foot).style(theme::base()), area);
+            }
+            ScrolledDraw {
+                offset,
+                viewport: scroll_area.height as usize,
+                total,
+            }
+        }
+    }
 }
 
 /// Smallest offset that keeps the focused block (`focus.0` inclusive, `focus.1`
@@ -635,6 +789,34 @@ pub(super) fn rail_hint_lines(text: &str, width: usize, more_follow: bool) -> Ve
         .collect()
 }
 
+/// Chunk `text` into `width`-cell runs, splitting between graphemes by their
+/// display width and never on whitespace: every byte lands in exactly one
+/// chunk. A path whose name holds spaces keeps them.
+pub(super) fn chunk_graphemes(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut chunk = String::new();
+    let mut chunk_w = 0;
+    for grapheme in Span::raw(text).styled_graphemes(Style::default()) {
+        let grapheme_w = Span::raw(grapheme.symbol).width();
+        if !chunk.is_empty() && chunk_w + grapheme_w > width {
+            lines.push(std::mem::take(&mut chunk));
+            chunk_w = 0;
+        }
+        chunk.push_str(grapheme.symbol);
+        chunk_w += grapheme_w;
+    }
+    if !chunk.is_empty() {
+        lines.push(chunk);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 /// Greedy word-wrap to `width` cells, measured the way the buffer renders: by
 /// grapheme, a wide one taking two; long words are hard-split between
 /// graphemes.
@@ -651,19 +833,11 @@ pub(super) fn wrap_words(text: &str, width: usize) -> Vec<String> {
             if !line.is_empty() {
                 lines.push(std::mem::take(&mut line));
             }
-            let mut chunk = String::new();
-            let mut chunk_w = 0;
-            for grapheme in Span::raw(word).styled_graphemes(Style::default()) {
-                let grapheme_w = Span::raw(grapheme.symbol).width();
-                if !chunk.is_empty() && chunk_w + grapheme_w > width {
-                    lines.push(std::mem::take(&mut chunk));
-                    chunk_w = 0;
-                }
-                chunk.push_str(grapheme.symbol);
-                chunk_w += grapheme_w;
-            }
-            line = chunk;
-            line_w = chunk_w;
+            let mut chunks = chunk_graphemes(word, width);
+            let last = chunks.pop().unwrap_or_default();
+            lines.extend(chunks);
+            line = last;
+            line_w = Span::raw(&line).width();
             continue;
         }
         let extra = usize::from(!line.is_empty());

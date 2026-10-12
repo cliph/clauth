@@ -433,9 +433,13 @@ pub(crate) fn serve(
     // Record the env this daemon inherited, once it is definitively the holder,
     // so the store move resolves the standalone's codex home and store defaults
     // the way the gateway it spawns will. Best-effort: a daemon that cannot
-    // write it still runs, and the move refuses until this daemon restarts.
+    // write it still runs, and the reads of it refuse until a later
+    // gateway round records it.
     if let Err(e) = crate::gateway::write_daemon_env() {
-        logline!("clauth daemon: {e:#}; the store move refuses until this daemon restarts");
+        logline!(
+            "clauth daemon: {e:#}{}",
+            crate::gateway::ENV_RECORD_FAULT_TAIL
+        );
     }
 
     log_rotate::warn_if_log_cap_defeated();

@@ -6923,6 +6923,83 @@ fn renaming_a_profile_moves_its_token_to_the_new_name() {
     assert_eq!(stored_tokens(), format!("[tokens]\nnew = \"{token}\"\n"));
 }
 
+/// A profile that gains a client token between the delete's plan (which read
+/// none) and its hold refuses, asking for a rerun, so no token outlives its
+/// profile; the rerun plans the token and revokes it.
+#[test]
+fn a_delete_whose_profile_gained_a_token_after_its_plan_refuses() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = adopt_gateway(&home, "[server]\n", "");
+    let mut config = blank_profiles(&["keep", "late"]);
+    let keep = crate::gateway_tokens::add_client_token(&record, "keep")
+        .expect("add")
+        .expose()
+        .to_string();
+    let other = record.clone();
+    let late = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let minted = std::sync::Arc::clone(&late);
+    crate::gateway_tokens::set_pre_hold_hook(
+        "late",
+        std::sync::Arc::new(move || {
+            let token = crate::gateway_tokens::add_client_token(&other, "late")
+                .expect("another process adds a token");
+            *minted.lock().expect("lock") = token.expose().to_string();
+        }),
+    );
+    assert_eq!(
+        delete(&mut config, "late"),
+        Err("cannot delete profile \"late\": the profile gained a client token while the delete was being prepared; run the delete again".to_string())
+    );
+    let late = late.lock().expect("lock").clone();
+    assert_eq!(
+        stored_tokens(),
+        format!("[tokens]\nkeep = \"{keep}\"\nlate = \"{late}\"\n")
+    );
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("late"))
+            .is_some(),
+        "the refused delete removed nothing"
+    );
+    assert_eq!(delete(&mut config, "late"), Ok(()));
+    assert_eq!(stored_tokens(), format!("[tokens]\nkeep = \"{keep}\"\n"));
+}
+
+/// A profile that gains a client token between the rename's plan (which read
+/// none, so never checked the new name against the gateway's clients) and its
+/// hold refuses, asking for a rerun; nothing moves.
+#[test]
+fn a_rename_whose_profile_gained_a_token_after_its_plan_refuses() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = adopt_gateway(&home, "[server]\n", "");
+    let mut config = blank_profiles(&["old"]);
+    let other = record.clone();
+    let late = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let minted = std::sync::Arc::clone(&late);
+    crate::gateway_tokens::set_pre_hold_hook(
+        "old",
+        std::sync::Arc::new(move || {
+            let token = crate::gateway_tokens::add_client_token(&other, "old")
+                .expect("another process adds a token");
+            *minted.lock().expect("lock") = token.expose().to_string();
+        }),
+    );
+    assert_eq!(
+        rename(&mut config, "old", "new"),
+        Err("cannot rename profile \"old\" to \"new\": the profile gained a client token while the rename was being prepared; run the rename again".to_string())
+    );
+    let late = late.lock().expect("lock").clone();
+    assert_eq!(stored_tokens(), format!("[tokens]\nold = \"{late}\"\n"));
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("old"))
+            .is_some(),
+        "the refused rename moved nothing"
+    );
+}
+
 fn delete(config: &mut AppConfig, name: &str) -> std::result::Result<(), String> {
     delete_profile(
         config,
@@ -6986,7 +7063,7 @@ fn deleting_the_last_token_reads_the_gateway_and_refuses_only_what_it_cannot_tel
         )
     };
     let unrecorded = unread(
-        "the running daemon recorded no environment, so clauth cannot read the client tokens the gateway inherits; restart the daemon, then try again",
+        "the running daemon recorded no environment, so clauth cannot read the client tokens the gateway inherits; try again in a moment, and restart the daemon if it persists",
     );
     let mut got = Vec::new();
     let mut want = Vec::new();
@@ -7137,7 +7214,7 @@ fn a_rename_refuses_a_held_name_and_a_gateway_it_cannot_read() {
     .expect("pid file");
     assert_eq!(
         rename(&mut config, "old", "fresh"),
-        Err("cannot rename profile \"old\" to \"fresh\": clauth cannot tell whether the new name clashes with a client the gateway already names (the running daemon recorded no environment, so clauth cannot read the client tokens the gateway inherits; restart the daemon, then try again); fix that, then try again".to_string())
+        Err("cannot rename profile \"old\" to \"fresh\": clauth cannot tell whether the new name clashes with a client the gateway already names (the running daemon recorded no environment, so clauth cannot read the client tokens the gateway inherits; try again in a moment, and restart the daemon if it persists); fix that, then try again".to_string())
     );
     assert!(
         config

@@ -31,7 +31,7 @@ use crate::gateway::{
     ClientAuth, GatewayRecord, SecretToken, adopted_guard_client_auth, client_auth,
     guard_client_auth, mint_token,
 };
-use crate::gateway_edit::{Applied, Edit, apply_edit};
+use crate::gateway_edit::{Applied, Edit, REQUIRE_CLIENT_TOKENS_OP, apply_edit};
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::profile::{atomic_write_600, clauth_dir};
 
@@ -409,7 +409,7 @@ pub(crate) fn remove_client_token(record: &GatewayRecord, profile: &str) -> Resu
         None
     };
     #[cfg(test)]
-    run_pre_removal_hold_hook(profile);
+    run_pre_hold_hook(profile);
     ClientTokens::update(|tokens| {
         if !tokens.contains_key(profile) {
             return Ok(false);
@@ -431,19 +431,19 @@ pub(crate) fn remove_client_token(record: &GatewayRecord, profile: &str) -> Resu
     })
 }
 
-/// A test's stand-in for another process changing the store between a
-/// removal's read and its hold, run once for the profile it names.
+/// A test's stand-in for another process changing the store between a token
+/// op's read (a removal's, a profile delete's or rename's plan) and its hold,
+/// run once for the profile it names.
 #[cfg(test)]
-pub(crate) type PreRemovalHoldHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+pub(crate) type PreHoldHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
-static PRE_REMOVAL_HOLD_HOOK: std::sync::Mutex<
-    Option<std::collections::HashMap<String, PreRemovalHoldHook>>,
-> = std::sync::Mutex::new(None);
+static PRE_HOLD_HOOK: std::sync::Mutex<Option<std::collections::HashMap<String, PreHoldHook>>> =
+    std::sync::Mutex::new(None);
 
 #[cfg(test)]
-pub(crate) fn set_pre_removal_hold_hook(profile: &str, f: PreRemovalHoldHook) {
-    if let Ok(mut hooks) = PRE_REMOVAL_HOLD_HOOK.lock() {
+pub(crate) fn set_pre_hold_hook(profile: &str, f: PreHoldHook) {
+    if let Ok(mut hooks) = PRE_HOLD_HOOK.lock() {
         hooks
             .get_or_insert_with(std::collections::HashMap::new)
             .insert(profile.to_string(), f);
@@ -451,8 +451,8 @@ pub(crate) fn set_pre_removal_hold_hook(profile: &str, f: PreRemovalHoldHook) {
 }
 
 #[cfg(test)]
-fn run_pre_removal_hold_hook(profile: &str) {
-    let hook = PRE_REMOVAL_HOLD_HOOK
+pub(crate) fn run_pre_hold_hook(profile: &str) {
+    let hook = PRE_HOLD_HOOK
         .lock()
         .ok()
         .and_then(|mut hooks| hooks.as_mut().and_then(|hooks| hooks.remove(profile)));
@@ -523,18 +523,22 @@ pub(crate) fn refuse_profile_rename(old: &str, new: &str) -> Result<bool> {
 /// `profile`'s token is the store's last and the plan guards it, so a refused
 /// delete is a clean no-op. A token that became the last after a plan that
 /// read nothing refuses, asking for a rerun, rather than read the gateway
-/// under the flock.
+/// under the flock, and so does a token the profile gained after a plan that
+/// found none, which the delete would otherwise leave behind.
 pub(crate) fn refuse_profile_delete(
     plan: Option<&ProfileTokenPlan>,
     profile: &str,
     _held: &StateLockHeld,
 ) -> Result<()> {
-    let Some(plan) = plan else {
-        return Ok(());
-    };
     let op = format!("cannot delete profile {profile:?}");
     let tokens = load_for(&op)?;
-    if !tokens.holds(profile) || tokens.tokens.len() != 1 {
+    if !tokens.holds(profile) {
+        return Ok(());
+    }
+    let Some(plan) = plan else {
+        return Err(ClientTokenRefusal::Gained { op, what: "delete" }.into());
+    };
+    if tokens.tokens.len() != 1 {
         return Ok(());
     }
     if !plan.read {
@@ -572,8 +576,9 @@ pub(crate) fn rename_profile_token(
         // A token that appeared after a plan that read nothing was never
         // checked against the clients the gateway already names.
         if !planned {
-            return Err(ClientTokenRefusal::RenameRaced {
+            return Err(ClientTokenRefusal::Gained {
                 op: format!("cannot rename profile {old:?} to {new:?}"),
+                what: "rename",
             }
             .into());
         }
@@ -598,7 +603,7 @@ pub(crate) fn rename_profile_token(
 /// exists, since shunt refuses a `[server.auth]` with none; a config that
 /// already has the table writes nothing.
 pub(crate) fn require_client_tokens(record: &GatewayRecord) -> Result<Applied> {
-    let op = "cannot require client tokens";
+    let op = REQUIRE_CLIENT_TOKENS_OP;
     let auth = client_auth(record).map_err(|e| for_op(op, e))?;
     if !auth.in_config && load_for(op)?.is_empty() {
         match &auth.unmanaged {
@@ -660,8 +665,9 @@ pub(crate) enum ClientTokenRefusal {
     Raced { op: String, what: &'static str },
     /// The store already holds a token under `name`.
     NameHeld { op: String, name: String },
-    /// The renamed profile gained a token after the rename planned.
-    RenameRaced { op: String },
+    /// The profile gained a token after the op (`what`, a delete or a
+    /// rename) planned with none.
+    Gained { op: String, what: &'static str },
     /// The require op, with no token in the store or the env file.
     NoToken,
     /// The remove of the last token while the gateway requires one.
@@ -725,16 +731,17 @@ impl std::fmt::Display for ClientTokenRefusal {
                 f,
                 "{op}: its client token became the gateway's last while the {what} was being prepared; run the {what} again"
             ),
-            Self::RenameRaced { op } => write!(
+            Self::Gained { op, what } => write!(
                 f,
-                "{op}: the profile gained a client token while the rename was being prepared; run the rename again"
+                "{op}: the profile gained a client token while the {what} was being prepared; run the {what} again"
             ),
             Self::NameHeld { op, name } => write!(
                 f,
                 "{op}: clauth's client-token store already holds a token for {name:?}; remove that token first"
             ),
-            Self::NoToken => f.write_str(
-                "cannot require client tokens: no client token exists yet; add one first",
+            Self::NoToken => write!(
+                f,
+                "{REQUIRE_CLIENT_TOKENS_OP}: no client token exists yet; add one first"
             ),
             Self::LastToken => f.write_str(
                 "cannot remove the last client token while the gateway requires tokens; add another token or remove [server.auth] from the config first",

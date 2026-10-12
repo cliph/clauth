@@ -763,7 +763,7 @@ impl<'a> ConfigDirSandbox<'a> {
 /// [`HomeSandbox`] that holds it; dropping the home first is E0505 at compile
 /// time instead of a race nothing checks.
 pub(crate) struct EnvPin<'a> {
-    prevs: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    prevs: Vec<(String, Option<std::ffi::OsString>)>,
     _home: std::marker::PhantomData<&'a HomeSandbox>,
 }
 
@@ -772,10 +772,7 @@ impl<'a> EnvPin<'a> {
         unsafe_code,
         reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
     )]
-    pub(crate) fn new(
-        _home: &'a HomeSandbox,
-        pins: &[(&'static str, Option<&std::ffi::OsStr>)],
-    ) -> Self {
+    pub(crate) fn new(_home: &'a HomeSandbox, pins: &[(&str, Option<&std::ffi::OsStr>)]) -> Self {
         let mut prevs = Vec::with_capacity(pins.len());
         for &(key, value) in pins {
             let prev = std::env::var_os(key);
@@ -786,7 +783,7 @@ impl<'a> EnvPin<'a> {
                     None => std::env::remove_var(key),
                 }
             }
-            prevs.push((key, prev));
+            prevs.push((key.to_string(), prev));
         }
         Self {
             prevs,
@@ -2197,24 +2194,25 @@ pub(crate) fn herdr_pane_env<'a>(
     )
 }
 
-/// Unset every `SHUNT_*` variable the gateway's client-token reads take
-/// from this process's env: shunt's default tokens variable and the env-layer
-/// `[server.auth]` keys, in both spellings a shell is likely to export, so a
-/// shell exporting one changes no result. Borrows the sandbox: the env is a
-/// process-global serialized by `HOME_TEST_LOCK`, which the sandbox holds.
+/// Unset every `SHUNT_*` variable the gateway's client-token and bind reads
+/// take from this process's env: shunt's default tokens variable, the bind
+/// override and every env-layer `[server.auth]` key this process holds, in
+/// whatever case it was exported, so a shell exporting one changes no result. Borrows the sandbox:
+/// the env is a process-global serialized by `HOME_TEST_LOCK`, which the
+/// sandbox holds.
 pub(crate) fn no_shunt_env(home: &HomeSandbox) -> EnvPin<'_> {
-    EnvPin::new(
-        home,
-        &[
-            ("SHUNT_CLIENT_TOKENS", None),
-            ("SHUNT_SERVER__AUTH__HEADER", None),
-            ("SHUNT_SERVER__AUTH__TOKENS_ENV", None),
-            ("SHUNT_SERVER__AUTH__JWT", None),
-            ("shunt_server__auth__header", None),
-            ("shunt_server__auth__tokens_env", None),
-            ("shunt_server__auth__jwt", None),
-        ],
-    )
+    let auth_keys: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| {
+            crate::gateway::is_auth_env_key(name)
+                || name.eq_ignore_ascii_case(crate::gateway::BIND_ENV)
+        })
+        .collect();
+    let pins: Vec<(&str, Option<&std::ffi::OsStr>)> = std::iter::once("SHUNT_CLIENT_TOKENS")
+        .chain(auth_keys.iter().map(String::as_str))
+        .map(|key| (key, None))
+        .collect();
+    EnvPin::new(home, &pins)
 }
 
 /// Shim that appends its full argv to `report.log` beside itself and exits 0.

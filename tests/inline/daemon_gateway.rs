@@ -4539,6 +4539,92 @@ fn a_hold_read_error_is_logged_once_per_change() {
     );
 }
 
+/// Each round of a daemon's gateway keeps its env record naming it: a record
+/// gone, or one a dead predecessor left (a failed start write leaves it in
+/// place), is written again under this daemon's own identity, with no
+/// singleton read.
+#[test]
+fn a_round_records_this_daemons_env_when_no_record_names_it() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    fs::create_dir_all(clauth_dir().expect("dir")).expect("dir");
+    let older = crate::gateway::DaemonIdentity {
+        pid: std::process::id(),
+        start: Some("older-start".to_string()),
+    };
+    let _ = Gateway::for_test(Some(older.clone())).intent();
+    assert_eq!(crate::gateway::recorded_daemon_identity(), Some(older));
+
+    let me = crate::gateway::DaemonIdentity {
+        pid: std::process::id(),
+        start: Some("this-start".to_string()),
+    };
+    let _ = Gateway::for_test(Some(me.clone())).intent();
+    assert_eq!(crate::gateway::recorded_daemon_identity(), Some(me));
+}
+
+/// A daemon whose own start time could not be read records nothing in its
+/// rounds: `is_named_by` never matches it, so its record would be rewritten
+/// every round.
+#[test]
+fn a_round_without_its_start_time_records_nothing() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    fs::create_dir_all(clauth_dir().expect("dir")).expect("dir");
+    let gateway = Gateway::for_test(Some(crate::gateway::DaemonIdentity {
+        pid: std::process::id(),
+        start: None,
+    }));
+    let _ = gateway.intent();
+    assert_eq!(crate::gateway::recorded_daemon_identity(), None);
+}
+
+/// A record that cannot be written logs once per change, not once per
+/// round: a standing fault logs once, and a fault that clears and recurs
+/// logs again.
+#[test]
+fn an_env_record_write_failure_is_logged_once_per_change() {
+    let _home = HomeSandbox::new();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let dir = clauth_dir().expect("dir");
+    let record = dir.join("gateway-env.json");
+    let gateway = Gateway::for_test(Some(crate::gateway::DaemonIdentity {
+        pid: std::process::id(),
+        start: Some("this-start".to_string()),
+    }));
+    let faults = || {
+        lines
+            .snapshot()
+            .iter()
+            .filter(|line| {
+                line.starts_with("clauth daemon: ")
+                    && line.ends_with("; the reads of this daemon's env refuse until it records it")
+            })
+            .count()
+    };
+    fs::create_dir_all(&record).expect("a directory at the record path");
+    let _ = gateway.intent();
+    let _ = gateway.intent();
+    assert_eq!(
+        faults(),
+        1,
+        "one line across two rounds: {:?}",
+        lines.snapshot()
+    );
+    fs::remove_dir(&record).expect("clear the fault");
+    let _ = gateway.intent();
+    fs::remove_file(&record).expect("drop the written record");
+    fs::create_dir_all(&record).expect("the fault again");
+    let _ = gateway.intent();
+    assert_eq!(
+        faults(),
+        2,
+        "a recurring fault logs again: {:?}",
+        lines.snapshot()
+    );
+}
+
 /// A disabled record still reads `disabled` even with a hold naming this
 /// daemon: the record's flag wins over the hold.
 #[test]

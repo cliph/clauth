@@ -492,7 +492,7 @@ impl Edit {
             Edit::SetAccounts { name, .. } => {
                 format!("cannot set the accounts of upstream {name:?}")
             }
-            Edit::RequireClientTokens => "cannot require client tokens".to_string(),
+            Edit::RequireClientTokens => REQUIRE_CLIENT_TOKENS_OP.to_string(),
         }
     }
 
@@ -838,7 +838,7 @@ impl std::fmt::Display for EditRefusal {
             ),
             Self::BindUnrecorded { op } => write!(
                 f,
-                "{op}: the running daemon recorded no environment, so clauth cannot tell whether SHUNT_SERVER__BIND overrides the bind; restart the daemon, then save again"
+                "{op}: the running daemon recorded no environment, so clauth cannot tell whether SHUNT_SERVER__BIND overrides the bind; try again in a moment, and restart the daemon if it persists"
             ),
             Self::BindReference => write!(
                 f,
@@ -4218,6 +4218,10 @@ impl<'a> Ctx<'a> {
         Ok(broken(text, owned))
     }
 }
+
+/// The require op's refusal opening, shared by the editor and the
+/// client-token engine's own refusals of the same op.
+pub(crate) const REQUIRE_CLIENT_TOKENS_OP: &str = "cannot require client tokens";
 
 /// shunt's `[server] default_provider` when the key is absent
 /// (`Config::default`, shunt 03d99f1 `src/config.rs`).

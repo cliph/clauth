@@ -1536,6 +1536,9 @@ pub(crate) struct Gateway {
     /// change instead of one per round (the supervisor's slot-reason
     /// precedent).
     hold_fault: Arc<Mutex<Option<HoldFault>>>,
+    /// The last env-record fault logged ([`crate::gateway::refresh_daemon_env`]),
+    /// one line per change, as `hold_fault`.
+    env_fault: Arc<Mutex<Option<String>>>,
 }
 
 impl Gateway {
@@ -1544,6 +1547,7 @@ impl Gateway {
         Gateway {
             me: None,
             hold_fault: Arc::new(Mutex::new(None)),
+            env_fault: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1556,6 +1560,7 @@ impl Gateway {
                 start: process_start_time(pid),
             }),
             hold_fault: Arc::new(Mutex::new(None)),
+            env_fault: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1565,6 +1570,7 @@ impl Gateway {
         Gateway {
             me,
             hold_fault: Arc::new(Mutex::new(None)),
+            env_fault: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1578,6 +1584,31 @@ impl Gateway {
         if *last != fault {
             if !message.is_empty() {
                 logline!("{message}");
+            }
+            *last = fault;
+        }
+    }
+
+    /// Keep this daemon's env record answering for the tokens variable the
+    /// gateway's config names now, so the TUI's client-token reads never wait
+    /// for a daemon restart.
+    fn refresh_env(&self) {
+        let Some(me) = &self.me else {
+            return;
+        };
+        let fault = crate::gateway::refresh_daemon_env(me)
+            .err()
+            .map(|e| format!("{e:#}"));
+        let mut last = self
+            .env_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *last != fault {
+            if let Some(fault) = &fault {
+                logline!(
+                    "clauth daemon: {fault}{}",
+                    crate::gateway::ENV_RECORD_FAULT_TAIL
+                );
             }
             *last = fault;
         }
@@ -1921,6 +1952,7 @@ impl Supervised for Gateway {
     }
 
     fn intent(&self) -> Intent<GatewaySlot, GatewayRecord> {
+        self.refresh_env();
         let hold = self.hold();
         let record = match GatewayRecord::load() {
             Ok(Some(record)) => record,

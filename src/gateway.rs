@@ -354,15 +354,65 @@ struct DaemonEnvRecord {
 /// singleton now. The daemon calls this at start; the store plan and move read
 /// it through [`inherited_env`], the client-token reads through
 /// [`TokensInherited::of_gateway`]. Best-effort at its call site: a daemon
-/// that cannot write the record still runs, and those reads refuse until it
-/// restarts.
+/// that cannot write the record still runs, those reads refuse, and each
+/// supervisor round tries again ([`refresh_daemon_env`]).
 pub(crate) fn write_daemon_env() -> Result<()> {
     write_daemon_env_from(&std::env::vars_os().collect::<Vec<_>>())
+}
+
+/// Re-record the running daemon's env when its record no longer answers for
+/// every tokens variable a daemon starting now would record (a gateway
+/// adopted, or a config or env file naming another variable, since this
+/// daemon started), or when no record names this daemon. `me` is the daemon's
+/// own identity, learned at its start, so a round neither reads the singleton
+/// nor spawns a process. Answers whether it wrote.
+pub(crate) fn refresh_daemon_env(me: &DaemonIdentity) -> Result<bool> {
+    refresh_daemon_env_from(me, || std::env::vars_os().collect())
+}
+
+/// What a daemon's log line adds after an env-record write fault: the
+/// start-time write's and a round's alike.
+pub(crate) const ENV_RECORD_FAULT_TAIL: &str =
+    "; the reads of this daemon's env refuse until it records it";
+
+/// [`refresh_daemon_env`] over an injected env.
+fn refresh_daemon_env_from(
+    me: &DaemonIdentity,
+    vars: impl FnOnce() -> Vec<(OsString, OsString)>,
+) -> Result<bool> {
+    // `is_named_by` never matches an identity without a start time, so a
+    // record under one would be rewritten every round.
+    if me.start.is_none() {
+        return Ok(false);
+    }
+    if let Ok(Some(record)) = read_env_record()
+        && record.identity.is_named_by(me)
+    {
+        let adopted = GatewayRecord::load().ok().flatten();
+        let answered = start_tokens_vars(adopted.as_ref(), &record.auth_env)
+            .iter()
+            .all(|var| {
+                record
+                    .tokens
+                    .iter()
+                    .any(|(have, _)| var_os_key(have) == var_os_key(var))
+            });
+        if answered {
+            return Ok(false);
+        }
+    }
+    write_daemon_env_as(&vars(), me.clone())?;
+    Ok(true)
 }
 
 /// [`write_daemon_env`] over an injected env, so a test drives the capture
 /// (its key list and bytes) without reading the process's own env.
 fn write_daemon_env_from(vars: &[(OsString, OsString)]) -> Result<()> {
+    write_daemon_env_as(vars, current_holder_identity()?)
+}
+
+/// The record of `vars` under `identity`.
+fn write_daemon_env_as(vars: &[(OsString, OsString)], identity: DaemonIdentity) -> Result<()> {
     let var = |key: &str| inherited_value(vars, key).map(OsStr::to_os_string);
     // Every key figment reads into `[server.auth]`, in any case, as the
     // spawn's env layer reads it ([`spawned_env_var`]).
@@ -388,7 +438,7 @@ fn write_daemon_env_from(vars: &[(OsString, OsString)]) -> Result<()> {
         })
         .collect();
     write_env_record(DaemonEnvRecord {
-        identity: current_holder_identity()?,
+        identity,
         env: INHERITED_KEYS
             .iter()
             .filter_map(|key| var(key).map(|value| ((*key).to_string(), env_value_bytes(&value))))
@@ -402,7 +452,8 @@ fn write_daemon_env_from(vars: &[(OsString, OsString)]) -> Result<()> {
 /// `SHUNT_SERVER__AUTH__*` keys) records: shunt's default, and the variable
 /// named over that env by its env layer, or with an adopted gateway (`record`)
 /// by the config and env file as they read now. A variable named later (a
-/// config edit) is unrecorded until the daemon restarts.
+/// config edit) is recorded by the daemon's next round
+/// ([`refresh_daemon_env`]).
 fn start_tokens_vars(record: Option<&GatewayRecord>, auth: &[(String, Vec<u8>)]) -> Vec<String> {
     let mut vars = vec![SHUNT_DEFAULT_TOKENS_ENV.to_string()];
     let inherited: Vec<(OsString, OsString)> = auth
@@ -485,7 +536,7 @@ fn live_daemon_record() -> Result<Option<DaemonEnvRecord>> {
     match read_env_record() {
         Ok(Some(record)) if record.identity.is_named_by(&current) => Ok(Some(record)),
         // Missing, stale, unreadable or unparseable: refuse until this daemon
-        // restarts and records its env.
+        // records its env (its next supervisor round, or its restart).
         _ => Err(StoreMoveRefusal::DaemonEnvUnrecorded.into()),
     }
 }
@@ -1738,14 +1789,15 @@ pub(crate) fn gateway_env(record: &GatewayRecord) -> Result<GatewayEnv> {
 /// would. Under a daemon's record the check, a child of this process, also
 /// gets the daemon's `SHUNT_SERVER__AUTH__*` keys and none of this process's
 /// own, and the tokens variable is set even with no token stored, so this
-/// process's own value never reaches it.
+/// process's own value never reaches it; where clauth cannot name that
+/// variable (or the daemon recorded no env) the env refuses instead.
 fn checked_env(record: &GatewayRecord) -> Result<GatewayEnv> {
     gateway_env_in(record, TokensInherited::of_gateway)
 }
 
-/// [`gateway_env`] over the inherited env `inherited` yields, read only when
-/// a token is stored or under a daemon's record, so tests inject one instead
-/// of reading the process's own.
+/// [`gateway_env`] over the inherited env `inherited` yields, read on every
+/// call and laid only when a token is stored or under a daemon's record, so
+/// tests inject one instead of reading the process's own.
 fn gateway_env_in(
     record: &GatewayRecord,
     inherited: impl FnOnce() -> Result<TokensInherited>,
@@ -1753,13 +1805,16 @@ fn gateway_env_in(
     let mut env = env_file_env(record)?;
     let tokens = ClientTokens::load()?;
     let layer = if tokens.is_empty() {
-        // Best-effort: the spawn passes the inherited value through on its
-        // own; only a daemon's record must be laid for a check run elsewhere,
-        // and a read that fails leaves the env as it was.
-        inherited()
-            .ok()
-            .filter(|view| matches!(view, TokensInherited::Recorded { .. }))
-            .and_then(|view| tokens_layer(record, &env, &tokens, &view).ok())
+        // The spawn passes the inherited value through on its own; only a
+        // daemon's record must be laid for a check run elsewhere, and one
+        // that cannot name the variable the daemon's gateway reads refuses,
+        // or the check would read this process's own.
+        match inherited()? {
+            view @ TokensInherited::Recorded { .. } => {
+                Some(tokens_layer(record, &env, &tokens, &view)?)
+            }
+            TokensInherited::Process(_) => None,
+        }
     } else {
         Some(tokens_layer(record, &env, &tokens, &inherited()?)?)
     };
@@ -1779,7 +1834,7 @@ fn gateway_env_in(
 
 /// What [`tokens_layer`] lays over the env file's pairs.
 struct TokensLayer {
-    /// `None` when the variable could not be read (a check's best effort).
+    /// `None` when the config could not be read (a check's best effort).
     variable: Option<String>,
     set: Vec<(String, OsString)>,
     unset: Vec<String>,
@@ -1824,9 +1879,9 @@ fn tokens_layer(
             .collect();
     }
     // With no token stored only a daemon's record reaches here, for a check:
-    // a variable that cannot be read leaves the rest of the layer standing,
-    // and one the record does not answer for is set empty, so this process's
-    // own value never reaches the check.
+    // a variable the record does not answer for is set empty, so this
+    // process's own value never reaches the check, and one clauth cannot
+    // name refuses.
     let doc = match read_config_doc(record) {
         Ok(doc) => doc,
         Err(_) if tokens.is_empty() => {
@@ -1844,13 +1899,6 @@ fn tokens_layer(
             set.push((variable.clone(), OsString::new()));
             return Ok(TokensLayer {
                 variable: Some(variable),
-                set,
-                unset,
-            });
-        }
-        Err(_) if tokens.is_empty() => {
-            return Ok(TokensLayer {
-                variable: None,
                 set,
                 unset,
             });
@@ -1923,7 +1971,7 @@ fn config_auth(doc: &DocumentMut) -> Option<&Item> {
 
 /// Whether `name` is a key shunt's figment env layer reads into
 /// `[server.auth]`: its prefix in any case.
-fn is_auth_env_key(name: &str) -> bool {
+pub(crate) fn is_auth_env_key(name: &str) -> bool {
     name.get(..AUTH_ENV_PREFIX.len())
         .is_some_and(|head| head.eq_ignore_ascii_case(AUTH_ENV_PREFIX))
 }
@@ -2233,11 +2281,11 @@ impl std::fmt::Display for TokensEnvRefusal {
                 "{TOKENS_ENV_ENV} holds a backslash inside its quotes, which figment would unescape and clauth does not; write the value literally"
             ),
             TokensEnvRefusal::DaemonUnrecorded => f.write_str(
-                "the running daemon recorded no environment, so clauth cannot read the client tokens the gateway inherits; restart the daemon, then try again",
+                "the running daemon recorded no environment, so clauth cannot read the client tokens the gateway inherits; try again in a moment, and restart the daemon if it persists",
             ),
             TokensEnvRefusal::VariableUnrecorded { variable } => write!(
                 f,
-                "the running daemon recorded no value for {variable}, the variable shunt reads its client tokens from; restart the daemon so it records it"
+                "the running daemon recorded no value for {variable}, the variable shunt reads its client tokens from; try again in a moment, and restart the daemon if it persists"
             ),
         }
     }

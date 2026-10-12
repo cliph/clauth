@@ -423,7 +423,7 @@ fn a_bind_edit_under_an_unrecorded_daemon_refuses_naming_the_restart() {
     );
     assert_eq!(
         err.to_string(),
-        "cannot set server.bind: the running daemon recorded no environment, so clauth cannot tell whether SHUNT_SERVER__BIND overrides the bind; restart the daemon, then save again"
+        "cannot set server.bind: the running daemon recorded no environment, so clauth cannot tell whether SHUNT_SERVER__BIND overrides the bind; try again in a moment, and restart the daemon if it persists"
     );
     assert_eq!(
         apply_edit(
@@ -435,7 +435,7 @@ fn a_bind_edit_under_an_unrecorded_daemon_refuses_naming_the_restart() {
         )
         .expect_err("an unset refuses too")
         .to_string(),
-        "cannot unset server.bind: the running daemon recorded no environment, so clauth cannot tell whether SHUNT_SERVER__BIND overrides the bind; restart the daemon, then save again"
+        "cannot unset server.bind: the running daemon recorded no environment, so clauth cannot tell whether SHUNT_SERVER__BIND overrides the bind; try again in a moment, and restart the daemon if it persists"
     );
     assert_eq!(
         fs::read_to_string(record.config()).expect("read"),
@@ -1865,11 +1865,13 @@ fn a_refused_edit_leaves_the_file_byte_identical() {
     assert_only(rig.config.parent().expect("etc"), &["shunt.toml"]);
 }
 
-/// Only a bind edit reads the daemon's env: a field edit under a daemon with
-/// no env record lands.
+/// A field edit under a daemon with no env record refuses before the check:
+/// clauth cannot tell which tokens variable the daemon's gateway reads, so the
+/// check would read this process's own; the file stays byte-identical and no
+/// check runs.
 #[cfg(unix)]
 #[test]
-fn a_non_bind_edit_under_an_unrecorded_daemon_lands() {
+fn a_non_bind_edit_under_an_unrecorded_daemon_refuses_before_the_check() {
     let rig = rig("[[models]]\nid = \"m\"\n");
     let _held = crate::daemon::hold_daemon_lock();
     fs::write(
@@ -1877,15 +1879,17 @@ fn a_non_bind_edit_under_an_unrecorded_daemon_lands() {
         format!("{}\n", std::process::id()),
     )
     .expect("stamp the holder pid");
-    apply_edit(
-        &rig.record,
-        &set_model("m", ModelField::DisplayName, Some("M")),
-    )
-    .expect("lands");
     assert_eq!(
-        rig.config_text(),
-        "[[models]]\nid = \"m\"\ndisplay_name = \"M\"\n"
+        apply_edit(
+            &rig.record,
+            &set_model("m", ModelField::DisplayName, Some("M")),
+        )
+        .map(|_| ())
+        .map_err(|e| format!("{e:#}")),
+        Err("the running daemon recorded no environment, so clauth cannot read the client tokens the gateway inherits; try again in a moment, and restart the daemon if it persists".to_string())
     );
+    assert_eq!(rig.config_text(), "[[models]]\nid = \"m\"\n");
+    assert_eq!(rig.read("calls"), "");
 }
 
 #[test]

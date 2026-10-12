@@ -43,6 +43,25 @@ fn add(record: &GatewayRecord, profile: &str) -> String {
         .to_string()
 }
 
+/// The test env scrub unsets an env-layer `[server.auth]` key and the bind
+/// override a shell exported in any case (figment reads every case), and puts
+/// them back after.
+#[test]
+fn the_test_env_scrub_takes_an_auth_key_in_any_case() {
+    let home = HomeSandbox::new();
+    let keys = ["Shunt_Server__Auth__Header", "Shunt_Server__Bind"];
+    let _shell = EnvPin::new(
+        &home,
+        &keys.map(|key| (key, Some(std::ffi::OsStr::new("x-shell")))),
+    );
+    {
+        let _env = no_shunt_env(&home);
+        assert_eq!(keys.map(std::env::var_os), [None, None]);
+    }
+    let shell = Some(std::ffi::OsString::from("x-shell"));
+    assert_eq!(keys.map(std::env::var_os), [shell.clone(), shell]);
+}
+
 /// The add mints 32 CSPRNG bytes, hex, into an owner-only store keyed by
 /// the profile and hands the token back; a second add for the profile
 /// replaces it. The store's `Debug` names profiles alone.
@@ -538,7 +557,7 @@ fn a_removal_whose_token_became_the_last_refuses_and_asks_for_a_rerun() {
     add(&record, "a");
     add(&record, "b");
     let other = record.clone();
-    set_pre_removal_hold_hook(
+    set_pre_hold_hook(
         "a",
         std::sync::Arc::new(move || {
             remove_client_token(&other, "b").expect("remove the other token");

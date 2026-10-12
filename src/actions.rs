@@ -1050,6 +1050,8 @@ pub(crate) fn rename_profile(
     // The gateway's client token follows the profile; a clash with a client
     // the gateway's own env names is read here, outside the flock.
     let token_planned = crate::gateway_tokens::refuse_profile_rename(old.as_str(), new.as_str())?;
+    #[cfg(test)]
+    crate::gateway_tokens::run_pre_hold_hook(old.as_str());
     with_state_lock(|held| {
         // Same gate delete and disable carry, same predicate and copy: a live
         // session's runtime tree, markers and env paths all live under this
@@ -1132,6 +1134,8 @@ pub(crate) fn delete_profile(
 ) -> Result<()> {
     // The gateway reads the last-token guard needs happen outside the flock.
     let token = crate::gateway_tokens::plan_profile_delete(name.as_str())?;
+    #[cfg(test)]
+    crate::gateway_tokens::run_pre_hold_hook(name.as_str());
     with_state_lock(|held| {
         // Refuse to pull an account out from under a running `clauth start`
         // session (either flavor), checked before any removal so a refused

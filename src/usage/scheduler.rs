@@ -1645,8 +1645,8 @@ fn update_third_party_broken(
 /// config write lands, never gated on the separately refreshed
 /// `ThirdPartyList`. A deleted, converted or re-keyed profile drops out at
 /// once — the same failure class `filter_suppressed` fixes by keying on the
-/// fingerprint. Read by the scans to union into `broken`, and by the
-/// TUI/daemon to hand the config-side walks a pre-read set.
+/// fingerprint. Read by the scans to union into `broken`, and by the TUI/daemon
+/// to hand the render and dispatch paths a pre-read set.
 pub(crate) fn current_key_rejected_names(
     broken: &HashMap<String, u64>,
     profiles: &[crate::profile::Profile],
@@ -1859,7 +1859,7 @@ pub(crate) fn kick_block_switch_grade(block: &KickBlock, now_secs: i64) -> bool 
 
 /// Names whose live kick block is switch-grade ([`kick_block_switch_grade`]),
 /// copied out under one short leaf lock for the auto-switch/recovery scans.
-fn kick_rejected_names(blocks: &KickBlocks, now_secs: i64) -> Vec<ProfileName> {
+pub(crate) fn kick_rejected_names(blocks: &KickBlocks, now_secs: i64) -> Vec<ProfileName> {
     blocks
         .lock()
         .map(|m| {
@@ -4318,8 +4318,8 @@ fn decision_fresh<R: crate::lockorder::Rank>(
 /// status (falling back to the third-party one, so a pure third-party member
 /// with no OAuth entry still counts — 2026-07-17). Consulted
 /// by both `scan_auto_switch` (the walk's fresh-preference) and `scan_recovery`
-/// (the relink gate) so both stay in lockstep with the UI twin.
-fn decision_fresh_any(
+/// (the relink gate), and by the TUI's caption + one-shot.
+pub(crate) fn decision_fresh_any(
     status: &StatusStore,
     third_party_status: &ThirdPartyStatusStore,
     third_party: bool,
@@ -4454,7 +4454,7 @@ pub(crate) fn is_stuck_streak(streak: u32) -> bool {
 /// does: a third-party-classified member reads its third-party status + streak
 /// alone, every other member is OAuth-first with the third-party fallback for a
 /// member with no OAuth status entry.
-fn reading_dead_names(
+pub(crate) fn reading_dead_names(
     members: &[crate::fallback::ChainMember],
     status: &StatusStore,
     third_party_status: &ThirdPartyStatusStore,
@@ -4514,6 +4514,64 @@ fn reading_dead_names(
         })
         .map(|m| m.name.clone())
         .collect()
+}
+
+/// Fill a claude `ChainSnapshot`'s non-config fields (kick-rejected,
+/// reading-dead, fresh) and build the picker usage map — the store-side fill
+/// block shared by `scan_auto_switch` (which clones the fields into its
+/// counterfactual snapshot) and the TUI's caption + startup one-shot.
+///
+/// Each store is locked once and released before the next — never two leaf
+/// mutexes at once, and never called while a `Config` guard is held (the stores
+/// rank below `Config` in `lockorder.rs`). The caller builds the snapshot under
+/// the config lock and drops that guard first.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fill_chain_snapshot_stores(
+    snapshot: &mut crate::fallback::ChainSnapshot,
+    store: &UsageStore,
+    third_party_usage_store: &ThirdPartyUsageStore,
+    status: &StatusStore,
+    third_party_status: &ThirdPartyStatusStore,
+    streaks: &PollStreaks,
+    third_party_streaks: &ThirdPartyStreaks,
+    kick_blocks: &KickBlocks,
+    third_party_names: &HashSet<ProfileName>,
+) -> HashMap<String, UsageInfo> {
+    snapshot.kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
+    // The picker snapshot is built once here and shared with the decision.
+    let usage = crate::fallback::usage_snapshot_for_chain(
+        store,
+        third_party_usage_store,
+        third_party_names,
+        &snapshot.chain,
+    );
+    snapshot.reading_dead = reading_dead_names(
+        &snapshot.chain,
+        status,
+        third_party_status,
+        streaks,
+        third_party_streaks,
+        third_party_names,
+        &usage,
+    );
+    // Freshness lives in the status stores, not in config. Unions BOTH stores
+    // (OAuth + third-party) via `decision_fresh_any`, so a fresh third-party
+    // member isn't invisible to this walk. A PREFERENCE for the headroom walk,
+    // never a gate — see `ChainSnapshot::fresh`.
+    snapshot.fresh = snapshot
+        .chain
+        .iter()
+        .filter(|m| {
+            decision_fresh_any(
+                status,
+                third_party_status,
+                third_party_names.contains(&m.name),
+                &m.name,
+            )
+        })
+        .map(|m| m.name.clone())
+        .collect();
+    usage
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4606,13 +4664,26 @@ pub(crate) fn scan_auto_switch(
         return;
     };
     // Not config state, so `snapshot_chain` can't fill it: the walk skips
-    // switch-grade kick-rejected members and a rejected ACTIVE bypasses the
-    // exhaustion gate (its usage reads idle while inference is refused). The
-    // kick/reading-dead/fresh fillers read only the member NAMES, which the
-    // two builds share, so they run once and clone into both snapshots.
-    let kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
-    snapshot.kick_rejected = kick_rejected.clone();
-    without_snapshot.kick_rejected = kick_rejected;
+    // switch-grade kick-rejected members, a rejected ACTIVE bypasses the
+    // exhaustion gate (its usage reads idle while inference is refused), and
+    // the dead-reading/fresh verdicts live in the status/streak stores. The
+    // store-side fill runs once on `snapshot`; the kick/reading-dead/fresh
+    // fields read only the member NAMES, which the two builds share, so they
+    // clone into `without_snapshot` unchanged.
+    let usage = fill_chain_snapshot_stores(
+        &mut snapshot,
+        store,
+        third_party_usage_store,
+        status,
+        third_party_status,
+        streaks,
+        third_party_streaks,
+        kick_blocks,
+        &third_party_names,
+    );
+    without_snapshot.kick_rejected = snapshot.kick_rejected.clone();
+    without_snapshot.reading_dead = snapshot.reading_dead.clone();
+    without_snapshot.fresh = snapshot.fresh.clone();
     // A third-party member whose api KEY the provider rejected is dead like an
     // OAuth auth-broken member — not config state (live only), so
     // `snapshot_chain` can't fill it: union the live set into `broken` so the
@@ -4623,49 +4694,6 @@ pub(crate) fn scan_auto_switch(
     without_snapshot
         .broken
         .extend(key_rejected_without_active.iter().cloned());
-    // The dead-reading channel is the same kind of non-config state (issue
-    // #83): a deep-stuck `RateLimited` member with no window at all can never
-    // produce the live window the walk's exhaustion gate needs, so the scan
-    // hands the walk the bypass flag instead. The picker snapshot is built once
-    // here and shared with the decision below.
-    let usage = crate::fallback::usage_snapshot_for_chain(
-        store,
-        third_party_usage_store,
-        &third_party_names,
-        &snapshot.chain,
-    );
-    let reading_dead = reading_dead_names(
-        &snapshot.chain,
-        status,
-        third_party_status,
-        streaks,
-        third_party_streaks,
-        &third_party_names,
-        &usage,
-    );
-    snapshot.reading_dead = reading_dead.clone();
-    without_snapshot.reading_dead = reading_dead;
-    // Same reason: freshness lives in the status stores, not in config, and
-    // `Profile.fetch_status` (what the UI twin reads) is written only by the UI
-    // thread. Unions BOTH stores (OAuth + third-party) via `decision_fresh_any`,
-    // exactly as the UI twin's `apply_usage` fills `fetch_status`, so a fresh
-    // third-party member isn't invisible to this walk alone. A PREFERENCE for
-    // the headroom walk, never a gate — see `ChainSnapshot::fresh`.
-    let fresh: Vec<ProfileName> = snapshot
-        .chain
-        .iter()
-        .filter(|m| {
-            decision_fresh_any(
-                status,
-                third_party_status,
-                third_party_names.contains(&m.name),
-                &m.name,
-            )
-        })
-        .map(|m| m.name.clone())
-        .collect();
-    snapshot.fresh = fresh.clone();
-    without_snapshot.fresh = fresh;
 
     // Only act on a reading worth acting on. The rule, and the two bypasses that
     // keep it from wedging the scan, live in `reading_is_actionable` — shared with
@@ -4688,6 +4716,7 @@ pub(crate) fn scan_auto_switch(
         &without_snapshot,
         &usage,
         &third_party_names,
+        crate::fallback::ActiveBurnRate::FromDisk,
     ) {
         Some(crate::fallback::AutoSwitchDecision {
             action: crate::fallback::SwitchAction::To(name),
@@ -4909,6 +4938,7 @@ fn scan_session_switches(
                 &snapshot,
                 &usage,
                 &third_party_names,
+                crate::fallback::ActiveBurnRate::FromDisk,
             )
         else {
             continue;
@@ -5027,12 +5057,11 @@ fn scan_recovery(
                 .fallback_chain
                 .iter()
                 // A disabled, auth-broken, or key-rejected member is not a
-                // recovery target. Shares `fallback::walk_excluded` with
-                // `next_target`/`fully_clear_target` so the skip list can't
-                // drift; canceled is caught store-side inside
-                // `find_recovered_member` (this walk's `Profile.usage` is stale
-                // headless, so the config-plan `is_canceled` the selection walks
-                // use would read empty here).
+                // recovery target. Shares `fallback::walk_excluded` with the
+                // render-side walks so the skip list can't drift; canceled is
+                // caught store-side inside `find_recovered_member` (this walk's
+                // `Profile.usage` is stale headless, so the config-plan
+                // `is_canceled` the render-side walks use would read empty here).
                 .filter(|name| !crate::fallback::walk_excluded(&cfg, name, &key_rejected))
                 .map(|name| {
                     let profile = cfg.find(name);

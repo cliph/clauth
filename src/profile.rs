@@ -870,7 +870,7 @@ pub(crate) struct AppState {
     /// threshold check when no burn rate is available yet. Off by default:
     /// the static threshold stays the default auto-switch behavior (issue #8
     /// follow-up b). Candidate selection and `soonest_resume` are unaffected
-    /// either way — see `fallback::is_exhausted_active`.
+    /// either way — the ACTIVE-side check is the walk's own.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) burn_aware_switching: bool,
     /// Which member the fallback-chain walk lands on WITHIN one accept pass
@@ -897,7 +897,7 @@ pub(crate) struct AppState {
     /// `Profile::max_auto_spend` ceiling. Off by default, and every ceiling
     /// defaults to `$0`, so BOTH halves must be set before a cent is spent
     /// unattended. Spend-armed members rank below every subscription member
-    /// with free quota — see `fallback::next_target`.
+    /// with free quota — see the fallback walk's spend pass.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) spend_budget_switching: bool,
     /// What to do once a billing account has spent its `max_auto_spend` budget:

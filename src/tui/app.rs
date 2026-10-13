@@ -3655,6 +3655,28 @@ pub(crate) enum LoginResult {
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
+/// The scheduler walk's answer to "where does the chain land when the active
+/// crosses its threshold", plus the ACTIVE's picked usage, resolved threshold
+/// and in-memory burn rate — the inputs the Overview projected-switch caption
+/// renders. See [`App::auto_switch_projection`].
+pub(crate) struct AutoSwitchProjection {
+    pub(crate) action: Option<SwitchAction>,
+    pub(crate) active_usage: Option<UsageInfo>,
+    pub(crate) active_threshold: f64,
+    pub(crate) active_rate: Option<f64>,
+}
+
+impl AutoSwitchProjection {
+    fn none() -> Self {
+        Self {
+            action: None,
+            active_usage: None,
+            active_threshold: crate::fallback::DEFAULT_THRESHOLD,
+            active_rate: None,
+        }
+    }
+}
+
 pub(crate) struct App {
     /// Shared config; locked by the UI thread and the background refresher.
     /// Release before HTTP to avoid stalling the UI.
@@ -4703,26 +4725,127 @@ impl App {
         .flatten()
     }
 
-    /// The in-memory burn rate for `profile`, or `None` when the profile is
-    /// third-party-classified — a hybrid never pairs its OAuth burn history with
-    /// its provider window (maintainer ruling 2026-09-10), so its windows are judged by the
-    /// static threshold, never a cross-pool projection. The one guard the
-    /// Overview ETA and the startup one-shot both read.
-    pub(crate) fn burn_rate_for(&self, profile: &Profile, usage_info: &UsageInfo) -> Option<f64> {
-        if profile.usage_cache_is_third_party() {
-            return None;
-        }
-        self.active_burn_rate(&profile.name, usage_info)
+    /// The startup one-shot's gate + burn rate, both off the stores (never
+    /// `Profile.usage`, never disk): `(active_fresh, rate)`. Freshness reads the
+    /// picker's status store via `decision_fresh_any` — the same verdict the
+    /// scheduler's scan gates on. The rate is the ACTIVE's picked 5h window from
+    /// `usage_store` paired with the in-memory `history_cache`; `None` for a
+    /// third-party-classified active, whose provider window never pairs with the
+    /// OAuth burn history (maintainer ruling 2026-09-10).
+    fn active_bootstrap_state(&self) -> (bool, Option<f64>) {
+        let (name, third_party) = {
+            let cfg = self.config();
+            let Some(name) = cfg.state.active_profile.as_ref().cloned() else {
+                return (false, None);
+            };
+            let third_party = cfg
+                .find(&name)
+                .is_some_and(|p| p.usage_cache_is_third_party());
+            (name, third_party)
+        };
+        let fresh = crate::usage::decision_fresh_any(
+            &self.usage_status,
+            &self.third_party_status,
+            third_party,
+            &name,
+        );
+        let rate = if third_party {
+            None
+        } else {
+            self.usage_store
+                .lock()
+                .ok()
+                .and_then(|s| s.get(name.as_str()).cloned())
+                .and_then(|u| self.active_burn_rate(&name, &u))
+        };
+        (fresh, rate)
     }
 
-    /// The startup one-shot's burn rate for `profile`: its `Profile.usage`
-    /// reading, or `None` when there is none. The one-shot reads its rate
-    /// through this step, never `active_burn_rate` directly — a
-    /// third-party-classified profile still refuses the OAuth burn pairing via
-    /// [`Self::burn_rate_for`] (maintainer ruling 2026-09-10).
-    fn startup_rate(&self, profile: &Profile) -> Option<f64> {
-        let usage = profile.usage.as_ref()?;
-        self.burn_rate_for(profile, usage)
+    /// The projected next switch for the Overview caption: the scheduler walk's
+    /// answer over the ACTIVE's reading replaced by one that reads exhausted at
+    /// the crossing (its threshold), so the caption names where the walk lands
+    /// when the active crosses — never the walk's decision for the active as it
+    /// reads now (a healthy active below its threshold has none). Also carries
+    /// the ACTIVE's real picked usage, resolved threshold and in-memory burn
+    /// rate, which the caption's eta guard reads. Built in one config-then-stores
+    /// sequence (stores rank below `Config`), so the caller must not hold the
+    /// config guard. `key_rejected` is the caller's live set, computed once per
+    /// frame.
+    pub(crate) fn auto_switch_projection(
+        &self,
+        key_rejected: &HashSet<ProfileName>,
+    ) -> AutoSwitchProjection {
+        let (mut snapshot, third_party_names) = {
+            let cfg = self.config();
+            let Some(snapshot) = crate::fallback::snapshot_chain(&cfg, key_rejected) else {
+                return AutoSwitchProjection::none();
+            };
+            if snapshot.chain.len() <= 1 {
+                return AutoSwitchProjection::none();
+            }
+            let third_party_names: HashSet<ProfileName> = cfg
+                .profiles
+                .iter()
+                .filter(|p| p.usage_cache_is_third_party())
+                .map(|p| p.name.clone())
+                .collect();
+            (snapshot, third_party_names)
+        };
+        let active = snapshot.active.clone();
+        let usage = crate::usage::fill_chain_snapshot_stores(
+            &mut snapshot,
+            &self.usage_store,
+            &self.third_party_usage_store,
+            &self.usage_status,
+            &self.third_party_status,
+            &self.poll_streaks,
+            &self.third_party_streaks,
+            &self.kick_blocks,
+            &third_party_names,
+        );
+        snapshot.broken.extend(key_rejected.iter().cloned());
+        let active_usage = usage.get(active.as_str()).cloned();
+        let active_threshold = snapshot
+            .chain
+            .iter()
+            .find(|m| m.name == active)
+            .map(|m| m.threshold)
+            .unwrap_or(crate::fallback::DEFAULT_THRESHOLD);
+        // A third-party-classified active has no burn history to pair with its
+        // provider window (maintainer ruling 2026-09-10), so no rate.
+        let active_rate = if third_party_names.contains(&active) {
+            None
+        } else {
+            active_usage
+                .as_ref()
+                .and_then(|u| self.active_burn_rate(&active, u))
+        };
+        // The caption projects "when the active crosses at ~eta, where does the
+        // walk land": re-run the SAME walk over a usage clone whose only change
+        // is the active's 5h utilization set to its threshold. The threshold
+        // reads exhausted in every mode — `util >= threshold` is the static
+        // disjunct in both arms of `is_exhausted_projected` (its `Some(rate)`
+        // arm ORs `projected_exhausted || util >= threshold`, its `None` arm is
+        // exactly that) and the direct check when burn-aware is off — so the
+        // floor, the rate and the mode never change the answer.
+        let mut projected = usage.clone();
+        if let Some(info) = projected.get_mut(active.as_str())
+            && let Some(window) = info.five_hour.as_mut()
+        {
+            window.utilization = active_threshold;
+        }
+        let action = crate::fallback::next_auto_switch_target_with_usage(
+            &snapshot,
+            &projected,
+            &third_party_names,
+            crate::fallback::ActiveBurnRate::Supplied(active_rate),
+        );
+        AutoSwitchProjection {
+            action,
+            active_usage,
+            active_threshold,
+            active_rate,
+        }
     }
 
     /// The funded wallet's burn rate for `profile`, computed from the
@@ -4774,16 +4897,23 @@ impl App {
         // are due on the scheduler's first tick, which fetches then
         // auto-switches off the corrected numbers.
         let switched = {
-            let cfg = self.config();
-            let active_profile = cfg.state.active_profile.as_ref().and_then(|n| cfg.find(n));
-            let active_fresh =
-                active_profile.is_some_and(|p| p.fetch_status == Some(FetchStatus::Fresh));
+            let (active_fresh, rate) = self.active_bootstrap_state();
             if active_fresh {
                 // In-memory rate only (`history_cache`) — never a disk read
-                // while the config guard is held; see `active_burn_rate`.
-                let rate = active_profile.and_then(|p| self.startup_rate(p));
-                drop(cfg);
-                auto_switch_if_needed(&self.config, rate).ok().flatten()
+                // under any guard; see `active_burn_rate`.
+                auto_switch_if_needed(
+                    &self.config,
+                    rate,
+                    &self.usage_store,
+                    &self.third_party_usage_store,
+                    &self.usage_status,
+                    &self.third_party_status,
+                    &self.poll_streaks,
+                    &self.third_party_streaks,
+                    &self.kick_blocks,
+                )
+                .ok()
+                .flatten()
             } else {
                 None
             }
@@ -13283,9 +13413,8 @@ fn toggle_wrap_off(app: &mut App) {
 /// Flip the opt-in burn-aware auto-switch mode (issue #8 follow-up b). Shares
 /// `switch_off_when_spent`'s persistence shape exactly: mutate the shared `AppConfig`,
 /// `save_app_state`, bump `last_reload_fp` — no separate propagation to the
-/// scheduler is needed since both `next_target` and `next_auto_switch_target`
-/// read the flag straight off the same shared `config` (`snapshot_chain`
-/// mirrors `switch_off_when_spent`'s copy into `ChainSnapshot`).
+/// scheduler is needed since `next_auto_switch_target` reads the flag straight
+/// off the same shared `config` (`snapshot_chain` mirrors `switch_off_when_spent`'s copy into `ChainSnapshot`).
 fn toggle_burn_aware_switching(app: &mut App) {
     {
         let mut cfg = app.config();
@@ -13355,10 +13484,10 @@ fn step_burn_horizon(app: &mut App) {
 
 /// Flip the master half of the real-money opt-in
 /// (`AppState.spend_budget_switching`). Same persistence shape as
-/// `toggle_burn_aware_switching`; both walk twins read the flag off the shared
-/// config (the UI twin directly, the scheduler's through `snapshot_chain`), so
-/// no separate propagation is needed. Flipping this on alone still spends
-/// nothing — every member's ceiling defaults to $0.
+/// `toggle_burn_aware_switching`; no separate propagation to the scheduler is
+/// needed since the walk reads the flag off the same shared `config`
+/// (`snapshot_chain` mirrors it into `ChainSnapshot`). Flipping this on alone
+/// still spends nothing — every member's ceiling defaults to $0.
 fn toggle_spend_budget_switching(app: &mut App) {
     {
         let mut cfg = app.config();

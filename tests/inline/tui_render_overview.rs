@@ -426,12 +426,29 @@ fn line_text(line: &Line<'static>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
+/// The single row carrying the projected-switch `↲` hint, flattened to text.
+/// Equality assertions pin the whole row (gauge, figures, eta), not just the
+/// target name, so any hint-text or eta drift reds.
+fn hinted_row_text(lines: &[Line<'static>]) -> String {
+    let hinted: Vec<String> = lines
+        .iter()
+        .map(line_text)
+        .filter(|t| t.contains('↲'))
+        .collect();
+    assert_eq!(
+        hinted.len(),
+        1,
+        "exactly one row carries the projected-switch hint: {hinted:?}"
+    );
+    hinted.into_iter().next().expect("one hinted row")
+}
+
 fn resumes_line(lines: &[Line<'static>]) -> Option<String> {
     lines.iter().map(line_text).find(|t| t.contains("resumes:"))
 }
 
 // Wrap mode: the active profile itself is exhausted and stays put (no sink,
-// `next_target` returns `None`) — previously silent. b resets sooner than a.
+// the walk returns `None`) — previously silent. b resets sooner than a.
 #[test]
 fn all_exhausted_wrap_mode_shows_resumes_hint() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -1593,9 +1610,9 @@ fn chain_rows_align_the_threshold_percent_column() {
     );
 }
 
-/// A row can be BOTH the projected switch target and blocked: `next_target`'s
-/// headroom walk only prefers a fresh candidate and falls through to a
-/// stale-but-unexhausted one (`is_exhausted` ignores `fetch_status`), so a
+/// A row can be BOTH the projected switch target and blocked: the walk's
+/// headroom pass only prefers a fresh candidate and falls through to a
+/// stale-but-unexhausted one, so a
 /// stale/soft-blocked member can still be `To`'s pick. With room for both, the
 /// row shows the hint AND the marker rather than silently dropping the
 /// imminent-switch projection.
@@ -3663,10 +3680,300 @@ fn a_hybrid_has_no_projected_switch_eta() {
             (now - 120_000, oauth_usage(72.0)),
         ],
     );
-    let cfg = app.config();
     assert_eq!(
-        projected_switch(&app, &cfg, &HashSet::new()),
+        projected_switch(&app, &std::collections::HashSet::new()),
         None,
         "a hybrid active has no projected-switch ETA"
+    );
+}
+
+/// Seed a live 5h window at `pct` into the OAuth usage store for `name`.
+fn seed_5h(app: &mut App, name: &str, pct: f64) {
+    #[allow(clippy::unwrap_used, reason = "test mutex poisoning is unrecoverable")]
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), oauth_usage(pct));
+}
+
+/// A switch-grade kick block lifted an hour out — the shape
+/// `kick_rejected_names` counts as a rejected member.
+fn kick_block(now: i64) -> crate::usage::KickBlock {
+    crate::usage::KickBlock {
+        streak: 2,
+        rejected: true,
+        until: Some(now + 3600),
+        next_retry: now + 3600,
+    }
+}
+
+/// Seed `name`'s in-memory burn history with a heavy climb so its rate projects
+/// the active past the static threshold — the burn-aware projection the caption
+/// reads its in-memory rate from.
+fn seed_heavy_burn(app: &mut App, name: &str) {
+    let now = crate::usage::now_ms();
+    app.history_cache.insert(
+        name.to_string(),
+        vec![
+            (now - 360_000, oauth_usage(36.0)),
+            (now - 240_000, oauth_usage(56.0)),
+            (now - 120_000, oauth_usage(76.0)),
+        ],
+    );
+}
+
+/// Seed a healthy two-member chain whose active `alpha` climbs 10 points every
+/// 2 minutes (300 %/h) to 52.5% against a 95% threshold: 42.5 points at
+/// 300 %/h is 510 s, so the hint reads `~8m`. The clock moving between the
+/// fixture's stamps and the rate read only lowers the rate and raises the eta,
+/// so the margin that matters is the 30 s up to 540 s (a fixture landing on
+/// exactly 540 s rendered `8m` or `9m` by whether the clock moved a millisecond).
+fn healthy_burning_alpha(bravo_pct: f64, switch_off_when_spent: bool) -> App {
+    let a = profile("alpha", 95.0, 52.5, 3600);
+    let b = profile("bravo", 95.0, bravo_pct, 3600);
+    let mut config = config_with(vec![a, b], Some("alpha"), vec!["alpha", "bravo"]);
+    config.state.switch_off_when_spent = switch_off_when_spent;
+    let mut app = App::new(config);
+    #[allow(clippy::unwrap_used, reason = "test mutex poisoning is unrecoverable")]
+    {
+        let mut store = app.usage_store.lock().unwrap();
+        store.insert("alpha".to_string(), oauth_usage(52.5));
+        store.insert("bravo".to_string(), oauth_usage(bravo_pct));
+        drop(store);
+        let mut status = app.usage_status.lock().unwrap();
+        status.insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+        status.insert("bravo".to_string(), crate::usage::FetchStatus::Fresh);
+    }
+    let now = crate::usage::now_ms();
+    app.history_cache.insert(
+        "alpha".to_string(),
+        vec![
+            (now - 360_000, oauth_usage(22.5)),
+            (now - 240_000, oauth_usage(32.5)),
+            (now - 120_000, oauth_usage(42.5)),
+        ],
+    );
+    app
+}
+
+/// R1 (reviewer probe, ported): the DEFAULT config (burn-aware off) caption
+/// names the member the walk lands on when a healthy active crosses its
+/// threshold. The whole target row is pinned by equality.
+#[test]
+fn reviewer_r1_default_caption_names_the_next_member_for_a_healthy_burning_active() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = healthy_burning_alpha(10.0, false);
+    let lines = fallback_flow_lines(&app, 120).0;
+    assert_eq!(
+        hinted_row_text(&lines),
+        " ╰ 2 bravo   ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%  ↲ ~8m",
+        "the default-config caption names the member the walk lands on at the crossing"
+    );
+}
+
+/// Wrap-off on and the only sibling spent: the walk signs everything out when
+/// the healthy active crosses its threshold, so the DEFAULT config (burn-aware
+/// off) warns with the `Off` caption ahead of it (cloudy, 2026-10-13: keep it).
+#[test]
+fn the_off_caption_warns_a_healthy_active_in_the_default_config() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = healthy_burning_alpha(100.0, true);
+    let lines = fallback_flow_lines(&app, 120).0;
+    let off: Vec<String> = lines
+        .iter()
+        .map(line_text)
+        .filter(|t| t.contains("signs everything out"))
+        .collect();
+    assert_eq!(off, vec!["  signs everything out in ~8m".to_string()]);
+}
+
+/// K1: the projected-switch caption skips a switch-grade kick-rejected member
+/// and names the clear one — the scheduler walk's `skip`, not the deleted UI
+/// walk (which never skipped kick-rejected members). Default config; whole row
+/// by equality.
+#[test]
+fn the_projected_switch_skips_a_kick_rejected_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = profile("alpha", 95.0, 94.0, 3600);
+    let b = profile("bravo", 95.0, 10.0, 3600);
+    let c = profile("charlie", 95.0, 10.0, 3600);
+    let config = config_with(
+        vec![a, b, c],
+        Some("alpha"),
+        vec!["alpha", "bravo", "charlie"],
+    );
+    let mut app = App::new(config);
+    seed_5h(&mut app, "alpha", 94.0);
+    seed_5h(&mut app, "bravo", 10.0);
+    seed_5h(&mut app, "charlie", 10.0);
+    seed_heavy_burn(&mut app, "alpha");
+    let now = crate::usage::now_epoch_secs();
+    #[allow(clippy::unwrap_used, reason = "test mutex poisoning is unrecoverable")]
+    {
+        app.kick_blocks
+            .lock()
+            .unwrap()
+            .insert("bravo".to_string(), kick_block(now));
+        // Every member reads Fresh, so the fresh preference cannot discriminate:
+        // only the walk's kick-rejected skip keeps bravo off the caption.
+        app.usage_status
+            .lock()
+            .unwrap()
+            .insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+        app.usage_status
+            .lock()
+            .unwrap()
+            .insert("bravo".to_string(), crate::usage::FetchStatus::Fresh);
+        app.usage_status
+            .lock()
+            .unwrap()
+            .insert("charlie".to_string(), crate::usage::FetchStatus::Fresh);
+    }
+
+    let lines = fallback_flow_lines(&app, 120).0;
+    assert_eq!(
+        hinted_row_text(&lines),
+        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%  ↲ ~6s",
+        "the caption must name the clear member, not the kick-rejected one"
+    );
+}
+
+/// K2: the projected-switch caption prefers a FRESH reading over a dead-reading
+/// member (deep `RateLimited` streak, no window). A dead-reading CANDIDATE is
+/// never skipped — it only loses the freshness preference (`snapshot.fresh`) —
+/// exactly as the deleted UI walk treated a non-Fresh member. Default config;
+/// whole row by equality.
+#[test]
+fn the_projected_switch_prefers_a_fresh_reading_over_a_dead_reading_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = profile("alpha", 95.0, 94.0, 3600);
+    let b = profile("bravo", 95.0, 10.0, 3600);
+    let c = profile("charlie", 95.0, 10.0, 3600);
+    let config = config_with(
+        vec![a, b, c],
+        Some("alpha"),
+        vec!["alpha", "bravo", "charlie"],
+    );
+    let mut app = App::new(config);
+    seed_5h(&mut app, "alpha", 94.0);
+    // bravo: windowless + deep RateLimited streak — its reading channel is dead.
+    seed_5h(&mut app, "charlie", 10.0);
+    seed_heavy_burn(&mut app, "alpha");
+    #[allow(clippy::unwrap_used, reason = "test mutex poisoning is unrecoverable")]
+    {
+        app.usage_status
+            .lock()
+            .unwrap()
+            .insert("bravo".to_string(), crate::usage::FetchStatus::RateLimited);
+        app.poll_streaks.lock().unwrap().insert(
+            "bravo".to_string(),
+            crate::usage::StreakCounts {
+                rate_limit: crate::usage::ACTIVE_CAP_MAX_STREAK + 1,
+                refresh_fail: 0,
+            },
+        );
+        app.usage_status
+            .lock()
+            .unwrap()
+            .insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+        app.usage_status
+            .lock()
+            .unwrap()
+            .insert("charlie".to_string(), crate::usage::FetchStatus::Fresh);
+    }
+
+    let lines = fallback_flow_lines(&app, 120).0;
+    assert_eq!(
+        hinted_row_text(&lines),
+        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%  ↲ ~6s",
+        "the caption must prefer the fresh member over the dead-reading one"
+    );
+}
+
+/// The simulated crossing reading (the active's utilization set to its
+/// threshold) reads exhausted under burn-aware ON with the DEFAULT floor (98,
+/// above the threshold 95): `util >= threshold` is the static disjunct of
+/// `is_exhausted_projected`, so the floor never blocks the crossing projection.
+#[test]
+fn the_projected_switch_names_the_next_member_under_burn_aware_default_floor() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = profile("alpha", 95.0, 94.0, 3600);
+    let b = profile("bravo", 95.0, 10.0, 3600);
+    let mut config = config_with(vec![a, b], Some("alpha"), vec!["alpha", "bravo"]);
+    config.state.burn_aware_switching = true;
+    let mut app = App::new(config);
+    seed_5h(&mut app, "alpha", 94.0);
+    seed_5h(&mut app, "bravo", 10.0);
+    seed_heavy_burn(&mut app, "alpha");
+    #[allow(clippy::unwrap_used, reason = "test mutex poisoning is unrecoverable")]
+    {
+        app.usage_status
+            .lock()
+            .unwrap()
+            .insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+        app.usage_status
+            .lock()
+            .unwrap()
+            .insert("bravo".to_string(), crate::usage::FetchStatus::Fresh);
+    }
+    let lines = fallback_flow_lines(&app, 120).0;
+    assert_eq!(
+        hinted_row_text(&lines),
+        " ╰ 2 bravo   ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%  ↲ ~6s",
+        "burn-aware with the default floor still projects the crossing"
+    );
+}
+
+/// m1: the caption's live key-rejected fold — a live `third_party_broken`
+/// (key-rejected) sibling is broken, so the walk skips it and the hint rides
+/// the next clear member. Removing the fold lets the walk name the rejected
+/// member. Whole row by equality.
+#[test]
+fn the_projected_switch_skips_a_live_key_rejected_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = profile("alpha", 95.0, 94.0, 3600);
+    let mut bravo = third_party_profile(10.0, 10.0);
+    bravo.name = "bravo".into();
+    let fp = crate::usage::profile_credential_fingerprint(&bravo).expect("fingerprint");
+    let c = profile("charlie", 95.0, 10.0, 3600);
+    let config = config_with(
+        vec![a, bravo, c],
+        Some("alpha"),
+        vec!["alpha", "bravo", "charlie"],
+    );
+    let mut app = App::new(config);
+    seed_5h(&mut app, "alpha", 94.0);
+    seed_5h(&mut app, "charlie", 10.0);
+    seed_heavy_burn(&mut app, "alpha");
+    #[allow(clippy::unwrap_used, reason = "test mutex poisoning is unrecoverable")]
+    {
+        // bravo's provider leg: a clear 5h bar + Fresh status, so removing the
+        // key-rejected fold would make the walk pick it.
+        app.third_party_usage_store
+            .lock()
+            .unwrap()
+            .insert("bravo".to_string(), tp_bar(10.0));
+        app.third_party_status
+            .lock()
+            .unwrap()
+            .insert("bravo".to_string(), crate::usage::FetchStatus::Fresh);
+        app.third_party_broken
+            .lock()
+            .unwrap()
+            .insert("bravo".to_string(), fp);
+        app.usage_status
+            .lock()
+            .unwrap()
+            .insert("alpha".to_string(), crate::usage::FetchStatus::Fresh);
+        app.usage_status
+            .lock()
+            .unwrap()
+            .insert("charlie".to_string(), crate::usage::FetchStatus::Fresh);
+    }
+    let lines = fallback_flow_lines(&app, 120).0;
+    assert_eq!(
+        hinted_row_text(&lines),
+        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%  ↲ ~6s",
+        "the caption skips the live key-rejected sibling and names the clear one"
     );
 }

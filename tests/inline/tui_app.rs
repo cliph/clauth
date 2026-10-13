@@ -31031,51 +31031,6 @@ mod usage_picker {
         );
     }
 
-    /// `burn_rate_for` refuses a hybrid's OAuth burn history, so
-    /// the Overview ETA and the startup one-shot never pair the OAuth series
-    /// with the provider window (maintainer ruling 2026-09-10).
-    #[test]
-    fn a_hybrids_burn_rate_is_none_despite_its_oauth_history() {
-        let _home = crate::testutil::HomeSandbox::new();
-        let name = ProfileName::from("h");
-        let mut p = crate::testutil::blank_profile(&name);
-        p.credentials = Some(creds());
-        p.base_url = Some("https://example.com".into());
-        p.api_key = Some("key".into());
-        assert!(
-            p.usage_cache_is_third_party(),
-            "fixture classifies third-party"
-        );
-        let now = crate::usage::now_ms();
-        // A monotonic climb to the current 60%, so no reset boundary slices the
-        // series and the in-memory rate actually computes.
-        let series = vec![
-            (now - 360_000, oauth(20.0)),
-            (now - 240_000, oauth(35.0)),
-            (now - 120_000, oauth(50.0)),
-        ];
-        let mut app = app_with(vec![p.clone()]);
-        app.history_cache.insert("h".into(), series.clone());
-        assert_eq!(
-            app.burn_rate_for(&p, &oauth(60.0)),
-            None,
-            "a hybrid's OAuth burn history must not pair with its provider window"
-        );
-
-        // Control: the same series on a pure OAuth profile yields a rate, so
-        // the hybrid `None` is the guard, not empty history.
-        let o_name = ProfileName::from("o");
-        let mut o = crate::testutil::blank_profile(&o_name);
-        o.credentials = Some(creds());
-        assert!(!o.usage_cache_is_third_party(), "control classifies OAuth");
-        let mut oauth_app = app_with(vec![o.clone()]);
-        oauth_app.history_cache.insert("o".into(), series);
-        assert!(
-            oauth_app.burn_rate_for(&o, &oauth(60.0)).is_some(),
-            "control: an OAuth profile pairs its own history"
-        );
-    }
-
     /// `apply_usage`'s own contract: a poisoned store lock keeps the prior
     /// reading rather than blanking it.
     #[test]
@@ -31214,7 +31169,7 @@ mod usage_picker {
     }
 
     /// The startup one-shot's rate step refuses a hybrid's OAuth burn history:
-    /// its `Profile.usage` is the provider windows, so no cross-pool projection
+    /// its store reading is the provider windows, so no cross-pool projection
     /// reaches `auto_switch_if_needed` (maintainer ruling 2026-09-10).
     #[test]
     fn the_startup_one_shots_rate_step_refuses_a_hybrid() {
@@ -31237,10 +31192,308 @@ mod usage_picker {
         ];
         let mut app = app_with(vec![p.clone()]);
         app.history_cache.insert("h".into(), series);
+        let (_fresh, rate) = app.active_bootstrap_state();
         assert_eq!(
-            app.startup_rate(&p),
-            None,
+            rate, None,
             "the startup rate step refuses a hybrid's OAuth burn history"
         );
     }
+}
+
+// ── the startup one-shot now runs the scheduler walk (ruling: one walk) ──────
+
+/// Drive the startup one-shot tail over a sandbox-held `App`: stand the
+/// refresher down, post `BootstrapDone`, and drain it (which calls
+/// `finish_bootstrap` → lease acquire → the one-shot).
+fn drive_startup_one_shot(app: &mut App) {
+    app.shutting_down.store(true, Ordering::SeqCst);
+    app.startup_sender
+        .send(super::StartupSignal::BootstrapDone)
+        .expect("send bootstrap signal");
+    super::drain_startup_signals(app);
+}
+
+/// K3: the startup one-shot returns home. A healthy active that has drifted off
+/// the preferred member walks back the instant the preferred reads clear AND
+/// fresh — the return-to-preferred pass the deleted UI one-shot never had.
+#[test]
+fn bootstrap_one_shot_returns_home_to_a_clear_fresh_preferred() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    let mk = |name: &str, preferred: bool| {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(creds_ra(&format!("rt-{name}"), &format!("at-{name}")));
+        p.preferred = preferred;
+        save_profile(&p).expect("save profile");
+        p
+    };
+    let worker = mk("worker", false);
+    let home = mk("home", true);
+    write_live_creds(worker.credentials.as_ref().expect("worker creds"));
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("worker".into()),
+            profiles: vec!["worker".into(), "home".into()],
+            fallback_chain: vec!["worker".into(), "home".into()],
+            ..AppState::default()
+        },
+        profiles: vec![worker, home],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let mut app = App::new(config);
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    {
+        let mut store = app.usage_store.lock().expect("usage_store poisoned");
+        store.insert(
+            "worker".to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(40.0)),
+                ..UsageInfo::default()
+            },
+        );
+        store.insert(
+            "home".to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(10.0)),
+                ..UsageInfo::default()
+            },
+        );
+        let mut status = app.usage_status.lock().expect("usage_status poisoned");
+        status.insert("worker".to_string(), FetchStatus::Fresh);
+        status.insert("home".to_string(), FetchStatus::Fresh);
+    }
+    drive_startup_one_shot(&mut app);
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("home"),
+        "a healthy drifted active must walk home at startup"
+    );
+    assert_eq!(
+        toast_bodies(&app),
+        vec!["returned to preferred account 'home'".to_string()],
+        "the return home announces itself"
+    );
+}
+
+/// K4: a startup one-shot on a switch-grade kick-rejected active whose usage
+/// reads idle walks away — the kick-rejected bypass the deleted one-shot never
+/// had (it stayed put one cadence).
+#[test]
+fn bootstrap_one_shot_leaves_a_kick_rejected_active() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    let mk = |name: &str| {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(creds_ra(&format!("rt-{name}"), &format!("at-{name}")));
+        save_profile(&p).expect("save profile");
+        p
+    };
+    let a = mk("alpha");
+    let b = mk("bravo");
+    write_live_creds(a.credentials.as_ref().expect("alpha creds"));
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("alpha".into()),
+            profiles: vec!["alpha".into(), "bravo".into()],
+            fallback_chain: vec!["alpha".into(), "bravo".into()],
+            ..AppState::default()
+        },
+        profiles: vec![a, b],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    crate::testutil::register_names(&["alpha", "bravo"]);
+    // The one-shot reads the kick block off the store the bootstrap seeded from
+    // disk (`sync_kick_blocks_from_cache`), so write the cache file, not the map.
+    let now = crate::usage::now_epoch_secs();
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("alpha"),
+        crate::profile_cache::KICK_BLOCK_CACHE_FILE,
+        &crate::usage::KickBlock {
+            streak: 2,
+            rejected: true,
+            until: Some(now + 3600),
+            next_retry: now + 3600,
+        },
+    );
+    let mut app = App::new(config);
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    {
+        let mut store = app.usage_store.lock().expect("usage_store poisoned");
+        store.insert(
+            "alpha".to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(10.0)),
+                ..UsageInfo::default()
+            },
+        );
+        store.insert(
+            "bravo".to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(10.0)),
+                ..UsageInfo::default()
+            },
+        );
+        let mut status = app.usage_status.lock().expect("usage_status poisoned");
+        status.insert("alpha".to_string(), FetchStatus::Fresh);
+        status.insert("bravo".to_string(), FetchStatus::Fresh);
+    }
+    drive_startup_one_shot(&mut app);
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("bravo"),
+        "a kick-rejected active must be walked away from at startup"
+    );
+}
+
+/// K5: a startup one-shot on a durably key-rejected third-party active still
+/// walks away — the durable verdict survives the one-shot's lack of a live
+/// `ThirdPartyBroken` set.
+#[test]
+fn bootstrap_one_shot_leaves_a_durably_key_rejected_third_party_active() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    crate::testutil::register_names(&["alpha", "bravo"]);
+    let mut a = Profile::new("alpha".to_string(), None, None);
+    a.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    a.api_key = Some("alpha-key".to_string());
+    a.provider = crate::providers::Provider::from_base_url(a.base_url.as_deref().unwrap());
+    save_profile(&a).expect("save alpha");
+    let fp = crate::usage::profile_credential_fingerprint(&a).expect("fingerprint");
+    crate::profile_cache::write_auth_expired(&a.name, fp);
+    let mut b = Profile::new("bravo".to_string(), None, None);
+    b.credentials = Some(creds_ra("rt-bravo", "at-bravo"));
+    save_profile(&b).expect("save bravo");
+    write_live_creds(b.credentials.as_ref().expect("bravo creds"));
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("alpha".into()),
+            profiles: vec!["alpha".into(), "bravo".into()],
+            fallback_chain: vec!["alpha".into(), "bravo".into()],
+            ..AppState::default()
+        },
+        profiles: vec![a, b],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let mut app = App::new(config);
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    {
+        // Ascending rank order: third_party_status (280) < usage_store (300) < usage_status (350).
+        let mut tp_status = app
+            .third_party_status
+            .lock()
+            .expect("third_party_status poisoned");
+        tp_status.insert("alpha".to_string(), FetchStatus::Fresh);
+        let mut store = app.usage_store.lock().expect("usage_store poisoned");
+        store.insert(
+            "bravo".to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(10.0)),
+                ..UsageInfo::default()
+            },
+        );
+        let mut status = app.usage_status.lock().expect("usage_status poisoned");
+        status.insert("bravo".to_string(), FetchStatus::Fresh);
+    }
+    drive_startup_one_shot(&mut app);
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("bravo"),
+        "a durably key-rejected active must be walked away from at startup"
+    );
+}
+
+/// M2: the startup one-shot feeds its IN-MEMORY burn rate into the walk. A
+/// burn-aware active below its static threshold (94%) with a heavy
+/// `history_cache` climb and NO disk history projects past the cap and switches;
+/// dropping the rate feed (`Supplied(None)`) falls back to the static threshold
+/// and stays put — the ruling's "pass its in-memory burn rate in" would ship
+/// green otherwise.
+#[test]
+fn bootstrap_one_shot_feeds_its_in_memory_burn_rate() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    let mk = |name: &str| {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(creds_ra(&format!("rt-{name}"), &format!("at-{name}")));
+        save_profile(&p).expect("save profile");
+        p
+    };
+    let a = mk("alpha");
+    let b = mk("bravo");
+    write_live_creds(a.credentials.as_ref().expect("alpha creds"));
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("alpha".into()),
+            profiles: vec!["alpha".into(), "bravo".into()],
+            fallback_chain: vec!["alpha".into(), "bravo".into()],
+            burn_aware_switching: true,
+            burn_switch_floor_pct: Some(90.0),
+            ..AppState::default()
+        },
+        profiles: vec![a, b],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let mut app = App::new(config);
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    {
+        let mut store = app.usage_store.lock().expect("usage_store poisoned");
+        store.insert(
+            "alpha".to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(94.0)),
+                ..UsageInfo::default()
+            },
+        );
+        store.insert(
+            "bravo".to_string(),
+            UsageInfo {
+                five_hour: Some(boot_window(10.0)),
+                ..UsageInfo::default()
+            },
+        );
+        let mut status = app.usage_status.lock().expect("usage_status poisoned");
+        status.insert("alpha".to_string(), FetchStatus::Fresh);
+        status.insert("bravo".to_string(), FetchStatus::Fresh);
+    }
+    // Heavy in-memory climb, no `usage_history.jsonl` on disk — the rate the
+    // one-shot projects from exists only in `history_cache`.
+    let now = crate::usage::now_ms();
+    let history = |pct: f64| UsageInfo {
+        five_hour: Some(boot_window(pct)),
+        ..UsageInfo::default()
+    };
+    app.history_cache.insert(
+        "alpha".to_string(),
+        vec![
+            (now - 360_000, history(36.0)),
+            (now - 240_000, history(56.0)),
+            (now - 120_000, history(76.0)),
+        ],
+    );
+    drive_startup_one_shot(&mut app);
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("bravo"),
+        "the burn-aware one-shot projects the active past its threshold from the in-memory rate"
+    );
+}
+
+/// M3: the startup one-shot is a switch DECISION, so it runs only when THIS
+/// instance holds the fetch lease (#27). Another instance holding it owns every
+/// switch decision; a Fresh maxed active here must stay put with no toast —
+/// removing the lease gate would run the one-shot and race the fetcher.
+#[test]
+fn bootstrap_one_shot_stands_down_when_another_instance_holds_the_fetch_lease() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // Another instance wins the lease first; its `File` must stay alive so the
+    // flock stays held for the rest of the test.
+    let other = crate::daemon::FetchLease::new();
+    assert!(other.acquire(), "the first instance wins the lease");
+    let app = bootstrap_app(&_home, FetchStatus::Fresh);
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some(BOOT_SPENT),
+        "a non-fetcher must not run the startup switch"
+    );
+    assert!(toast_bodies(&app).is_empty(), "no switch means no toast");
 }

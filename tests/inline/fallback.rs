@@ -1,7 +1,7 @@
-//! Behaviour tests for `next_target` — the fallback-chain target picker.
+//! Behaviour tests for the fallback-chain target picker (`next_auto_switch_target`).
 //!
 //! Tests stay hermetic: no filesystem I/O, no `switch_profile`. All scenarios
-//! construct an in-memory `AppConfig` and assert on `next_target`'s return value.
+//! construct an in-memory `AppConfig` and assert on the walk's return value.
 //!
 //! Issue #8 follow-up: `Profile::last_resort` replaced the old `threshold >=
 //! 100.0` sentinel as the chain-walk terminal-stop marker. Several scenarios
@@ -117,8 +117,9 @@ fn mark_disabled(mut p: Profile) -> Profile {
     p
 }
 
-/// Marks a profile's last usage read as live — the UI twin's freshness input.
-/// The snapshot twin carries the same judgment on `ChainSnapshot::fresh`.
+/// Marks a profile's last usage read as live — the freshness input
+/// [`walk_config`] folds into `ChainSnapshot::fresh` (the same fill the
+/// scheduler's scan runs from the `StatusStore`).
 fn mark_fresh(mut p: Profile) -> Profile {
     p.fetch_status = Some(FetchStatus::Fresh);
     p
@@ -189,7 +190,7 @@ fn all_maxed_sinks_no_switch() {
         ],
         "a",
     );
-    assert_eq!(next_target(&config, None, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new()), None);
 }
 
 // Active (unmarked, threshold 95) at 100%; B is marked last_resort at an 80%
@@ -205,7 +206,7 @@ fn non_sink_active_migrates_to_sink_once() {
         "a",
     );
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("b".to_string()))
     );
 }
@@ -221,7 +222,7 @@ fn sink_active_maxed_stays_put() {
         ],
         "b",
     );
-    assert_eq!(next_target(&config, None, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new()), None);
 }
 
 // Active marked last_resort (80% threshold, maxed), B has headroom (95% @
@@ -237,7 +238,7 @@ fn sink_active_switches_to_member_with_headroom() {
         "a",
     );
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("b".to_string()))
     );
 }
@@ -252,7 +253,7 @@ fn no_sink_available_returns_none() {
         ],
         "a",
     );
-    assert_eq!(next_target(&config, None, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new()), None);
 }
 
 // ── issue #8 follow-up: threshold no longer implies last_resort ─────────────
@@ -273,7 +274,7 @@ fn unmarked_hundred_threshold_active_no_longer_acts_as_sink() {
     );
     config.state.switch_off_when_spent = true;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::Off)
     );
 }
@@ -293,7 +294,7 @@ fn wrap_off_switches_off_when_unmarked_hundred_threshold_member_present() {
     );
     config.state.switch_off_when_spent = true;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::Off)
     );
 }
@@ -320,6 +321,36 @@ fn store_with_infos(entries: Vec<(&str, UsageInfo)>) -> UsageStore {
         .map(|(name, info)| (name.to_string(), info))
         .collect();
     Arc::new(RankedMutex::new(map))
+}
+
+/// A `UsageStore` seeded from the profiles' `Profile.usage` fields — the port
+/// bridge for the UI-walk scenarios while `Profile.usage` still exists (commit
+/// 2b deletes the field and these tests die with it).
+fn store_from_config(config: &AppConfig) -> UsageStore {
+    let map: HashMap<String, UsageInfo> = config
+        .profiles
+        .iter()
+        .filter_map(|p| p.usage.as_ref().map(|u| (p.name.to_string(), u.clone())))
+        .collect();
+    Arc::new(RankedMutex::new(map))
+}
+
+/// Run the scheduler walk over an `AppConfig` built the way the config-side
+/// scenarios build it: snapshot the chain, seed the store from `Profile.usage`,
+/// fold `fetch_status == Fresh` into `snapshot.fresh` (the store twin of
+/// `mark_fresh`), and union the key-rejected set into `broken` (the scan's
+/// fold, which `snapshot_chain` alone leaves out).
+fn walk_config(config: &AppConfig, key_rejected: &HashSet<ProfileName>) -> Option<SwitchAction> {
+    let mut snap = snapshot_chain(config, key_rejected).expect("snapshot");
+    snap.broken.extend(key_rejected.iter().cloned());
+    snap.fresh = config
+        .profiles
+        .iter()
+        .filter(|p| p.fetch_status == Some(FetchStatus::Fresh))
+        .map(|p| p.name.clone())
+        .collect();
+    let store = store_from_config(config);
+    next_auto_switch_target(&snap, &store)
 }
 
 #[test]
@@ -564,7 +595,7 @@ fn auto_switch_sink_loop_guard_holds() {
     assert_eq!(next_auto_switch_target(&snap, &store), None);
 }
 
-// Parity with `next_target`'s decoupling on the snapshot walk: an unmarked
+// Parity with the walk's decoupling on the snapshot path: an unmarked
 // threshold-100 member is a late switch point, never a sink — with everyone
 // exhausted and nothing marked, wrap-off switches off instead of parking.
 #[test]
@@ -621,8 +652,8 @@ fn auto_switch_missing_util_is_not_exhausted() {
 
 /// An unresolvable name in the chain (no profile on disk, i.e. a hand-edited
 /// `state.json` or a profile that failed to load) must not be a switch candidate
-/// for the scheduler walk, lockstep with `next_target` which excludes it via
-/// `walk_excluded → p.is_none()`. The unresolvable non-active entry is dropped
+/// for the scheduler walk, which excludes it via `walk_excluded → p.is_none()`.
+/// The unresolvable non-active entry is dropped
 /// at snapshot build time, so it never reaches `next_auto_switch_target_with_usage`
 /// where the absence of a usage-store entry would misleadingly read as infinite
 /// headroom.
@@ -663,7 +694,7 @@ fn auto_switch_skips_unresolvable_chain_entry() {
 // When no member is marked last_resort and the whole chain is exhausted,
 // wrap-off turns off all accounts instead of staying put.
 
-// next_target: switch_off_when_spent on, no last_resort member, all exhausted → Off.
+// walk: switch_off_when_spent on, no last_resort member, all exhausted → Off.
 #[test]
 fn wrap_off_switches_off_when_chain_spent() {
     let mut config = config_with_chain(
@@ -675,12 +706,12 @@ fn wrap_off_switches_off_when_chain_spent() {
     );
     config.state.switch_off_when_spent = true;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::Off)
     );
 }
 
-// next_target: switch_off_when_spent on but a last_resort member exists (at an 80%
+// walk: switch_off_when_spent on but a last_resort member exists (at an 80%
 // threshold, not 100) → migrate there, not Off.
 #[test]
 fn wrap_off_prefers_sink_over_off() {
@@ -693,12 +724,12 @@ fn wrap_off_prefers_sink_over_off() {
     );
     config.state.switch_off_when_spent = true;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("b".to_string()))
     );
 }
 
-// next_target: switch_off_when_spent on but active still has headroom → no Off.
+// walk: switch_off_when_spent on but active still has headroom → no Off.
 #[test]
 fn wrap_off_skips_off_when_active_has_headroom() {
     let mut config = config_with_chain(
@@ -710,10 +741,10 @@ fn wrap_off_skips_off_when_active_has_headroom() {
     );
     config.state.switch_off_when_spent = true;
     // a at 50% < 95% → not exhausted → stay
-    assert_eq!(next_target(&config, None, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new()), None);
 }
 
-// next_target: same spent chain, switch_off_when_spent off → legacy None.
+// walk: same spent chain, switch_off_when_spent off → legacy None.
 #[test]
 fn wrap_off_disabled_stays_put() {
     let config = config_with_chain(
@@ -723,7 +754,7 @@ fn wrap_off_disabled_stays_put() {
         ],
         "a",
     );
-    assert_eq!(next_target(&config, None, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new()), None);
 }
 
 // ── soonest_resume ───────────────────────────────────────────────────────────
@@ -807,7 +838,7 @@ fn soonest_resume_none_when_one_member_recovered() {
 }
 
 // b's 5h window already reset — headroom again whatever its stale util says
-// (same wall-clock rule `find_recovered_member`/`is_exhausted` use).
+// (the same wall-clock rule `find_recovered_member` uses).
 #[test]
 fn soonest_resume_none_when_a_member_window_expired() {
     let config = config_with_chain(
@@ -984,14 +1015,14 @@ fn walk_order_config() -> AppConfig {
 #[test]
 fn walk_order_chain_default_picks_chain_position_and_soonest_picks_the_soonest_reset() {
     assert_eq!(
-        next_target(&walk_order_config(), None, &HashSet::new()),
+        walk_config(&walk_order_config(), &HashSet::new()),
         Some(SwitchAction::To("alpha".to_string())),
         "default (unset) keeps today's chain-position walk byte-identical"
     );
     let mut soonest = walk_order_config();
     soonest.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
     assert_eq!(
-        next_target(&soonest, None, &HashSet::new()),
+        walk_config(&soonest, &HashSet::new()),
         Some(SwitchAction::To("beta".to_string())),
         "soonest-weekly-reset lands on the member whose 7d window resets first"
     );
@@ -1022,7 +1053,7 @@ fn walk_order_soonest_ranks_a_member_with_no_weekly_reset_last() {
     );
     config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("beta".to_string())),
         "a cold member's unknown reset ranks last, not soonest"
     );
@@ -1049,7 +1080,7 @@ fn walk_order_soonest_ties_keep_chain_position() {
     );
     config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("alpha".to_string())),
         "a tie on the parsed instant keeps the earlier chain-order member"
     );
@@ -1090,7 +1121,7 @@ fn walk_order_soonest_never_reorders_across_the_accept_pass_ladder() {
     config.state.spend_budget_switching = true;
     config.state.walk_order = Some(WalkOrder::SoonestWeeklyReset);
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("beta".to_string())),
         "a clear member wins over a sooner-resetting spend-armed-only one"
     );
@@ -1141,12 +1172,12 @@ fn walk_order_soonest_recovery_orders_both_passes_unless_preferred_wins() {
     );
 }
 
-/// The scheduler twin's own walk-order pin: the same fixture as
+/// The snapshot walk's own walk-order pin: the same fixture as
 /// [`walk_order_chain_default_picks_chain_position_and_soonest_picks_the_soonest_reset`]
 /// driven through a frozen snapshot + usage map, so the daemon leg and the
-/// UI leg cannot drift on the mode.
+/// config-side leg cannot drift on the mode.
 #[test]
-fn walk_order_scheduler_twin_matches_the_ui_twin_in_both_directions() {
+fn walk_order_snapshot_walk_matches_the_config_walk_in_both_directions() {
     let member = |name: &str| ChainMember {
         name: name.into(),
         threshold: 95.0,
@@ -1195,7 +1226,7 @@ fn walk_order_scheduler_twin_matches_the_ui_twin_in_both_directions() {
     assert_eq!(
         next_auto_switch_target_for_test(&snap(WalkOrder::SoonestWeeklyReset), &usage),
         Some(SwitchAction::To("beta".to_string())),
-        "soonest-reset lands the scheduler twin on the soonest weekly reset"
+        "soonest-reset lands the snapshot walk on the soonest weekly reset"
     );
 }
 
@@ -1764,13 +1795,13 @@ fn headroom_snapshot(order: WalkOrder, chain: &[&str], fresh: &[&str]) -> ChainS
 fn walk_order_most_headroom_picks_the_least_used_week_not_the_next_slot() {
     let mut config = headroom_config(weekly_read(10.0, 80.0), weekly_read(10.0, 5.0));
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("alpha".to_string())),
         "chain mode takes the next slot"
     );
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("beta".to_string())),
         "the least-used week wins over the next slot"
     );
@@ -1781,7 +1812,7 @@ fn walk_order_most_headroom_breaks_a_weekly_tie_on_five_hour() {
     let mut config = headroom_config(weekly_read(60.0, 20.0), weekly_read(5.0, 20.0));
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("beta".to_string())),
         "the same week, so the emptier 5h window decides"
     );
@@ -1793,7 +1824,7 @@ fn walk_order_most_headroom_breaks_a_weekly_tie_on_five_hour() {
     let mut config = headroom_config(weekly_read(5.0, 20.0), lapsed_five);
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("beta".to_string())),
         "a 5h window that already reset reads as unused"
     );
@@ -1804,7 +1835,7 @@ fn walk_order_most_headroom_ties_keep_chain_position() {
     let mut config = headroom_config(weekly_read(10.0, 20.0), weekly_read(10.0, 20.0));
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("alpha".to_string())),
         "an all-equal pass keeps chain position"
     );
@@ -1816,7 +1847,7 @@ fn walk_order_most_headroom_never_ranks_an_excluded_member_in() {
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     config.state.auth_broken = vec![ProfileName::from("beta")];
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("alpha".to_string())),
         "an auth-broken member stays out however empty its week reads"
     );
@@ -1832,7 +1863,7 @@ fn walk_order_most_headroom_reads_a_lapsed_weekly_window_as_unused() {
     let mut config = headroom_config(weekly_read(10.0, 30.0), lapsed);
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("beta".to_string())),
         "a week that already rolled over is an unused week"
     );
@@ -1845,7 +1876,7 @@ fn walk_order_most_headroom_reads_an_absent_five_hour_window_as_unused() {
     let mut config = headroom_config(weekly_read(60.0, 20.0), seven_only);
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("beta".to_string())),
         "the same week, and a missing 5h window reads as unused, so beta wins the tie"
     );
@@ -1855,7 +1886,7 @@ fn walk_order_most_headroom_reads_an_absent_five_hour_window_as_unused() {
     let mut config = headroom_config(seven_only, weekly_read(0.0, 20.0));
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("alpha".to_string())),
         "a missing 5h window reads as exactly 0%, so the tie keeps chain position"
     );
@@ -1872,7 +1903,7 @@ fn walk_order_most_headroom_ranks_a_week_with_no_reset_yet_among_read_weeks() {
     let mut config = headroom_config(weekly_read(10.0, 30.0), fresh_week);
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("beta".to_string())),
         "a 0% week with no reset yet outranks a 30% week"
     );
@@ -1887,7 +1918,7 @@ fn walk_order_most_headroom_ranks_a_member_with_no_weekly_window_last() {
     let mut config = headroom_config(five_only, weekly_read(10.0, 97.0));
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("beta".to_string())),
         "a member with a read week outranks one with no weekly window"
     );
@@ -1920,7 +1951,7 @@ fn walk_order_most_headroom_never_reorders_across_the_accept_pass_ladder() {
     config.state.spend_budget_switching = true;
     config.state.walk_order = Some(WalkOrder::MostWeeklyHeadroom);
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("beta".to_string())),
         "a clear member wins over an emptier-week spend-armed-only one"
     );
@@ -2326,7 +2357,7 @@ fn auto_switch_ignores_expired_window_active() {
 
 // A chain member whose 100% window lapsed is a viable switch target again.
 #[test]
-fn next_target_accepts_member_with_expired_window() {
+fn walk_accepts_member_with_expired_window() {
     let config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
@@ -2339,7 +2370,7 @@ fn next_target_accepts_member_with_expired_window() {
         "a",
     );
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("b".into()))
     );
 }
@@ -2364,12 +2395,11 @@ fn auto_switch_wrap_off_disabled_stays_put() {
 // A member whose OAuth refresh is revoked/invalid (`AppState::auth_broken`) must
 // never be picked as a switch target — installing its dead token would log out
 // every running claude (Incident C). Excluded in the headroom pass AND the sink
-// pass, on both the config-side (`next_target`) and scheduler-side
-// (`next_auto_switch_target`) walks.
+// pass, on both the config-side and scheduler-side walks.
 
-// next_target: broken member with headroom is skipped; the next viable one wins.
+// walk: broken member with headroom is skipped; the next viable one wins.
 #[test]
-fn next_target_skips_broken_member_picks_next() {
+fn walk_skips_broken_member_picks_next() {
     let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted
@@ -2380,14 +2410,14 @@ fn next_target_skips_broken_member_picks_next() {
     );
     config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("c".into()))
     );
 }
 
-// next_target: the only non-active member is broken → nothing viable → None.
+// walk: the only non-active member is broken → nothing viable → None.
 #[test]
-fn next_target_returns_none_when_only_alternative_is_broken() {
+fn walk_returns_none_when_only_alternative_is_broken() {
     let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted
@@ -2396,7 +2426,7 @@ fn next_target_returns_none_when_only_alternative_is_broken() {
         "a",
     );
     config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
-    assert_eq!(next_target(&config, None, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new()), None);
 }
 
 // next_auto_switch_target: the scheduler-side walk skips broken members too
@@ -2425,7 +2455,7 @@ fn auto_switch_skips_broken_member_picks_next() {
 // other viable member, the chain switches OFF rather than installing the dead
 // sink's token.
 #[test]
-fn next_target_broken_sink_wrap_off_switches_off() {
+fn walk_broken_sink_wrap_off_switches_off() {
     let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted, not a sink
@@ -2436,7 +2466,7 @@ fn next_target_broken_sink_wrap_off_switches_off() {
     config.state.switch_off_when_spent = true;
     config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::Off)
     );
 }
@@ -2448,10 +2478,10 @@ fn next_target_broken_sink_wrap_off_switches_off() {
 // started there 403s. Treated like `broken`: skipped as a candidate on both
 // walks, and a canceled ACTIVE is itself a switch trigger.
 
-// next_target: a canceled member with idle-looking headroom is skipped; the
+// walk: a canceled member with idle-looking headroom is skipped; the
 // next viable member wins.
 #[test]
-fn next_target_skips_canceled_member_picks_next() {
+fn walk_skips_canceled_member_picks_next() {
     let config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted
@@ -2461,14 +2491,14 @@ fn next_target_skips_canceled_member_picks_next() {
         "a",
     );
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("c".into())),
     );
 }
 
-// next_target: the only alternative is canceled → nothing viable → None.
+// walk: the only alternative is canceled → nothing viable → None.
 #[test]
-fn next_target_returns_none_when_only_alternative_is_canceled() {
+fn walk_returns_none_when_only_alternative_is_canceled() {
     let config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
@@ -2476,7 +2506,7 @@ fn next_target_returns_none_when_only_alternative_is_canceled() {
         ],
         "a",
     );
-    assert_eq!(next_target(&config, None, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new()), None);
 }
 
 // next_auto_switch_target: the scheduler-side walk skips a canceled member too,
@@ -2510,10 +2540,10 @@ fn auto_switch_skips_canceled_member_picks_next() {
 // sink by either walk. Treated the same as `broken`/`canceled` by the walk,
 // but never surfaced as a chip reason here (render-only, a later pair's job).
 
-// next_target: chain [a, b(disabled), c] — b has headroom but is disabled, so
+// walk: chain [a, b(disabled), c] — b has headroom but is disabled, so
 // c (also headroom) is picked instead. Pins the exact spec scenario.
 #[test]
-fn next_target_skips_disabled_member_picks_next() {
+fn walk_skips_disabled_member_picks_next() {
     let config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted
@@ -2523,14 +2553,14 @@ fn next_target_skips_disabled_member_picks_next() {
         "a",
     );
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("c".into())),
     );
 }
 
-// next_target: the only alternative is disabled → nothing viable → None.
+// walk: the only alternative is disabled → nothing viable → None.
 #[test]
-fn next_target_returns_none_when_only_alternative_is_disabled() {
+fn walk_returns_none_when_only_alternative_is_disabled() {
     let config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
@@ -2538,14 +2568,14 @@ fn next_target_returns_none_when_only_alternative_is_disabled() {
         ],
         "a",
     );
-    assert_eq!(next_target(&config, None, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new()), None);
 }
 
 // A disabled member marked `last_resort` must never serve as the chain's
 // sink — active (not itself a sink) has nothing viable to migrate to, so the
 // walk returns None instead of parking on the disabled sink.
 #[test]
-fn next_target_disabled_last_resort_is_never_a_sink() {
+fn walk_disabled_last_resort_is_never_a_sink() {
     let config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted, not a sink
@@ -2557,7 +2587,7 @@ fn next_target_disabled_last_resort_is_never_a_sink() {
         ],
         "a",
     );
-    assert_eq!(next_target(&config, None, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new()), None);
 }
 
 // next_auto_switch_target: the scheduler-side walk skips a disabled member too
@@ -2590,7 +2620,7 @@ fn auto_switch_skips_disabled_member_picks_next() {
 // via `snapshot.chain.iter().position(|m| m.name == snapshot.active)`, and a
 // missing active means that `?` returns `None` every tick forever — no
 // candidate ever gets evaluated again. `disabled` is a candidate-only
-// exclusion (mirrors `next_target`'s skip closure, which never skips
+// exclusion (mirrors the walk's own skip closure, which never skips
 // `chain[i] == active`), never a reason to drop the active itself.
 #[test]
 fn auto_switch_disabled_active_still_evaluates_instead_of_wedging() {
@@ -2841,15 +2871,15 @@ fn a_reading_dead_member_remains_a_walk_target() {
     );
 }
 
-// Fresh-PREFERENCE walk, asserted on both twins in each direction. The UI twin
-// reads `Profile.fetch_status`, the snapshot twin reads `ChainSnapshot::fresh`
-// (filled by the scheduler's scan from the same `StatusStore` the ACTIVE gate
-// consults), so a drift between them fails here.
+// Fresh-PREFERENCE walk: `walk_config` folds `Profile.fetch_status == Fresh`
+// into `ChainSnapshot::fresh` (the same fill the scheduler's scan runs from the
+// `StatusStore` the ACTIVE gate consults), so the config-side scenarios drive
+// the one shared walk with no drift.
 
 // Two members have headroom and the one the walk reaches FIRST is stale: the
 // fresh member wins anyway, since pass 1a outranks walk order.
 #[test]
-fn next_target_prefers_fresh_member_over_earlier_stale_one() {
+fn walk_prefers_fresh_member_over_earlier_stale_one() {
     let config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
@@ -2859,7 +2889,7 @@ fn next_target_prefers_fresh_member_over_earlier_stale_one() {
         "a",
     );
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("c".to_string())),
         "b is reached first but its read is stale — the trusted c must win"
     );
@@ -2889,7 +2919,7 @@ fn auto_switch_prefers_fresh_member_over_earlier_stale_one() {
 // accepts it. Freshness may reorder the walk, never veto it — an exhausted
 // active must keep its escape (2026-06-28 target asymmetry).
 #[test]
-fn next_target_still_picks_a_stale_member_when_no_fresh_one_has_headroom() {
+fn walk_still_picks_a_stale_member_when_no_fresh_one_has_headroom() {
     let config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
@@ -2898,7 +2928,7 @@ fn next_target_still_picks_a_stale_member_when_no_fresh_one_has_headroom() {
         "a",
     );
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("b".to_string())),
         "freshness is a preference, not a gate: the stale escape must stay open"
     );
@@ -3272,7 +3302,7 @@ fn spend_room_refuses_when_used_is_unknown() {
 // paying member buys nothing and relinks live credentials every tick. Same loop
 // guard `last_resort` carries, for the same reason.
 #[test]
-fn next_target_does_not_hop_between_two_spend_armed_members() {
+fn walk_does_not_hop_between_two_spend_armed_members() {
     let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
@@ -3283,7 +3313,7 @@ fn next_target_does_not_hop_between_two_spend_armed_members() {
     );
     config.state.spend_budget_switching = true;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         None,
         "b is paying and still within budget: hopping to c gains nothing"
     );
@@ -3292,7 +3322,7 @@ fn next_target_does_not_hop_between_two_spend_armed_members() {
     // the chain on a paying account when someone can serve for nothing.
     config.profiles[2] = profile_with_util("c", Some(95.0), Some(10.0));
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("c".to_string())),
         "free quota always beats staying on a paying active"
     );
@@ -3324,7 +3354,7 @@ fn auto_switch_does_not_hop_between_two_spend_armed_members() {
     assert_eq!(
         next_auto_switch_target(&snap, &store),
         None,
-        "the scheduler must hold the same loop guard as the UI twin"
+        "the scheduler must hold the same loop guard"
     );
 }
 
@@ -3337,7 +3367,7 @@ fn auto_switch_does_not_hop_between_two_spend_armed_members() {
 // named for. Asserted at the steady state (the armed member IS active), which
 // is the tick the entry-side tests never reach.
 #[test]
-fn next_target_over_budget_active_switches_off_by_default() {
+fn walk_over_budget_active_switches_off_by_default() {
     let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
@@ -3353,7 +3383,7 @@ fn next_target_over_budget_active_switches_off_by_default() {
         "a spent budget halts by default"
     );
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::Off),
         "the ceiling must stop the spending, not merely gate entry to it"
     );
@@ -3361,7 +3391,7 @@ fn next_target_over_budget_active_switches_off_by_default() {
     // Still inside the budget → keeps working, which is the point of the knob.
     config.profiles[1].usage = Some(usage_spent_with_spend(spend_block(true, 1.0, Some(50.0))));
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         None,
         "under budget, stay and bill"
     );
@@ -3371,7 +3401,7 @@ fn next_target_over_budget_active_switches_off_by_default() {
 // nothing when free quota runs out and costs money when a budget does, so an
 // operator may want stay-on-active for one and switch-off-all for the other.
 #[test]
-fn next_target_over_budget_active_can_be_told_to_keep_billing() {
+fn walk_over_budget_active_can_be_told_to_keep_billing() {
     let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
@@ -3382,7 +3412,7 @@ fn next_target_over_budget_active_can_be_told_to_keep_billing() {
     config.state.spend_budget_switching = true;
     config.state.switch_off_when_budget_spent = false;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         None,
         "explicitly told to stay on a spent budget: keeps billing"
     );
@@ -3391,7 +3421,7 @@ fn next_target_over_budget_active_can_be_told_to_keep_billing() {
     // halts a chain out of QUOTA, and this chain is out of MONEY.
     config.state.switch_off_when_spent = true;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         None,
         "switch_off_when_spent must not halt an over-budget active that was told to stay"
     );
@@ -3400,7 +3430,7 @@ fn next_target_over_budget_active_can_be_told_to_keep_billing() {
 // A free parking spot beats halting: moving to the sink stops the billing
 // without signing anyone out, so the halt is the last resort, not the first.
 #[test]
-fn next_target_over_budget_active_parks_on_a_sink_before_halting() {
+fn walk_over_budget_active_parks_on_a_sink_before_halting() {
     let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
@@ -3411,7 +3441,7 @@ fn next_target_over_budget_active_parks_on_a_sink_before_halting() {
     );
     config.state.spend_budget_switching = true;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("c".to_string())),
         "park on the sink to stop billing rather than halting outright"
     );
@@ -3420,7 +3450,7 @@ fn next_target_over_budget_active_parks_on_a_sink_before_halting() {
 // The bit-identical guarantee at the halt gate: with the master toggle off, a
 // billing account over any ceiling must read `switch_off_when_spent` exactly like before.
 #[test]
-fn next_target_over_budget_halt_is_inert_with_the_toggle_off() {
+fn walk_over_budget_halt_is_inert_with_the_toggle_off() {
     let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
@@ -3430,14 +3460,14 @@ fn next_target_over_budget_halt_is_inert_with_the_toggle_off() {
     );
     assert!(!config.state.spend_budget_switching, "default is off");
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         None,
         "switch_off_when_spent off + toggle off → stay, exactly like before the budget existed"
     );
 
     config.state.switch_off_when_spent = true;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::Off),
         "switch_off_when_spent on → Off, decided by switch_off_when_spent alone"
     );
@@ -3604,7 +3634,7 @@ fn budget_spent_blocking_needs_5h_exhaustion_too() {
 // Everything is spent and one member is billing with room → the chain pays
 // rather than parking.
 #[test]
-fn next_target_picks_a_spend_armed_member_when_the_chain_is_spent() {
+fn walk_picks_a_spend_armed_member_when_the_chain_is_spent() {
     let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
@@ -3614,7 +3644,7 @@ fn next_target_picks_a_spend_armed_member_when_the_chain_is_spent() {
     );
     config.state.spend_budget_switching = true;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("b".to_string()))
     );
 }
@@ -3622,7 +3652,7 @@ fn next_target_picks_a_spend_armed_member_when_the_chain_is_spent() {
 // The bit-identical guard: the SAME fixture with the master toggle off must
 // behave exactly like today — nothing viable, so the walk stays put.
 #[test]
-fn next_target_spend_budget_off_never_spends() {
+fn walk_spend_budget_off_never_spends() {
     let config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
@@ -3631,13 +3661,13 @@ fn next_target_spend_budget_off_never_spends() {
         "a",
     );
     assert!(!config.state.spend_budget_switching, "default must be off");
-    assert_eq!(next_target(&config, None, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new()), None);
 }
 
 // Toggle on, ceiling $0 → identical to the toggle being off. Both halves of the
 // opt-in are required before a cent is spent.
 #[test]
-fn next_target_zero_ceiling_never_spends_even_with_the_toggle_on() {
+fn walk_zero_ceiling_never_spends_even_with_the_toggle_on() {
     let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
@@ -3646,13 +3676,13 @@ fn next_target_zero_ceiling_never_spends_even_with_the_toggle_on() {
         "a",
     );
     config.state.spend_budget_switching = true;
-    assert_eq!(next_target(&config, None, &HashSet::new()), None);
+    assert_eq!(walk_config(&config, &HashSet::new()), None);
 }
 
 // Free quota always beats paying, whatever the walk order says: c has headroom
 // and is reached LAST, b is spend-armed and reached first.
 #[test]
-fn next_target_subscription_headroom_beats_a_spend_armed_member() {
+fn walk_subscription_headroom_beats_a_spend_armed_member() {
     let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
@@ -3663,7 +3693,7 @@ fn next_target_subscription_headroom_beats_a_spend_armed_member() {
     );
     config.state.spend_budget_switching = true;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("c".to_string())),
         "a member with free quota must always win over one that costs money"
     );
@@ -3671,7 +3701,7 @@ fn next_target_subscription_headroom_beats_a_spend_armed_member() {
 
 // Pre-last-resort: paying to keep working outranks parking on a spent sink.
 #[test]
-fn next_target_spend_armed_member_outranks_last_resort_parking() {
+fn walk_spend_armed_member_outranks_last_resort_parking() {
     let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
@@ -3682,14 +3712,14 @@ fn next_target_spend_armed_member_outranks_last_resort_parking() {
     );
     config.state.spend_budget_switching = true;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("c".to_string()))
     );
 
     // Same chain, toggle off → the sink parks it, exactly like today.
     config.state.spend_budget_switching = false;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("b".to_string()))
     );
 }
@@ -3697,7 +3727,7 @@ fn next_target_spend_armed_member_outranks_last_resort_parking() {
 // ...and outranks wrap-off's halt: an operator who set a ceiling asked to keep
 // working, and Off stops every running claude.
 #[test]
-fn next_target_spend_armed_member_outranks_wrap_off() {
+fn walk_spend_armed_member_outranks_wrap_off() {
     let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
@@ -3708,14 +3738,14 @@ fn next_target_spend_armed_member_outranks_wrap_off() {
     config.state.switch_off_when_spent = true;
     config.state.spend_budget_switching = true;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("b".to_string()))
     );
 
     // Toggle off → wrap-off halts, exactly like today.
     config.state.spend_budget_switching = false;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::Off)
     );
 }
@@ -3730,7 +3760,7 @@ fn next_target_spend_armed_member_outranks_wrap_off() {
 // it before spend.
 
 #[test]
-fn next_target_serving_last_resort_sink_outranks_a_spend_armed_member() {
+fn walk_serving_last_resort_sink_outranks_a_spend_armed_member() {
     let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
@@ -3741,7 +3771,7 @@ fn next_target_serving_last_resort_sink_outranks_a_spend_armed_member() {
     );
     config.state.spend_budget_switching = true;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("b".to_string())),
         "a sink still serving for free must beat spending money"
     );
@@ -3750,7 +3780,7 @@ fn next_target_serving_last_resort_sink_outranks_a_spend_armed_member() {
 // The active-side facet: a serving-sink active is already parked free, so it
 // stays put rather than hopping to a billing sibling.
 #[test]
-fn next_target_serving_last_resort_active_stays_put_instead_of_paying() {
+fn walk_serving_last_resort_active_stays_put_instead_of_paying() {
     let mut config = config_with_chain(
         vec![
             mark_last_resort(weekly_soft_profile("a")),
@@ -3760,7 +3790,7 @@ fn next_target_serving_last_resort_active_stays_put_instead_of_paying() {
     );
     config.state.spend_budget_switching = true;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         None,
         "a serving-sink active never pays a sibling — it already serves free"
     );
@@ -3891,7 +3921,7 @@ fn auto_switch_subscription_headroom_beats_a_spend_armed_member() {
     );
 }
 
-// The store twin's steady state, in lockstep with `next_target`: an over-budget
+// The store walk's steady state: an over-budget
 // active halts on `switch_off_when_budget_spent`, and `switch_off_when_spent` does not answer for it.
 #[test]
 fn auto_switch_over_budget_active_switches_off_by_default() {
@@ -3918,7 +3948,7 @@ fn auto_switch_over_budget_active_switches_off_by_default() {
     assert_eq!(
         next_auto_switch_target(&snap, &store),
         Some(SwitchAction::Off),
-        "the scheduler must cap the spend exactly like the UI twin"
+        "the scheduler must cap the spend at the ceiling"
     );
 
     // Told to stay → keeps billing, and `switch_off_when_spent` must not override that.
@@ -4006,7 +4036,7 @@ fn auto_switch_broken_and_exhausted_active_still_wraps_off() {
 // base case migrates a→b; quarantining b makes the last-resort walk find
 // nothing.
 #[test]
-fn next_target_skips_broken_last_resort_member() {
+fn walk_skips_broken_last_resort_member() {
     let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)), // active, exhausted, not last_resort
@@ -4015,13 +4045,13 @@ fn next_target_skips_broken_last_resort_member() {
         "a",
     );
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("b".into())),
         "base case: the last-resort pass migrates to the sink"
     );
     config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         None,
         "a broken last_resort sink is excluded from the last-resort pass"
     );
@@ -4029,9 +4059,9 @@ fn next_target_skips_broken_last_resort_member() {
 
 // ── issue #8 follow-up b: burn-aware auto-switch (opt-in, default off) ─────
 //
-// `is_exhausted_projected`/`is_exhausted_active`/`is_exhausted_active_from_usage`
+// `is_exhausted_projected` and the ACTIVE-side check
 // only ever change the ACTIVE profile's own exhaustion decision; candidate
-// selection stays on the static `is_exhausted`/`is_exhausted_from_usage`
+// selection stays on the static store-side exhaustion check
 // tested above (unchanged by this section).
 
 #[test]
@@ -4148,92 +4178,20 @@ fn is_exhausted_projected_horizon_cap_tightens_the_margin() {
     ));
 }
 
-#[test]
-fn is_exhausted_active_mode_off_matches_static_is_exhausted() {
-    // Mode off must reproduce `is_exhausted` bit for bit — no divergence from
-    // today's static behavior regardless of what a rate would otherwise say.
-    let exhausted = profile_with_util("a", Some(95.0), Some(100.0));
-    let headroom = profile_with_util("a", Some(95.0), Some(50.0));
-    assert_eq!(
-        is_exhausted_active(
-            &exhausted,
-            false,
-            90_000,
-            None,
-            weekly_blocked(&exhausted, 98.0),
-            98.0,
-            90_000
-        ),
-        is_exhausted(&exhausted, 98.0)
-    );
-    assert_eq!(
-        is_exhausted_active(
-            &headroom,
-            false,
-            90_000,
-            None,
-            weekly_blocked(&headroom, 98.0),
-            98.0,
-            90_000
-        ),
-        is_exhausted(&headroom, 98.0)
-    );
-    assert!(is_exhausted_active(
-        &exhausted,
-        false,
-        90_000,
-        None,
-        weekly_blocked(&exhausted, 98.0),
-        98.0,
-        90_000
-    ));
-    assert!(!is_exhausted_active(
-        &headroom,
-        false,
-        90_000,
-        None,
-        weekly_blocked(&headroom, 98.0),
-        98.0,
-        90_000
-    ));
-}
+// The deleted ACTIVE-check unit (mode-off == static, no-rate ==
+// static) is covered on the surviving path by
+// `is_exhausted_projected_none_burn_falls_back_to_static_threshold`,
+// `walk_order_soonest_and_burn_aware_leave_each_other_identical` and
+// `burn_aware_never_holds_the_active_where_static_switches_on_both_walks`.
 
-// Burn-aware ON but no rate available (fresh profile / first tick, or the
-// caller's in-memory history is empty): falls back to the same static
-// comparison mode-off uses — never leaves an account uncovered for lack of
-// data. `is_exhausted_active` takes the rate as a parameter and never reads
-// disk itself (that's the caller's job — `App::active_burn_rate` in-memory on
-// the UI thread, `fallback::burn_rate_for_profile` on disk for the scheduler),
-// so this needs no sandboxed HOME.
-#[test]
-fn is_exhausted_active_burn_aware_falls_back_without_rate() {
-    let exhausted = profile_with_util("a", Some(95.0), Some(100.0));
-    let headroom = profile_with_util("a", Some(95.0), Some(50.0));
-    assert!(is_exhausted_active(
-        &exhausted,
-        true,
-        90_000,
-        None,
-        weekly_blocked(&exhausted, 98.0),
-        98.0,
-        90_000
-    ));
-    assert!(!is_exhausted_active(
-        &headroom,
-        true,
-        90_000,
-        None,
-        weekly_blocked(&headroom, 98.0),
-        98.0,
-        90_000
-    ));
-}
-
-// Same fallback, exercised through the full `next_target` entry point (wrap-off
-// path) rather than the `is_exhausted_active` unit — pins that mode-on with no
+// Same fallback, exercised through the full walk entry point (wrap-off
+// path) rather than the active-check unit — pins that mode-on with no
 // rate available agrees with mode-off all the way through the public walk.
 #[test]
-fn next_target_burn_aware_none_rate_falls_back_to_static_threshold() {
+fn burn_aware_none_rate_falls_back_to_static_threshold_via_the_walk() {
+    // The walk reads the burn rate from disk (no history here → no rate), so
+    // it needs a sandboxed HOME for that read.
+    let _home = crate::testutil::HomeSandbox::new();
     let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
@@ -4244,7 +4202,7 @@ fn next_target_burn_aware_none_rate_falls_back_to_static_threshold() {
     config.state.switch_off_when_spent = true;
     config.state.burn_aware_switching = true;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::Off),
         "no rate available → static 100% >= 95% threshold fires, same as mode off"
     );
@@ -4265,19 +4223,16 @@ fn write_history(name: &str, entries: &[(u64, UsageInfo)]) {
     std::fs::write(&path, body).expect("write history");
 }
 
-// End-to-end proof that the UI-thread walk (`next_target`) and the
-// scheduler-side walk (`next_auto_switch_target`) agree, and that burn-aware
-// never holds the active where static would switch (the burn-floor regression):
-// a heavy burn climbs the active to 96%, over the 95% threshold, so static signs
-// everything out. Burn-aware with the default floor 98 once HELD here (96 < 98),
-// running the window longer than static; the static check now always applies, so
-// both walks switch off too.
+// End-to-end proof that burn-aware never holds the active where static would
+// switch (the burn-floor regression): a heavy burn climbs the active to 96%,
+// over the 95% threshold, so static signs everything out. Burn-aware with the
+// default floor 98 once HELD here (96 < 98), running the window longer than
+// static; the static check now always applies, so burn-aware switches off too.
 //
 // `b` is pinned exhausted (100%, no `last_resort`) so the headroom-walk and
 // last-resort-walk (unaffected by burn-aware mode by design) both come up empty
 // either way; the only thing that can move the outcome is the ACTIVE-only Off
-// decision — the wrap-off Off-check inside `next_target`, and the entry gate
-// inside `next_auto_switch_target`.
+// decision.
 #[test]
 fn burn_aware_never_holds_the_active_where_static_switches_on_both_walks() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -4312,19 +4267,10 @@ fn burn_aware_never_holds_the_active_where_static_switches_on_both_walks() {
     );
     static_config.state.switch_off_when_spent = true;
     assert_eq!(
-        next_target(&static_config, None, &HashSet::new()),
+        walk_config(&static_config, &HashSet::new()),
         Some(SwitchAction::Off),
         "static mode: 96% is over the 95% threshold → Off"
     );
-
-    // `next_target` takes the burn rate as a parameter — it never reads disk
-    // itself. Source it the same way `burn_rate_for_profile` does here,
-    // standing in for the caller's in-memory `history_cache` lookup
-    // (`App::active_burn_rate`) that feeds the real UI-thread call site.
-    let active_window = window(96.0, Some(live_reset()));
-    let rate = burn_rate_for_profile(&crate::profile::ProfileName::from("a"), &active_window)
-        .expect("rate computed from history");
-    assert!((rate - 600.0).abs() < 1.0, "expected ~600 %/h, got {rate}");
 
     // Burn-aware: 96% is over the 95% threshold, so the static check inside the
     // projection fires and the active switches Off — same as mode-off. Before the
@@ -4341,7 +4287,7 @@ fn burn_aware_never_holds_the_active_where_static_switches_on_both_walks() {
     config.state.burn_aware_switching = true;
     config.state.refresh_interval_ms = 90_000;
     assert_eq!(
-        next_target(&config, Some(rate), &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::Off),
         "burn-aware agrees with static: 96% ≥ 95% threshold → Off"
     );
@@ -4356,6 +4302,147 @@ fn burn_aware_never_holds_the_active_where_static_switches_on_both_walks() {
         next_auto_switch_target(&snap, &store),
         Some(SwitchAction::Off),
         "scheduler-side walk agrees: burn-aware switches off at 96%, same as static"
+    );
+}
+
+/// K9: the walk uses the caller-supplied in-memory burn rate, never the disk
+/// history. The active sits at 94% (under the 95% threshold); a heavy supplied
+/// rate projects past the cap and switches off, while the same snapshot over
+/// the disk history's light climb stays put.
+#[test]
+fn the_walk_prefers_the_caller_supplied_burn_rate_over_disk_history() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let member = |name: &str| ChainMember {
+        name: name.into(),
+        threshold: 95.0,
+        last_resort: false,
+        preferred: false,
+        max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
+    };
+    let snap = ChainSnapshot {
+        active: "a".into(),
+        chain: vec![member("a"), member("b")],
+        switch_off_when_spent: true,
+        broken: vec![],
+        burn_aware: true,
+        walk_order: WalkOrder::Chain,
+        interval_ms: 90_000,
+        burn_floor_pct: 90.0,
+        burn_horizon_cap_ms: 90_000,
+        spend_budget: false,
+        switch_off_when_budget_spent: false,
+        kick_rejected: vec![],
+        reading_dead: vec![],
+        fresh: vec![],
+    };
+    let usage = HashMap::from([
+        (
+            "a".to_string(),
+            usage_info(Some(window(94.0, Some(live_reset())))),
+        ),
+        (
+            "b".to_string(),
+            usage_info(Some(window(100.0, Some(live_reset())))),
+        ),
+    ]);
+    // A heavy supplied rate (1200 %/h) projects 94 → 124 over the 90s interval.
+    assert_eq!(
+        next_auto_switch_target_with_usage(
+            &snap,
+            &usage,
+            &HashSet::new(),
+            ActiveBurnRate::Supplied(Some(1200.0)),
+        ),
+        Some(SwitchAction::Off),
+        "the in-memory rate must decide, not the disk history"
+    );
+
+    // The disk history carries only a light climb (~20 %/h): the FromDisk arm
+    // reads it, the projection stays under the cap, and the active stays put.
+    let now = crate::usage::now_ms();
+    write_history(
+        "a",
+        &[
+            (
+                now - 360_000,
+                usage_info(Some(window(92.0, Some(live_reset())))),
+            ),
+            (
+                now - 240_000,
+                usage_info(Some(window(93.0, Some(live_reset())))),
+            ),
+            (
+                now - 120_000,
+                usage_info(Some(window(94.0, Some(live_reset())))),
+            ),
+        ],
+    );
+    assert_eq!(
+        next_auto_switch_target_with_usage(
+            &snap,
+            &usage,
+            &HashSet::new(),
+            ActiveBurnRate::FromDisk,
+        ),
+        None,
+        "the disk history's light climb must not project past the cap"
+    );
+}
+
+/// K9: a third-party-classified active never projects its provider window from
+/// the OAuth burn history — the static threshold decides even with a heavy
+/// supplied rate.
+#[test]
+fn a_third_party_active_never_projects_its_burn() {
+    let member = |name: &str| ChainMember {
+        name: name.into(),
+        threshold: 95.0,
+        last_resort: false,
+        preferred: false,
+        max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
+    };
+    let snap = ChainSnapshot {
+        active: "a".into(),
+        chain: vec![member("a"), member("b")],
+        switch_off_when_spent: true,
+        broken: vec![],
+        burn_aware: true,
+        walk_order: WalkOrder::Chain,
+        interval_ms: 90_000,
+        burn_floor_pct: 90.0,
+        burn_horizon_cap_ms: 90_000,
+        spend_budget: false,
+        switch_off_when_budget_spent: false,
+        kick_rejected: vec![],
+        reading_dead: vec![],
+        fresh: vec![],
+    };
+    let usage = HashMap::from([
+        (
+            "a".to_string(),
+            usage_info(Some(window(94.0, Some(live_reset())))),
+        ),
+        (
+            "b".to_string(),
+            usage_info(Some(window(100.0, Some(live_reset())))),
+        ),
+    ]);
+    let third_party_names: HashSet<ProfileName> = HashSet::from([ProfileName::from("a")]);
+    assert_eq!(
+        next_auto_switch_target_with_usage(
+            &snap,
+            &usage,
+            &third_party_names,
+            ActiveBurnRate::Supplied(Some(1200.0)),
+        ),
+        None,
+        "a third-party active's provider window must not pair with OAuth burn history"
     );
 }
 
@@ -4400,71 +4487,17 @@ fn weekly_dead_member_is_never_a_fallback_target() {
         "a",
     );
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("c".into()))
     );
 }
 
-#[test]
-fn weekly_dead_active_is_exhausted_despite_idle_5h() {
-    // The mirror direction: an ACTIVE account whose week is spent must count
-    // exhausted — its 5h window never grows again (requests are refused), so
-    // the 5h trigger alone would leave the daemon parked on a dead account.
-    let p = weekly_dead_profile("a");
-    assert!(is_exhausted(&p, 98.0));
-    // Hard block trumps both burn-aware modes (nothing left to project).
-    assert!(is_exhausted_active(
-        &p,
-        false,
-        90_000,
-        None,
-        weekly_blocked(&p, 98.0),
-        98.0,
-        90_000
-    ));
-    assert!(is_exhausted_active(
-        &p,
-        true,
-        90_000,
-        Some(5.0),
-        weekly_blocked(&p, 98.0),
-        98.0,
-        90_000
-    ));
-}
-
-#[test]
-fn weekly_soft_line_gates_below_it_and_lapsed_resets_renew() {
-    // The weekly side is a soft line at 98%, not a 100% hard cap (2026-07-12):
-    // an account riding 98%+ of its week bricks for DAYS the moment it tops
-    // out, so the switch must happen while there is still room to land it —
-    // waiting for the API to start refusing means dying mid-session.
-    let below = profile_with_usage(
-        "a",
-        Some(95.0),
-        Some(usage_both(None, Some(window(97.9, Some(live_reset()))))),
-    );
-    assert!(
-        !is_exhausted(&below, 98.0),
-        "97.9% weekly still has headroom"
-    );
-    let at_line = profile_with_usage(
-        "a",
-        Some(95.0),
-        Some(usage_both(None, Some(window(98.0, Some(live_reset()))))),
-    );
-    assert!(
-        is_exhausted(&at_line, 98.0),
-        "98% weekly counts as exhausted"
-    );
-    // A 7d window whose reset has PASSED is a renewed quota, not a block.
-    let renewed = profile_with_usage(
-        "a",
-        Some(95.0),
-        Some(usage_both(None, Some(window(100.0, Some(expired_reset()))))),
-    );
-    assert!(!is_exhausted(&renewed, 98.0));
-}
+// The deleted weekly-unit assertions (a weekly-dead
+// active counts exhausted, the soft line gates at 98 with lapsed resets
+// renewing) are covered on the surviving path by
+// `weekly_dead_member_is_never_a_fallback_target`,
+// `wrap_off_keys_on_the_hard_cap_in_the_store_walk_too` and
+// `weekly_line_is_configurable_chain_wide`.
 
 #[test]
 fn weekly_soft_exhausted_active_triggers_a_switch_despite_5h_headroom() {
@@ -4479,25 +4512,12 @@ fn weekly_soft_exhausted_active_triggers_a_switch_despite_5h_headroom() {
             Some(window(98.5, Some(live_reset()))),
         )),
     );
-    assert!(
-        is_exhausted(&active, 98.0),
-        "7d 98.5% triggers despite 5h 40%"
-    );
-    assert!(is_exhausted_active(
-        &active,
-        false,
-        90_000,
-        None,
-        weekly_blocked(&active, 98.0),
-        98.0,
-        90_000
-    ));
     let config = config_with_chain(
         vec![active, profile_with_util("b", Some(95.0), Some(10.0))],
         "a",
     );
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("b".into()))
     );
 }
@@ -4521,7 +4541,7 @@ fn weekly_soft_member_is_not_a_target() {
         "a",
     );
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("c".into()))
     );
 }
@@ -4637,13 +4657,13 @@ fn weekly_line_is_configurable_chain_wide() {
     let mut config = config_with_chain(mk(), "a");
     config.state.weekly_switch_threshold = Some(90.0);
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("c".into())),
         "at a 90 line, b's 7d 92% is exhausted — walk lands on c"
     );
     let default_line = config_with_chain(mk(), "a");
     assert_eq!(
-        next_target(&default_line, None, &HashSet::new()),
+        walk_config(&default_line, &HashSet::new()),
         Some(SwitchAction::To("b".into())),
         "at the 98 default, b's 7d 92% is headroom"
     );
@@ -4651,7 +4671,7 @@ fn weekly_line_is_configurable_chain_wide() {
     garbage.state.weekly_switch_threshold = Some(120.0);
     assert_eq!(garbage.state.weekly_switch_threshold_pct(), 98.0);
     assert_eq!(
-        next_target(&garbage, None, &HashSet::new()),
+        walk_config(&garbage, &HashSet::new()),
         Some(SwitchAction::To("b".into())),
         "an out-of-band hand-edit falls back to the default line"
     );
@@ -4681,7 +4701,7 @@ fn wrap_off_keys_on_the_weekly_hard_cap_not_the_soft_line() {
     );
     config.state.switch_off_when_spent = true;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         None,
         "a soft-blocked active with weekly room left must stay put"
     );
@@ -4698,7 +4718,7 @@ fn wrap_off_keys_on_the_weekly_hard_cap_not_the_soft_line() {
     let mut config = config_with_chain(vec![dead, weekly_soft_profile("b")], "a");
     config.state.switch_off_when_spent = true;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::Off)
     );
 }
@@ -4830,15 +4850,15 @@ fn both_windows(five: f64, seven: f64) -> UsageInfo {
     }
 }
 
-// `candidate_excluded` (the config-side skip every selection walk applies) and
-// `blocked_reason`'s dead-first rungs (`Disabled`/`Canceled`/`AuthBroken`) are
-// two hand-written ladders over one policy. A member the walk refuses as a
-// candidate is exactly one the chip marks dead-first; a member blocked only by
-// usage stays a walk candidate and carries a non-dead-first chip. This pins the
-// biconditional for each of the three current dead-first terms, so dropping or
-// re-gating one on either side reds here rather than drifting the chip off the
-// behaviour it describes. A brand-new exclusion class needs its own fixture
-// added below to be covered.
+// `candidate_excluded` (the dead-member predicate the reachability checks
+// share) and `blocked_reason`'s dead-first rungs
+// (`Disabled`/`Canceled`/`AuthBroken`) are two hand-written ladders over one
+// policy. A member the walk refuses as a candidate is exactly one the chip
+// marks dead-first; a member blocked only by usage stays a walk candidate and
+// carries a non-dead-first chip. This pins the biconditional for each of the
+// three current dead-first terms, so dropping or re-gating one on either side
+// reds here rather than drifting the chip off the behaviour it describes. A
+// brand-new exclusion class needs its own fixture added below to be covered.
 //
 // Holds only for a NON-active member: `blocked_reason`'s `Disabled` rung and
 // the walk's `== active` skip both special-case the active slot, so a healthy
@@ -5732,8 +5752,12 @@ fn next_auto_switch_target_ignores_store_mutation_after_snapshot() {
     }
 
     // Snapshot evaluation against the PRE-mutation clone: To(B) FREE.
-    let result_with_pre_snapshot =
-        super::next_auto_switch_target_with_usage(&snapshot, &pre_mutation, &HashSet::new());
+    let result_with_pre_snapshot = super::next_auto_switch_target_with_usage(
+        &snapshot,
+        &pre_mutation,
+        &HashSet::new(),
+        ActiveBurnRate::FromDisk,
+    );
     assert_eq!(
         result_with_pre_snapshot,
         Some(SwitchAction::To("b".to_string())),
@@ -6163,118 +6187,15 @@ fn blocked_reason_five_hour_outranks_scoped_spent() {
     ));
 }
 
-// ── fully_clear_target: the UI-thread twin of the scoped trigger's walk ──────
-
-#[test]
-fn fully_clear_target_skips_blocked_members_and_finds_the_clear_one() {
-    // b: scoped-blocked (skipped), c: auth-broken (skipped), d: clear (the
-    // pick). Exercised directly — this is the only walk `auto_switch_if_needed`
-    // runs for the scoped trigger.
-    let mut config = config_with_chain(
-        vec![
-            profile_with_usage("a", Some(95.0), Some(both_windows(20.0, 40.0))),
-            profile_with_usage(
-                "b",
-                Some(95.0),
-                Some(usage_with_scoped(
-                    5.0,
-                    30.0,
-                    vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
-                )),
-            ),
-            profile_with_usage("c", Some(95.0), Some(both_windows(5.0, 30.0))),
-            profile_with_usage("d", Some(95.0), Some(both_windows(5.0, 30.0))),
-        ],
-        "a",
-    );
-    config.state.auth_broken.push("c".into());
-    assert_eq!(
-        fully_clear_target(&config, 98.0, &HashSet::new()),
-        Some("d".to_string()),
-        "the walk must skip the scoped-blocked and broken members"
-    );
-}
-
-#[test]
-fn fully_clear_target_none_when_every_member_is_blocked() {
-    let config = config_with_chain(
-        vec![
-            profile_with_usage("a", Some(95.0), Some(both_windows(20.0, 40.0))),
-            profile_with_usage(
-                "b",
-                Some(95.0),
-                Some(usage_with_scoped(
-                    5.0,
-                    30.0,
-                    vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
-                )),
-            ),
-            // c: 5h over its threshold — exhausted, not fully clear.
-            profile_with_usage("c", Some(95.0), Some(both_windows(96.0, 30.0))),
-        ],
-        "a",
-    );
-    assert_eq!(fully_clear_target(&config, 98.0, &HashSet::new()), None);
-}
-
-#[test]
-fn fully_clear_target_skips_canceled_and_disabled_members() {
-    // b: canceled (idle-looking usage, skipped), c: disabled (skipped),
-    // d: clear (the pick). Its `skip` closure must mirror `next_target`'s —
-    // a canceled or disabled member sorting first must not shadow a genuinely
-    // clear one further down the chain.
-    let config = config_with_chain(
-        vec![
-            profile_with_usage("a", Some(95.0), Some(both_windows(20.0, 40.0))),
-            profile_with_usage("b", Some(95.0), Some(canceled_usage())),
-            mark_disabled(profile_with_usage(
-                "c",
-                Some(95.0),
-                Some(both_windows(5.0, 30.0)),
-            )),
-            profile_with_usage("d", Some(95.0), Some(both_windows(5.0, 30.0))),
-        ],
-        "a",
-    );
-    assert_eq!(
-        fully_clear_target(&config, 98.0, &HashSet::new()),
-        Some("d".to_string()),
-        "the walk must skip the canceled and disabled members"
-    );
-}
-
-// The scoped trigger's walk follows the walk-order mode like every other walk:
-// b is next in chain order, c's week resets soonest, d's week is least used.
-#[test]
-fn fully_clear_target_follows_every_walk_order() {
-    let read = |seven: f64, reset_secs: i64| {
-        usage_both(
-            Some(window(10.0, Some(live_reset()))),
-            Some(window(seven, Some(reset_in(reset_secs)))),
-        )
-    };
-    let mut config = config_with_chain(
-        vec![
-            profile_with_usage("a", Some(95.0), Some(both_windows(20.0, 40.0))),
-            profile_with_usage("b", Some(95.0), Some(read(80.0, 3 * 86_400))),
-            profile_with_usage("c", Some(95.0), Some(read(70.0, 2 * 3600))),
-            profile_with_usage("d", Some(95.0), Some(read(10.0, 4 * 86_400))),
-        ],
-        "a",
-    );
-    for (order, want) in [
-        (WalkOrder::Chain, "b"),
-        (WalkOrder::SoonestWeeklyReset, "c"),
-        (WalkOrder::MostWeeklyHeadroom, "d"),
-    ] {
-        config.state.walk_order = Some(order);
-        assert_eq!(
-            fully_clear_target(&config, 98.0, &HashSet::new()),
-            Some(want.to_string()),
-            "{order:?}"
-        );
-    }
-}
+// ── the scoped trigger's target walk (deleted, now inline in the core) ──────
+//
+// Deleted with the walk it tested; the scoped trigger now lives inside
+// `next_auto_switch_target_core` and is pinned by
+// `auto_switch_scoped_blocked_active_hops_to_fully_clear_member`,
+// `auto_switch_scoped_blocked_active_stays_put_when_no_fully_clear_member`,
+// `scoped_active_trigger_stays_parked_on_a_pinned_sink`, and the
+// `walk_order_soonest_*` ordering pins (the trigger's target walk uses the same
+// `ordered_walk`).
 
 #[test]
 fn scoped_gate_off_active_never_fires_the_scoped_hop() {
@@ -6329,7 +6250,7 @@ fn lapsed_scoped_window_never_blocks() {
 }
 
 #[test]
-fn next_target_prefers_fully_clear_member() {
+fn walk_prefers_fully_clear_member() {
     // UI-side twin of the tier-1 preference: B model-blocked, C clear.
     let mk = |name: &str, info: UsageInfo| profile_with_usage(name, Some(95.0), Some(info));
     let config = config_with_chain(
@@ -6348,7 +6269,7 @@ fn next_target_prefers_fully_clear_member() {
         "a",
     );
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("c".to_string())),
     );
 }
@@ -6613,13 +6534,13 @@ fn weekly_override_never_softens_the_hard_sink_and_halt_judgments() {
 }
 
 #[test]
-fn weekly_override_on_a_sink_never_makes_the_ui_twin_pay() {
-    // The UI-thread twin of the case above: a `last_resort` sink carrying a
+fn weekly_override_on_a_sink_never_makes_the_walk_pay() {
+    // The config-side walk of the case above: a `last_resort` sink carrying a
     // weekly override of 50 with its week at 98.5 (soft-blocked at its own
     // line, hard-clear, 5h idle) still serves every request for free. The
     // serving-sink pass must park there instead of paying the spend-armed
     // sibling — judging the sink at its member-resolved soft line would make
-    // `next_target` spend real money while `next_auto_switch_target` parks.
+    // the walk spend real money while it should park.
     let mut config = config_with_chain(
         vec![
             profile_with_util("a", Some(95.0), Some(100.0)),
@@ -6631,7 +6552,7 @@ fn weekly_override_on_a_sink_never_makes_the_ui_twin_pay() {
     config.profiles[1].weekly_threshold = Some(50.0);
     config.state.spend_budget_switching = true;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         Some(SwitchAction::To("b".to_string())),
         "a hard-clear sink parks free regardless of its soft-line override"
     );
@@ -6652,7 +6573,7 @@ fn weekly_override_on_a_sink_active_still_stays_put_over_paying() {
     config.profiles[0].weekly_threshold = Some(50.0);
     config.state.spend_budget_switching = true;
     assert_eq!(
-        next_target(&config, None, &HashSet::new()),
+        walk_config(&config, &HashSet::new()),
         None,
         "a serving-sink active stays parked free regardless of its override"
     );
@@ -6952,7 +6873,7 @@ fn a_rotation_the_store_could_not_keep_is_walked_around() {
 // `start_walk` reads usage off `profile_json::profile_windows` (the on-disk
 // `usage_cache.json`), never `Profile.usage` (which only the UI thread fills),
 // so these fixtures write the cache under a sandbox rather than the in-memory
-// field the pure `next_target` tests use.
+// field the walk tests use.
 
 fn start_walk_profile(name: &str) -> Profile {
     Profile::new(name.to_string(), None, None)
@@ -7637,11 +7558,11 @@ fn walk_excluded_rejects_a_key_rejected_member_not_a_console_lapse() {
     );
 }
 
-/// The startup one-shot and the Fallback-tab projection share `next_target`: an
+/// The startup one-shot and the Fallback-tab projection share the walk: an
 /// exhausted active with a key-rejected headroom sibling must not switch onto
 /// (or project) that sibling — the walk finds no target and holds the chain.
 #[test]
-fn next_target_never_picks_a_key_rejected_member() {
+fn the_walk_never_picks_a_key_rejected_member() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["b"]);
     let a = profile_with_util("a", None, Some(100.0));
@@ -7654,7 +7575,7 @@ fn next_target_never_picks_a_key_rejected_member() {
     let config = config_with_chain(vec![a, b], "a");
     let key_rejected = crate::fallback::durable_key_rejected(&config);
     assert_eq!(
-        next_target(&config, None, &key_rejected),
+        walk_config(&config, &key_rejected),
         None,
         "a key-rejected member must never be picked (or projected) as the switch target"
     );
@@ -7960,7 +7881,12 @@ fn a_hybrid_active_walks_on_its_provider_windows() {
 
     let usage = usage_snapshot_for_chain(&store, &tp_store, &third_party_names, &snap.chain);
     assert_eq!(
-        next_auto_switch_target_with_usage(&snap, &usage, &third_party_names),
+        next_auto_switch_target_with_usage(
+            &snap,
+            &usage,
+            &third_party_names,
+            ActiveBurnRate::FromDisk,
+        ),
         None,
         "a hybrid active with provider headroom must not switch on its stale OAuth reading"
     );
@@ -8032,7 +7958,12 @@ fn burn_aware_never_projects_a_hybrids_provider_window_from_its_oauth_burn() {
     ]);
     let third_party_names: HashSet<ProfileName> = HashSet::from([ProfileName::from("gamma")]);
     assert_eq!(
-        next_auto_switch_target_with_usage(&snap, &usage, &third_party_names),
+        next_auto_switch_target_with_usage(
+            &snap,
+            &usage,
+            &third_party_names,
+            ActiveBurnRate::FromDisk,
+        ),
         None,
         "a hybrid's provider window never pairs its OAuth burn history"
     );

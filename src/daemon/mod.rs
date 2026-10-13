@@ -529,7 +529,7 @@ fn stand_by(dir: &std::path::Path, slot: StandbySlot) -> Result<DaemonLock> {
 /// chain is testable without capturing log output.
 ///
 /// A disabled member is excluded: it is never spend-armed by the walk
-/// (`next_target` skips it as a candidate), so it can't be the uncapped
+/// (the walk skips it as a candidate), so it can't be the uncapped
 /// spender this names. Auth-broken and canceled members stay named even though
 /// that same walk skips them too: both clear on their own (a re-login, a
 /// re-subscribe), so going quiet about a member one re-auth away from billing

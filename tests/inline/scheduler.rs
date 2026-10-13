@@ -3684,10 +3684,10 @@ fn scan_auto_switch_prefers_a_fresh_member_over_an_earlier_stale_one() {
 }
 
 /// `decision_fresh_any` unions BOTH status stores. Before the fix the scheduler
-/// twin read only the OAuth `StatusStore`, so a fresh third-party member looked
-/// stale to its fresh-preference/recovery gate while the UI twin (reading
-/// `Profile.fetch_status`, filled from both in `apply_usage`) saw it — the twins
-/// disagreed on a mixed OAuth+third-party chain (2026-07-17).
+/// read only the OAuth `StatusStore`, so a fresh third-party member looked
+/// stale to its fresh-preference/recovery gate while the config-side walk
+/// (reading `Profile.fetch_status`, filled from both in `apply_usage`) saw it —
+/// the two legs disagreed on a mixed OAuth+third-party chain (2026-07-17).
 #[test]
 fn decision_fresh_any_reads_both_the_oauth_and_third_party_stores() {
     use super::{FetchStatus, StatusStore, ThirdPartyStatusStore, decision_fresh_any};
@@ -8484,8 +8484,7 @@ fn scan_recovery_never_relinks_to_a_chain_member_with_no_profile() {
 /// Same recovered-usage shape as the happy path, but the member's plan reads
 /// canceled — `/v1/messages` 403s no matter how idle its cached 5h window
 /// looks, so it must never be a relink target (mirrors the disabled/kick-
-/// rejected exclusions above; twin of the `fully_clear_target` canceled fix
-/// on the target-side walk).
+/// rejected exclusions above; the target-side walk's canceled fix).
 #[test]
 fn scan_recovery_never_relinks_to_a_canceled_member() {
     use super::{FetchStatus, KickBlocks, PendingSwitch, StatusStore, scan_recovery};

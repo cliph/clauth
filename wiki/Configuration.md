@@ -110,7 +110,7 @@ MiniMax sells its fast model on the M Plan only, so on a pay-as-you-go key re-po
 { "base_url": "https://api.example/anthropic", "models": { "default": "my-model" } }
 ```
 
-`apply preset` opens the picker, built-ins first. Applying replaces the account's endpoint and its whole `[models]` block, so a tier the preset leaves unset is cleared rather than kept; the picker warns and names the fields first when the account already carries any. The account's own api key is never touched, and a preset never carries one. <kbd>d</kbd> in the picker deletes a saved preset; the built-ins have no file and stay.
+`apply preset` opens the picker, built-ins first. Applying writes every field the preset sets and keeps every field it leaves unset. Before replacing a value, the picker names the fields it would change. When the account holds a value the preset leaves unset, the same confirm lists those fields and offers `keep them` (the default) or `clear them`. The `+ new` form works the same way, with what you typed standing in for the account's values. The account's own api key is never touched, and a preset never carries one. <kbd>d</kbd> in the picker deletes a saved preset; the built-ins have no file and stay.
 
 ## Auto-start the 5-hour window
 

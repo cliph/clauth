@@ -92,7 +92,7 @@ The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is
 |-------|------|
 | `duplicate account` | asks for a name, then copies every setting onto a new account: endpoint, api key, env, models, thresholds. The stored login stays behind, as do the chain's `preferred` and `last resort` marks, which only one account may hold |
 | `save as preset` | stores this account's base url and models under a name you type ([Configuration](Configuration#presets)). An existing preset asks first; a built-in's name is refused |
-| `apply preset` | opens the picker, built-ins first. Applying replaces the endpoint and the whole model block, naming the fields first when any are set. <kbd>d</kbd> deletes a saved preset |
+| `apply preset` | opens the picker, built-ins first. Applying writes what the preset sets and keeps the rest, asking first before it replaces a value; when the account holds a value the preset leaves unset, the confirm offers `keep them` or `clear them` ([Configuration](Configuration#presets)). <kbd>d</kbd> deletes a saved preset |
 | `open provider console` | opens the page this account's api key is minted on, in your browser. Only for DeepSeek, Z.ai, OpenRouter, MiniMax and Alibaba Model Studio endpoints, so it is absent on an OAuth account and on any endpoint clauth does not recognise. An Alibaba account gets its own plan's page: Token Plan and Coding Plan are separate products, on separate pages, per console |
 
 There is no `remove field` because none is needed: an env row's <kbd>⏎</kbd> edits its value, and an empty value removes the key. Editing it back is the same row.
@@ -101,7 +101,7 @@ There is no `remove field` because none is needed: an env row's <kbd>⏎</kbd> e
 
 ## Setup tab rows
 
-The account list ends in an action row: `+ new`, which turns this pane into the create form. On that form, below `+ login`, `+ capture current login` stashes the login Claude Code is using now (it appears only when that login exists and no saved account owns it); <kbd>⏎</kbd> on `create account` then saves it under the name you typed.
+The account list ends in an action row: `+ new`, which turns this pane into the create form. The form carries the same `model` and `+ model override` rows a saved account does, and `create account` saves every one. On that form, below `+ login`, `+ capture current login` stashes the login Claude Code is using now (it appears only when that login exists and no saved account owns it); <kbd>⏎</kbd> on `create account` then saves it under the name you typed. A captured login on a different endpoint than the form's takes none of the form's model rows.
 
 | Row | Sets |
 |-----|------|

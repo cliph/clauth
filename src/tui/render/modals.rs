@@ -17,7 +17,7 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::chain::reason_marker;
-use super::format::spinner_frame;
+use super::format::{spinner_frame, truncate};
 use super::overview::switch_mark;
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KEY_REJECTED,
@@ -1534,7 +1534,7 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
     let max_label_w = state
         .items
         .iter()
-        .map(|item| item.label.chars().count())
+        .map(|item| Span::raw(item.label).width())
         .max()
         .unwrap_or(0) as u16;
     let content_w = GUTTER + max_label_w + 3 + HOTKEY_W;
@@ -1625,8 +1625,8 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
         };
         let hotkey_width = usize::from(inner_w >= GUTTER + HOTKEY_W + 3);
         let label_width = (inner_w as usize).saturating_sub(GUTTER as usize + 3 + hotkey_width);
-        let label = crate::format::truncate(item.label, label_width);
-        let label_len = label.chars().count() as u16;
+        let label = truncate(item.label, label_width);
+        let label_len = Span::raw(&label).width() as u16;
         let pad = inner_w
             .saturating_sub(GUTTER)
             .saturating_sub(label_len)

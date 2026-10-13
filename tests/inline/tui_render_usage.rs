@@ -3321,3 +3321,13 @@ fn usage_prose_styles_its_commands_and_the_notes_key() {
         true,
     );
 }
+
+/// The kick pill's right pad is `avail − cells`, not `avail − chars`, so a wide
+/// (non-ASCII) text still lands flush against the pane edge. Today's `kick_text`
+/// is ASCII, so this is the one surface where the cell switch is invisible.
+#[test]
+fn kick_spans_pads_by_cells() {
+    let spans = super::kick_spans("日本語の上流", 0, 30);
+    let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(ratatui::text::Span::raw(&joined).width(), 30);
+}

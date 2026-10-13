@@ -14,7 +14,7 @@ use super::super::app::{App, NoteBuffer, StatusFocus};
 use super::super::theme;
 use super::format::{
     ResetFmt, activity_verb, is_past_reset, reset_in_secs_at, reset_phrase, spinner_frame,
-    spinner_style,
+    spinner_style, truncate,
 };
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, QueueView,
@@ -987,11 +987,11 @@ fn kick_spans(text: &str, left_w: usize, inner_w: usize) -> Vec<Span<'static>> {
     if avail < 3 {
         return Vec::new();
     }
-    let text = crate::format::truncate(text, avail - 3);
+    let text = truncate(text, avail - 3);
     if text.chars().count() < 4 {
         return Vec::new();
     }
-    let pad = avail - text.chars().count();
+    let pad = avail - Span::raw(&text).width();
     vec![
         Span::raw(" ".repeat(pad)),
         Span::styled(text, theme::faint()),

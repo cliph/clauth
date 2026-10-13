@@ -1480,7 +1480,11 @@ fn model_lines(
     // Expand the label column to the longest name when there's room; only
     // truncate (via `fixed`) when the card is too narrow. Reserve the count
     // column + two 1-cell gaps + a minimum 8-cell bar + the cost column.
-    let longest = names.iter().map(|s| s.chars().count()).max().unwrap_or(6);
+    let longest = names
+        .iter()
+        .map(|s| Span::raw(s).width())
+        .max()
+        .unwrap_or(6);
     let max_label = w.saturating_sub(count_w + 2 + 8 + cost_col);
     let label_w = longest.clamp(6, max_label.max(6));
     let bar_w = w

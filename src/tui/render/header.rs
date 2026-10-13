@@ -297,7 +297,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut left_spans: Vec<Span<'static>> = Vec::new();
     if let Some(ref g) = gauge {
         let gauge_budget = row1_width.saturating_sub(status_w + CONTENT_GAP);
-        let fit = gauge_fit(gauge_budget, g.name.chars().count(), g.pct.is_some());
+        let fit = gauge_fit(
+            gauge_budget,
+            Span::raw(g.name.as_str()).width(),
+            g.pct.is_some(),
+        );
         if fit.visible {
             left_spans.extend(gauge_spans(fit, &g.name, g.pct, app.anim_ms()));
         }

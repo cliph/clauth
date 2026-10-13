@@ -7891,3 +7891,63 @@ fn the_save_and_remove_rows_take_the_house_colours() {
         "the `remove` label is bold at rest"
     );
 }
+
+// ── display-cell budgeting (part A fix round) ───────────────────────────────
+
+/// `config_key` pads its label to the value column by cells, so a CJK or emoji
+/// upstream name opens its value at the same column as an ASCII one instead of
+/// pushing it right.
+#[test]
+fn a_shunt_config_key_pads_by_cells() {
+    let ascii = super::config_key("name", 4);
+    let cjk = super::config_key("日本語", 4);
+    let emoji = super::config_key("🧭upstream", 4);
+    assert_eq!(ratatui::text::Span::raw(&ascii).width(), 16);
+    assert_eq!(ratatui::text::Span::raw(&cjk).width(), 16);
+    assert_eq!(ratatui::text::Span::raw(&emoji).width(), 16);
+}
+
+/// The route line sizes the model's room from the provider's cells, so a CJK
+/// provider never pushes the row past the pane.
+#[test]
+fn a_shunt_route_line_budgets_provider_and_model_by_cells() {
+    let route = RouteView {
+        position: 1,
+        model: Some(w("opus")),
+        provider: Some(w("日本語")),
+        upstream_model: None,
+        effort: None,
+        service_tier: None,
+    };
+    let out = super::route_label(&route, 10);
+    assert!(
+        ratatui::text::Span::raw(&out).width() <= 10,
+        "route overran: {out:?}"
+    );
+}
+
+/// A wide (CJK) delegate profile name fits its column whole at a wide pane:
+/// `name_w` and `key_cell` both budget cells, so the cell `truncate` no longer
+/// cuts it though room remains.
+#[test]
+fn a_delegate_with_a_wide_name_keeps_it_whole() {
+    use crate::mcp::jobs::JobPhase;
+    let _home = crate::testutil::HomeSandbox::new();
+    let cell = super::DelegateCells {
+        state: JobPhase::Running,
+        profile: "日本語".to_string(),
+        facts: vec!["3m".to_string()],
+        cwd: None,
+    };
+    let (lines, _, _) = super::delegate_job_lines(&[cell], None, false, 80);
+    let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(text, "  ● running   日本語  3m");
+}
+
+/// The `stays` action sizes its path room from the reason's cells, so a CJK
+/// reason the contract keeps whole is not cell-truncated.
+#[test]
+fn a_stays_action_keeps_a_cjk_reason_whole() {
+    let spans = super::shunt_action_spans("stays  /home/u/repos/app  日本語", 30);
+    assert_eq!(spans[3].content, "日本語");
+}

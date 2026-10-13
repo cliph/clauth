@@ -93,15 +93,15 @@ pub(super) fn bold_when(style: Style, cond: bool) -> Style {
     }
 }
 
-/// Key-column cell: `key` left-justified to `max(width, key.len())` then a
+/// Key-column cell: `key` left-justified to `max(width, key cells)` then a
 /// fixed `gutter`-space gap, so every row's value opens at the same column
-/// even when one key fills `width`. A plain `width.saturating_sub(len).max(1)`
+/// even when one key fills `width`. A plain `width.saturating_sub(cells).max(1)`
 /// pad pushes an exactly-fitting key one cell past its siblings; this shape
 /// keeps the gap separate from the width so it never collides. Each pane passes
 /// its own `width` (its longest key) and the house `gutter` of 2.
 pub(super) fn key_cell(key: &str, width: usize, gutter: usize) -> String {
-    let w = width.max(key.chars().count());
-    format!("{key:<w$}{}", " ".repeat(gutter))
+    let kw = Span::raw(key).width();
+    format!("{key}{}", " ".repeat(width.max(kw) - kw + gutter))
 }
 
 /// One segment of a cycle row: the active option renders `[label]` while the

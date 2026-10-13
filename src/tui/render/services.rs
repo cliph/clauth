@@ -36,7 +36,7 @@ use super::super::app::{
     parse_herdr_tag_secs, pending_require_line, removable, shunt_field_value, written_display,
 };
 use super::super::theme;
-use super::format::{middle_truncate, spinner_frame};
+use super::format::{fixed, middle_truncate, spinner_frame, truncate};
 use super::header::pulse_name_spans;
 use super::modals::danger_button;
 use super::panes::{
@@ -47,7 +47,6 @@ use super::panes::{
     select_line, value_caret, wrap_words,
 };
 use super::prose;
-use crate::format::truncate;
 use crate::gateway_edit::{
     BindOverride, ConfigView, EnvFileFailure, ModelView, ProviderForm, RouteView, ServerView,
     UpstreamView, Written,
@@ -1074,10 +1073,10 @@ fn route_label(r: &RouteView, room: usize) -> String {
     );
     let head = format!("{}  ", r.position);
     let arrow = " → ";
-    let head_arrow = head.chars().count() + arrow.chars().count();
+    let head_arrow = Span::raw(&head).width() + Span::raw(arrow).width();
     // The model's room after the position, the arrow and the whole provider.
-    let model_room = room.saturating_sub(head_arrow + provider.chars().count());
-    if model.chars().count() <= model_room {
+    let model_room = room.saturating_sub(head_arrow + Span::raw(&provider).width());
+    if Span::raw(&model).width() <= model_room {
         return format!("{head}{model}{arrow}{provider}");
     }
     if model_room > 0 {
@@ -1302,8 +1301,8 @@ fn config_key(label: &str, indent: usize) -> String {
     let width = CONFIG_VALUE_COL
         .saturating_sub(indent)
         .saturating_sub(CONFIG_KEY_GUTTER);
-    let label = truncate(&escape_control(label), width);
-    format!("{label:<width$}{}", " ".repeat(CONFIG_KEY_GUTTER))
+    let label = fixed(&escape_control(label), width);
+    format!("{label}{}", " ".repeat(CONFIG_KEY_GUTTER))
 }
 
 /// A field row's label word: the provider key for an `upstream_model` row.
@@ -1756,7 +1755,7 @@ fn shunt_action_spans(text: &str, width: usize) -> Vec<Span<'static>> {
             // when the pane cannot hold it and a four-cell path floor.
             let (path, reason) = value.rsplit_once("  ").unwrap_or((value, ""));
             let after_key = width.saturating_sub(key.len() + 2 + 2);
-            let path_room = after_key.saturating_sub(reason.chars().count()).max(4);
+            let path_room = after_key.saturating_sub(Span::raw(reason).width()).max(4);
             let reason_room = after_key.saturating_sub(path_room);
             vec![
                 key_span,
@@ -2270,7 +2269,7 @@ fn delegate_job_lines(
 ) -> (Vec<Line<'static>>, Vec<usize>, Vec<usize>) {
     let name_w = cells
         .iter()
-        .map(|c| c.profile.chars().count())
+        .map(|c| Span::raw(c.profile.as_str()).width())
         .max()
         .unwrap_or(0)
         .min(NAME_W_MAX);

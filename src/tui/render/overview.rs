@@ -279,7 +279,7 @@ impl OverviewWidths {
             .config()
             .profiles
             .iter()
-            .map(|p| p.name.chars().count())
+            .map(|p| Span::raw(p.name.as_str()).width())
             .max()
             .unwrap_or(8);
         let shows_clock = ResetFmt::from_state(&app.config().state).shows_clock();
@@ -953,7 +953,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> (Vec<Line<'static>>, usize) {
     // row fits a phone line instead of hard-wrapping its trailing figures.
     let name_w = chain
         .iter()
-        .map(|n| n.chars().count())
+        .map(|n| Span::raw(n.as_str()).width())
         .max()
         .unwrap_or(8)
         .clamp(6, if narrow { 12 } else { 18 });
@@ -1222,7 +1222,7 @@ fn chain_row(cfg: &AppConfig, name: &crate::profile::ProfileName, ctx: ChainRowC
     } else {
         theme::dim()
     };
-    let name_pad = name_w.saturating_sub(name.chars().count());
+    let name_pad = name_w.saturating_sub(Span::raw(name.as_str()).width());
 
     let mut spans = vec![
         Span::styled(format!(" {rail} "), theme::faint()),

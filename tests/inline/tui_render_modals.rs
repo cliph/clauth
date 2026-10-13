@@ -2404,3 +2404,39 @@ fn selectors_and_modals_page_by_hand_pinned_cursors() {
         "env review page"
     );
 }
+
+/// The action menu sizes its width from the widest label's cells, so a CJK
+/// label renders whole instead of being cut by a char-derived modal width.
+#[test]
+fn the_action_menu_sizes_its_width_by_cells() {
+    use crate::tui::app::{ActionItem, ActionMenuAction, ActionMenuState};
+    use ratatui::{Frame, Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let menu = ActionMenuState {
+        items: vec![ActionItem {
+            label: "日本語の上流",
+            hotkey: None,
+            action: ActionMenuAction::ReloadTokenStats,
+        }],
+        scoped_len: 0,
+        context: None,
+        cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    };
+    let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
+    term.draw(|f: &mut Frame<'_>| draw_action_menu(f, f.area(), &menu))
+        .unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        rows.iter().any(|row| row.contains('流')),
+        "a CJK action label must render whole: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains('…')),
+        "a CJK action label must not be needlessly cut: {rows:?}"
+    );
+}

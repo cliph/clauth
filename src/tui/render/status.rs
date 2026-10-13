@@ -16,7 +16,7 @@ use ratatui::widgets::{Block, Paragraph};
 
 use super::super::app::{App, StatusFocus};
 use super::super::theme;
-use super::format::{NO_DATA, middle_truncate, relative_age, spinner_frame};
+use super::format::{NO_DATA, fixed, middle_truncate, relative_age, spinner_frame, truncate};
 use super::panes::{
     draw_scrollbar, empty_state, follow_scroll_offset, key_cell, master_detail, section_box,
     wrap_words,
@@ -210,7 +210,7 @@ fn incident_rows(
 /// Pad a span list with tinted filler so the `BG_HOVER` tint spans the full
 /// content width (the ratatui filler-tint gotcha).
 fn pad_to(spans: &mut Vec<Span<'static>>, content_w: usize, tint: Option<ratatui::style::Color>) {
-    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let used: usize = spans.iter().map(Span::width).sum();
     let pad = content_w.saturating_sub(used);
     if pad > 0 {
         let style = match tint {
@@ -409,8 +409,8 @@ fn update_lines(
     body_w: usize,
     indent: usize,
 ) -> Vec<Line<'static>> {
-    let time = pad_right(&stamp(update.at_ms), time_col);
-    let phase = pad_right(&update.phase.word(), phase_col);
+    let time = fixed(&stamp(update.at_ms), time_col);
+    let phase = fixed(&update.phase.word(), phase_col);
     let phase_color = phase_text_color(&update.phase);
 
     let wrapped = wrap_words(&update.text, body_w);
@@ -451,13 +451,13 @@ fn transition_lines(
         .collect();
     let widest_name = rows
         .iter()
-        .map(|(n, _)| n.chars().count())
+        .map(|(n, _)| Span::raw(n).width())
         .max()
         .unwrap_or(0);
     // Reserve room for ` → new` so the name column can shrink under pressure.
     let max_status = rows
         .iter()
-        .map(|(_, n)| 2 + n.chars().count())
+        .map(|(_, n)| 2 + Span::raw(n).width())
         .max()
         .unwrap_or(0);
     // Name column width: widest name, but shrunk so `name  → new` fits body_w.
@@ -467,7 +467,7 @@ fn transition_lines(
 
     rows.into_iter()
         .map(|(name, new)| {
-            let name = pad_right(&truncate(&name, name_col), name_col);
+            let name = fixed(&name, name_col);
             let new_color = component_status_color(&new);
             let spans = vec![
                 Span::raw(" ".repeat(indent)),
@@ -477,11 +477,7 @@ fn transition_lines(
             ];
             // Last-resort guard: if the assembled content still overflows body_w,
             // trailing-truncate the whole line so ratatui never clips silently.
-            let content_w: usize = spans
-                .iter()
-                .map(|s| s.content.chars().count())
-                .sum::<usize>()
-                - indent;
+            let content_w: usize = spans.iter().map(Span::width).sum::<usize>() - indent;
             if content_w > body_w {
                 let mut flat = String::new();
                 for s in spans.iter().skip(1) {
@@ -616,7 +612,7 @@ fn key_span(key: &str) -> Span<'static> {
 
 // ── Small text helpers ──────────────────────────────────────────────────────
 
-use crate::format::{local_stamp, truncate};
+use crate::format::local_stamp;
 
 /// The incident stamps (`started` row + timeline rows): local wall clock in
 /// the 2026-08-22 ruling's `YYYY-MM-DD HH:MM:SS` shape, through the one
@@ -626,11 +622,6 @@ fn stamp(epoch_ms: u64) -> String {
     local_stamp((epoch_ms / 1000) as i64).unwrap_or_else(|| NO_DATA.to_string())
 }
 
-/// Pad `s` on the right to `width` chars (truncating with `…` if longer).
-fn pad_right(s: &str, width: usize) -> String {
-    let count = s.chars().count();
-    if count > width {
-        return truncate(s, width);
-    }
-    format!("{s}{}", " ".repeat(width - count))
-}
+#[cfg(test)]
+#[path = "../../../tests/inline/tui_render_status.rs"]
+mod tests;

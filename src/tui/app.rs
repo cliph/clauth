@@ -58,7 +58,7 @@ use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_m
 use crate::profile_json::{stale_after_ms, usage_cache_file};
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::render::prose::{self, cmd_lit};
-use crate::tui::render::{ListView, follow_scroll_offset};
+use crate::tui::render::{ListView, follow_scroll_offset, truncate};
 use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
@@ -19453,7 +19453,7 @@ fn apply_status_incidents(
                 ToastKind::Info
             };
             if app.tab == Tab::Status {
-                let title = crate::format::truncate(&incident.title, 40);
+                let title = truncate(&incident.title, 40);
                 app.toast(severity, format!("new incident: {title}"));
             } else {
                 app.set_tab_activity(Tab::Status, severity);

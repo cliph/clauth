@@ -1087,3 +1087,15 @@ fn the_word_accounts_renders_on_the_panel_title_alone() {
         rows[carrying[0]]
     );
 }
+
+/// The gauge rung measures the active name's cells, so a CJK name renders whole
+/// at a wide budget instead of being cut to `日…` by a char-derived width.
+#[test]
+fn the_header_gauge_keeps_a_wide_active_name_whole() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![oauth_profile("日本語", 42.0)], Some("日本語"));
+    app.tab = Tab::Tokens;
+    let chars: Vec<char> = row_content(&app, 120, 1).chars().collect();
+    let left: String = chars[..36].iter().collect();
+    assert_eq!(left, "[ 0 live ] · 日 本 語  42% [████░░░░░░]");
+}

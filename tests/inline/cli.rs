@@ -1586,8 +1586,14 @@ mod disabled_target_refusal {
             state: crate::profile::AppState::default(),
             profiles: Vec::new(),
         };
-        crate::actions::create_blank_profile(&mut config, name.to_string(), None, None, None)
-            .expect("create profile");
+        crate::actions::create_blank_profile(
+            &mut config,
+            name.to_string(),
+            None,
+            None,
+            Default::default(),
+        )
+        .expect("create profile");
         crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from(name))
             .expect("disable profile");
     }
@@ -3451,8 +3457,14 @@ fn cli_delete_refuses_while_a_rotation_holds_the_lock() {
         state: crate::profile::AppState::default(),
         profiles: Vec::new(),
     };
-    crate::actions::create_blank_profile(&mut config, "cli-held".to_string(), None, None, None)
-        .expect("create profile");
+    crate::actions::create_blank_profile(
+        &mut config,
+        "cli-held".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
 
     // Another process mid-rotation: a locked handle on a separate fd.
     let _holder = crate::testutil::hold_rotation_lock("cli-held");

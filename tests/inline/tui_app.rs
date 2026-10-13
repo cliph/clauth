@@ -3492,7 +3492,14 @@ fn a_preset_apply_clears_the_old_providers_streak() {
         "precondition: the old provider's deep streak is on the books"
     );
 
-    super::apply_preset_to(&mut app, "zai", "DeepSeek");
+    super::apply_preset_to(
+        &mut app,
+        &super::PresetTarget::from("zai"),
+        "DeepSeek",
+        crate::presets::Leftover::Keep,
+        &["base url"],
+        &[],
+    );
 
     {
         let m = app.third_party_streaks.lock().unwrap();
@@ -3517,6 +3524,69 @@ fn a_preset_apply_clears_the_old_providers_streak() {
         None,
         "the next frame shows no stale chrome after a preset repoint"
     );
+}
+
+/// A preset that keeps the account's endpoint repoints nothing, so the
+/// provider's streak and fetch status stay on the books.
+#[test]
+fn a_preset_apply_keeping_the_endpoint_keeps_the_providers_streak() {
+    use crate::profile::{AppConfig, AppState, ModelSettings, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::presets::save_preset(
+        "models-only",
+        &None,
+        &ModelSettings {
+            opus: Some("x-opus".to_string()),
+            ..ModelSettings::default()
+        },
+    )
+    .expect("save the preset");
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_profile(&zai).expect("save the profile");
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("zai")],
+            ..AppState::default()
+        },
+        profiles: vec![zai],
+    });
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), FetchStatus::RateLimited);
+    app.third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), 3);
+
+    super::apply_preset_to(
+        &mut app,
+        &super::PresetTarget::from("zai"),
+        "models-only",
+        crate::presets::Leftover::Keep,
+        &[],
+        &["base url"],
+    );
+
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("zai"))
+            .unwrap()
+            .models
+            .opus
+            .as_deref(),
+        Some("x-opus"),
+        "the apply landed"
+    );
+    assert_eq!(app.third_party_streaks.lock().unwrap().get("zai"), Some(&3));
+    assert!(app.third_party_status.lock().unwrap().contains_key("zai"));
 }
 
 /// R4: the divergence resolver's Overwrite choice snapshots the LIVE login
@@ -12093,7 +12163,8 @@ fn capture_overwrite_cancel_changes_nothing() {
 // ── Setup tab: default-model row on the `+ new` create form (issue #12) ──────
 //
 // The row is the same hybrid alias-cycle field an existing account's model row
-// is; the create form otherwise stays minimal (no alias overrides, no env).
+// is, and the alias overrides sit behind `+ model override` as they do there;
+// the create form carries no env rows.
 
 mod new_account_model_row {
     use super::super::{
@@ -12139,10 +12210,12 @@ mod new_account_model_row {
             .position(|r| *r == ConfigRow::Create)
             .expect("create row present");
         assert!(model_pos < create_pos, "model row precedes create");
-        assert!(
-            !rows.contains(&ConfigRow::OpusModel) && !rows.contains(&ConfigRow::ModelOverrideAdd),
-            "the create form stays minimal: no alias overrides"
+        assert_eq!(
+            rows.get(model_pos + 1),
+            Some(&ConfigRow::ModelOverrideAdd),
+            "a fresh form tucks every alias override behind the reveal, as a saved account does"
         );
+        assert!(!rows.contains(&ConfigRow::OpusModel));
     }
 
     #[test]
@@ -14249,6 +14322,328 @@ fn apply_preset_on_new_row_stamps_the_draft_buffers() {
     );
 }
 
+/// The `+ new` draft's seven buffers, endpoint first, in the Setup rows' order.
+fn draft_buffers(app: &super::App) -> [String; 7] {
+    let d = app.config_draft.as_ref().expect("draft still mounted");
+    [
+        &d.base_url,
+        &d.model,
+        &d.fable_model,
+        &d.opus_model,
+        &d.sonnet_model,
+        &d.haiku_model,
+        &d.subagent_model,
+    ]
+    .map(|i| i.value.clone())
+}
+
+/// A `+ new` draft with every buffer but opus typed, opened on `apply
+/// preset` → a custom preset that sets opus alone.
+fn typed_draft_on_custom_preset() -> super::App {
+    use super::{ActionMenuAction, Tab, dispatch_action_menu_action, handle_key};
+    use crate::profile::{ModelSettings, Profile};
+    use ratatui::crossterm::event::KeyCode;
+
+    crate::presets::save_preset(
+        "zz-custom",
+        &None,
+        &ModelSettings {
+            opus: Some("x-opus".to_string()),
+            ..ModelSettings::default()
+        },
+    )
+    .expect("save the custom preset");
+    let pick = crate::presets::list_presets()
+        .iter()
+        .position(|p| p.name == "zz-custom")
+        .expect("the custom preset is listed");
+
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    let mut draft = super::build_draft_new();
+    draft.base_url = super::InputState::new("https://typed.example/anthropic");
+    draft.model = super::InputState::new("typed-default");
+    draft.sonnet_model = super::InputState::new("typed-sonnet");
+    draft.haiku_model = super::InputState::new("typed-haiku");
+    draft.fable_model = super::InputState::new("typed-fable");
+    draft.subagent_model = super::InputState::new("typed-subagent");
+    app.config_draft = Some(draft);
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    for _ in 0..pick {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    app
+}
+
+/// On `+ new` the typed buffers count as the account's values: a preset that
+/// leaves them unset asks keep or clear, naming the new account.
+#[test]
+fn apply_preset_on_new_offers_keep_or_clear_for_typed_buffers() {
+    use super::Modal;
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = typed_draft_on_custom_preset();
+    assert!(matches!(app.modals.last(), Some(Modal::PresetApply(_))));
+    assert_eq!(
+        modal_rows(&app),
+        [
+            "",
+            "apply 'zz-custom' to the new account?",
+            "the preset leaves base url, model, fable, sonnet, haiku, subagent unset.",
+            "",
+            "cancel   keep them   clear them",
+            "",
+        ],
+    );
+}
+
+/// `keep them` on `+ new` fills opus and keeps every typed buffer.
+#[test]
+fn apply_preset_on_new_keeps_the_buffers_the_preset_leaves_unset() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = typed_draft_on_custom_preset();
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        draft_buffers(&app),
+        [
+            "https://typed.example/anthropic",
+            "typed-default",
+            "typed-fable",
+            "x-opus",
+            "typed-sonnet",
+            "typed-haiku",
+            "typed-subagent",
+        ]
+        .map(str::to_string),
+    );
+}
+
+/// `clear them` on `+ new` fills opus and empties every buffer the preset
+/// leaves unset, the endpoint included; the alias rows shown are the ones the
+/// stamp filled.
+#[test]
+fn apply_preset_on_new_row_clears_the_buffers_the_preset_leaves_unset() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = typed_draft_on_custom_preset();
+    app.config_draft.as_mut().unwrap().overrides_expanded = true;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        draft_buffers(&app),
+        ["", "", "", "x-opus", "", "", ""].map(str::to_string),
+    );
+    let draft = app.config_draft.as_ref().unwrap();
+    assert_eq!(
+        (draft.overrides_shown.as_slice(), draft.overrides_expanded),
+        ([super::ConfigRow::OpusModel].as_slice(), false),
+        "the stamp shows the alias rows it filled, collapsed, as a saved account's rebuilt pane does"
+    );
+}
+
+/// A typed buffer the preset would overwrite asks first on `+ new` too.
+#[test]
+fn apply_preset_on_new_names_the_typed_buffers_it_replaces() {
+    use super::{ActionMenuAction, Modal, Tab, dispatch_action_menu_action, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    let mut draft = super::build_draft_new();
+    draft.opus_model = super::InputState::new("my-opus");
+    app.config_draft = Some(draft);
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // DeepSeek
+    let Some(Modal::Confirm(state)) = app.modals.last() else {
+        panic!("a replaced typed buffer raises the overwrite warning");
+    };
+    assert_eq!(state.message, "apply 'DeepSeek' to the new account?");
+    assert_eq!(state.detail.as_deref(), Some("replaces opus."));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        draft_buffers(&app),
+        [
+            "https://api.deepseek.com/anthropic",
+            "opus",
+            "deepseek-v4-pro[1m]",
+            "deepseek-v4-pro[1m]",
+            "deepseek-flash[1m]",
+            "deepseek-flash[1m]",
+            "",
+        ]
+        .map(str::to_string),
+    );
+}
+
+/// `create account` saves each of the six model buffers into its own row.
+#[test]
+fn create_saves_every_model_buffer_into_its_own_row() {
+    use crate::profile::{ModelSettings, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    app.profile_cursor = app.profile_count();
+    let mut draft = super::build_draft_new();
+    draft.name = super::InputState::new("six");
+    draft.model = super::InputState::new("m-default");
+    draft.opus_model = super::InputState::new("m-opus");
+    draft.sonnet_model = super::InputState::new("m-sonnet");
+    draft.haiku_model = super::InputState::new("m-haiku");
+    draft.fable_model = super::InputState::new("m-fable");
+    draft.subagent_model = super::InputState::new(" m-subagent ");
+    app.config_draft = Some(draft);
+    super::commit_new_account(&mut app);
+    let cfg = app.config();
+    assert_eq!(
+        cfg.find(&ProfileName::from("six")).expect("created").models,
+        ModelSettings {
+            default: Some("m-default".to_string()),
+            opus: Some("m-opus".to_string()),
+            sonnet: Some("m-sonnet".to_string()),
+            haiku: Some("m-haiku".to_string()),
+            fable: Some("m-fable".to_string()),
+            subagent: Some("m-subagent".to_string()),
+        },
+    );
+}
+
+/// A captured live login whose endpoint differs from the form's drops the
+/// form's model rows with the typed endpoint: they were picked for that
+/// endpoint, not the captured one.
+#[test]
+fn a_captured_login_on_another_endpoint_drops_the_typed_model_rows() {
+    use super::DraftLogin;
+    use crate::actions::CaptureSnapshot;
+    use crate::profile::{ModelSettings, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![]);
+    app.profile_cursor = app.profile_count();
+    let mut draft = super::build_draft_new();
+    draft.name = super::InputState::new("cap");
+    draft.base_url = super::InputState::new("https://api.deepseek.com/anthropic");
+    draft.opus_model = super::InputState::new("deepseek-v4-pro[1m]");
+    draft.captured_login = Some(DraftLogin::LiveLogin(Box::new(CaptureSnapshot {
+        credentials: None,
+        base_url: Some("https://captured.example/anthropic".to_string()),
+        api_key: Some("sk-captured".to_string()),
+        anchor: crate::actions::AnchorAction::Unproven,
+    })));
+    app.config_draft = Some(draft);
+    super::commit_new_account(&mut app);
+    let cfg = app.config();
+    let created = cfg.find(&ProfileName::from("cap")).expect("created");
+    assert_eq!(
+        created.base_url.as_deref(),
+        Some("https://captured.example/anthropic")
+    );
+    assert_eq!(created.models, ModelSettings::default());
+    assert!(
+        app.toasts.iter().any(|t| t.body
+            == "created from the captured current login\nthe typed endpoint and model fields were not used"),
+        "{:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// A preset stamped on `+ new` and then created lands every row it filled on
+/// the new account, the same block applying it to a saved account writes.
+#[test]
+fn a_preset_stamped_on_new_reaches_the_created_account_whole() {
+    use super::{ActionMenuAction, Tab, dispatch_action_menu_action, handle_key};
+    use crate::profile::{ModelSettings, ProfileName};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    let mut draft = super::build_draft_new();
+    draft.name = super::InputState::new("fresh");
+    app.config_draft = Some(draft);
+
+    app.config_action_cursor = super::config_rows(&app)
+        .iter()
+        .position(|&r| r == super::ConfigRow::Create)
+        .expect("the form ends on create");
+    // Cursor 0 = the DeepSeek built-in.
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        super::config_rows(&app).get(app.config_action_cursor),
+        Some(&super::ConfigRow::Create),
+        "the rows the stamp reveals never move the cursor off its row"
+    );
+    super::commit_new_account(&mut app);
+
+    let cfg = app.config();
+    let created = cfg
+        .find(&ProfileName::from("fresh"))
+        .expect("the account was created");
+    assert_eq!(
+        created.base_url.as_deref(),
+        Some("https://api.deepseek.com/anthropic")
+    );
+    assert_eq!(
+        created.models,
+        ModelSettings {
+            default: Some("opus".to_string()),
+            opus: Some("deepseek-v4-pro[1m]".to_string()),
+            sonnet: Some("deepseek-flash[1m]".to_string()),
+            haiku: Some("deepseek-flash[1m]".to_string()),
+            fable: Some("deepseek-v4-pro[1m]".to_string()),
+            subagent: None,
+        },
+    );
+}
+
+/// On `+ new` the picker's target is the draft, even when the typed name
+/// matches a saved account: no confirm names that account's fields, the draft
+/// takes the stamp, and the saved account keeps its own.
+#[test]
+fn apply_preset_on_new_never_confirms_against_a_saved_namesake() {
+    use super::{ActionMenuAction, Modal, Tab, dispatch_action_menu_action, handle_key};
+    use crate::profile::{Profile, ProfileName};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new(
+        "acct".to_string(),
+        Some("https://saved.example/anthropic".to_string()),
+        Some("sk-saved".to_string()),
+    );
+    acct.models.default = Some("saved-model".to_string());
+    crate::profile::save_profile(&acct).expect("save acct");
+    let mut app = app_with(vec![acct]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    let mut draft = super::build_draft_new();
+    draft.name = super::InputState::new("acct");
+    app.config_draft = Some(draft);
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    assert!(
+        !app.modals.iter().any(|m| matches!(m, Modal::Confirm(_))),
+        "no confirm names the saved namesake"
+    );
+    let draft = app.config_draft.as_ref().expect("draft still mounted");
+    assert_eq!(draft.base_url.value, "https://api.deepseek.com/anthropic");
+    let cfg = app.config();
+    let saved = cfg.find(&ProfileName::from("acct")).expect("acct stays");
+    assert_eq!(
+        saved.base_url.as_deref(),
+        Some("https://saved.example/anthropic")
+    );
+    assert_eq!(saved.models.default.as_deref(), Some("saved-model"));
+}
+
 /// `duplicate account` copies every configured field. The stored login does NOT
 /// come along, and neither do the two chain radios — `preferred` is exclusive
 /// across the whole roster (`toggle_preferred` clears every sibling), so a copy
@@ -14449,8 +14844,256 @@ fn a_saved_preset_applies_onto_another_account() {
     );
 }
 
-/// Applying over an account that already carries an endpoint or model settings
-/// names the fields it would replace, and cancelling leaves them alone.
+/// A saved account carrying an endpoint, every model row and a subagent id,
+/// opened on `apply preset` → DeepSeek, which leaves `subagent` unset.
+fn preset_apply_target() -> super::App {
+    use super::{ActionMenuAction, Tab, dispatch_action_menu_action, handle_key};
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+
+    let mut target = Profile::new(
+        "target".to_string(),
+        Some("https://old.test".to_string()),
+        None,
+    );
+    target.models.default = Some("opus".to_string());
+    target.models.opus = Some("old-opus".to_string());
+    target.models.fable = Some("old-fable".to_string());
+    target.models.subagent = Some("old-subagent".to_string());
+    crate::profile::save_profile(&target).expect("save target");
+
+    let mut app = app_with(vec![target]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // cursor 0 = DeepSeek
+    app
+}
+
+fn saved_target(app: &super::App) -> (Option<String>, crate::profile::ModelSettings) {
+    let cfg = app.config();
+    let p = cfg
+        .find(&crate::profile::ProfileName::from("target"))
+        .expect("target");
+    (p.base_url.clone(), p.models.clone())
+}
+
+fn modal_rows(app: &super::App) -> Vec<String> {
+    modal_rows_at(app, 100, 40)
+}
+
+/// The rows of the topmost modal's frame on a `w`×`h` terminal, borders
+/// stripped: the columns the title row's corners span, cut out of every row
+/// down to the bottom corner.
+fn modal_rows_at(app: &super::App, w: u16, h: u16) -> Vec<String> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let top = rows
+        .iter()
+        .position(|r| r.contains("─ CONFIRM ─"))
+        .expect("a CONFIRM modal is drawn");
+    let chars: Vec<char> = rows[top].chars().collect();
+    let left = chars.iter().position(|&c| c == '╭').expect("left corner");
+    let right = chars.iter().rposition(|&c| c == '╮').expect("right corner");
+    rows[top + 1..]
+        .iter()
+        .take_while(|r| r.chars().nth(left) != Some('╰'))
+        .map(|r| {
+            r.chars()
+                .skip(left + 1)
+                .take(right - left - 1)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
+        .collect()
+}
+
+/// A preset that leaves a set field unset asks first, naming what it replaces
+/// and what it leaves: a value equal to the preset's is not "replaced", and
+/// `keep them` is the focused button. Cancel writes nothing.
+#[test]
+fn applying_over_fields_the_preset_leaves_unset_offers_keep_or_clear() {
+    use super::{Modal, PresetApplyButton, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = preset_apply_target();
+
+    let Some(Modal::PresetApply(form)) = app.modals.last() else {
+        panic!("a left-over set field raises the keep / clear confirm");
+    };
+    assert_eq!(form.focus, PresetApplyButton::Keep);
+    assert_eq!(
+        modal_rows(&app),
+        [
+            "",
+            "apply 'DeepSeek' to 'target'?",
+            "replaces base url, fable, opus.",
+            "the preset leaves subagent unset.",
+            "",
+            "cancel   keep them   clear them",
+            "",
+        ],
+    );
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert!(app.modals.is_empty());
+    let (base_url, models) = saved_target(&app);
+    assert_eq!(base_url.as_deref(), Some("https://old.test"));
+    assert_eq!(models.subagent.as_deref(), Some("old-subagent"));
+    assert_eq!(
+        models.opus.as_deref(),
+        Some("old-opus"),
+        "cancel wrote nothing"
+    );
+}
+
+/// The confirm's choice applies only over the fields it named: a reload that
+/// moved the account while it was open makes the apply ask again over the
+/// fresh diff, writing nothing.
+#[test]
+fn a_diff_that_moved_while_the_confirm_was_open_asks_again() {
+    use super::{Modal, PresetApplyButton};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = preset_apply_target();
+    {
+        let mut cfg = app.config();
+        let p = cfg
+            .find_mut(&crate::profile::ProfileName::from("target"))
+            .expect("target");
+        p.models.default = Some("landed-late".to_string());
+    }
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    let Some(Modal::PresetApply(form)) = app.modals.last() else {
+        panic!("the moved diff re-opens the confirm");
+    };
+    assert_eq!(
+        (form.replaces.as_slice(), form.leaves.as_slice(), form.focus),
+        (
+            ["base url", "model", "fable", "opus"].as_slice(),
+            ["subagent"].as_slice(),
+            PresetApplyButton::Keep,
+        ),
+    );
+    let (base_url, models) = saved_target(&app);
+    assert_eq!(base_url.as_deref(), Some("https://old.test"));
+    assert_eq!(
+        (models.opus.as_deref(), models.subagent.as_deref()),
+        (Some("old-opus"), Some("old-subagent")),
+        "nothing was written"
+    );
+}
+
+/// On a phone-width terminal the three buttons shorten to fit.
+#[test]
+fn the_keep_or_clear_buttons_shorten_on_a_narrow_terminal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = preset_apply_target();
+    let rows = modal_rows_at(&app, 40, 24);
+    assert!(
+        rows.iter().any(|r| r == "cancel   keep   clear"),
+        "{rows:#?}"
+    );
+}
+
+/// The picker fixes its target when it opens: a reload adding an account
+/// under an open picker never turns a `+ new` stamp into a saved-account
+/// apply.
+#[test]
+fn a_new_account_stamp_stays_on_the_draft_when_the_roster_grows() {
+    use super::{ActionMenuAction, Tab, dispatch_action_menu_action, handle_key};
+    use crate::profile::{Profile, ProfileName};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![]);
+    app.tab = Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    let mut draft = super::build_draft_new();
+    draft.name = super::InputState::new("late");
+    app.config_draft = Some(draft);
+    dispatch_action_menu_action(&mut app, ActionMenuAction::ApplyPreset);
+    app.config()
+        .profiles
+        .push(Profile::new("late".to_string(), None, None));
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // DeepSeek
+
+    assert_eq!(
+        draft_buffers(&app)[0],
+        "https://api.deepseek.com/anthropic",
+        "the draft took the stamp"
+    );
+    let cfg = app.config();
+    let late = cfg.find(&ProfileName::from("late")).expect("late");
+    assert_eq!(late.base_url, None, "the saved namesake stays untouched");
+}
+
+/// `keep them` writes the preset's fields and keeps every field it leaves
+/// unset.
+#[test]
+fn keep_them_writes_the_preset_and_keeps_what_it_leaves_unset() {
+    use crate::profile::ModelSettings;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = preset_apply_target();
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        saved_target(&app),
+        (
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            ModelSettings {
+                default: Some("opus".to_string()),
+                opus: Some("deepseek-v4-pro[1m]".to_string()),
+                sonnet: Some("deepseek-flash[1m]".to_string()),
+                haiku: Some("deepseek-flash[1m]".to_string()),
+                fable: Some("deepseek-v4-pro[1m]".to_string()),
+                subagent: Some("old-subagent".to_string()),
+            },
+        ),
+    );
+}
+
+/// `clear them` writes the preset's fields and empties every field it leaves
+/// unset; `→` walks the focus from `keep them` onto it.
+#[test]
+fn clear_them_writes_the_preset_and_clears_what_it_leaves_unset() {
+    use super::{Modal, PresetApplyButton};
+    use crate::profile::ModelSettings;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = preset_apply_target();
+
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    assert!(matches!(
+        app.modals.last(),
+        Some(Modal::PresetApply(f)) if f.focus == PresetApplyButton::Clear
+    ));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        saved_target(&app),
+        (
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            ModelSettings {
+                default: Some("opus".to_string()),
+                opus: Some("deepseek-v4-pro[1m]".to_string()),
+                sonnet: Some("deepseek-flash[1m]".to_string()),
+                haiku: Some("deepseek-flash[1m]".to_string()),
+                fable: Some("deepseek-v4-pro[1m]".to_string()),
+                subagent: None,
+            },
+        ),
+    );
+}
+
+/// A preset that only replaces values, leaving no set field behind, keeps
+/// the two-button confirm, naming just the fields whose value changes.
 #[test]
 fn applying_over_set_fields_names_them_before_replacing_anything() {
     use super::{
@@ -14465,12 +15108,9 @@ fn applying_over_set_fields_names_them_before_replacing_anything() {
         Some("https://old.test".to_string()),
         None,
     );
-    target.models.default = Some("keep-me".to_string());
+    target.models.default = Some("opus".to_string());
     target.models.opus = Some("old-opus".to_string());
-    target.models.fable = Some("old-fable".to_string());
-    target.models.subagent = Some("old-subagent".to_string());
     crate::profile::save_profile(&target).expect("save target");
-
     let mut app = app_with(vec![target]);
     app.tab = Tab::Setup;
     app.profile_cursor = 0;
@@ -14479,48 +15119,24 @@ fn applying_over_set_fields_names_them_before_replacing_anything() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter)); // cursor 0 = DeepSeek
 
     let Some(Modal::Confirm(state)) = app.modals.pop() else {
-        panic!("a set field raises the overwrite warning");
+        panic!("a replaced field raises the overwrite warning");
     };
-    assert_eq!(state.message, "apply 'DeepSeek' over 'target'?");
-    assert_eq!(
-        state.detail.as_deref(),
-        Some("replaces base url, model, fable, opus, subagent."),
-        "the warning names the fields in the Setup rows' order",
-    );
+    assert_eq!(state.message, "apply 'DeepSeek' to 'target'?");
+    assert_eq!(state.detail.as_deref(), Some("replaces base url, opus."));
     assert!(!state.choice, "the warning defaults to cancel");
-
-    // Cancelling is the pop above — nothing ran.
     assert_eq!(
-        app.config()
-            .find(&crate::profile::ProfileName::from("target"))
-            .expect("target")
-            .base_url
-            .as_deref(),
+        saved_target(&app).0.as_deref(),
         Some("https://old.test"),
         "the cancelled apply wrote nothing",
     );
 
     run_confirm_action(&mut app, state.on_confirm);
-    let cfg = app.config();
-    let applied = cfg
-        .find(&crate::profile::ProfileName::from("target"))
-        .expect("target");
+    let (base_url, models) = saved_target(&app);
     assert_eq!(
-        applied.base_url.as_deref(),
+        base_url.as_deref(),
         Some("https://api.deepseek.com/anthropic")
     );
-    assert_eq!(
-        applied.models,
-        crate::profile::ModelSettings {
-            default: Some("opus".to_string()),
-            opus: Some("deepseek-v4-pro[1m]".to_string()),
-            sonnet: Some("deepseek-flash[1m]".to_string()),
-            haiku: Some("deepseek-flash[1m]".to_string()),
-            fable: Some("deepseek-v4-pro[1m]".to_string()),
-            subagent: None,
-        },
-        "the apply replaces the model block whole, it does not merge into it",
-    );
+    assert_eq!(models.opus.as_deref(), Some("deepseek-v4-pro[1m]"));
 }
 
 /// A preset applied while the account's detail pane is open reshapes the row
@@ -17678,7 +18294,9 @@ fn c_and_p_are_inert_without_an_open_paste_door() {
 }
 
 /// The `+ new` form runs name to create with one login row and nothing beside
-/// it: the exact runtime sequence, like the OAuth account's tail above.
+/// it: the exact runtime sequence, like the OAuth account's tail above. Its
+/// alias overrides collapse behind `+ model override` the way a saved
+/// account's do.
 #[test]
 fn config_rows_on_the_new_form_carry_one_login_row() {
     use super::{ConfigRow, build_draft_new, config_rows};
@@ -17695,10 +18313,30 @@ fn config_rows_on_the_new_form_carry_one_login_row() {
             ConfigRow::Name,
             ConfigRow::BaseUrl,
             ConfigRow::Model,
+            ConfigRow::ModelOverrideAdd,
             ConfigRow::Login,
             ConfigRow::Create,
         ],
         "{rows:?}"
+    );
+
+    super::run_config_row(&mut app, ConfigRow::ModelOverrideAdd);
+    let rows = config_rows(&app);
+    assert_eq!(
+        rows,
+        [
+            ConfigRow::Name,
+            ConfigRow::BaseUrl,
+            ConfigRow::Model,
+            ConfigRow::FableModel,
+            ConfigRow::OpusModel,
+            ConfigRow::SonnetModel,
+            ConfigRow::HaikuModel,
+            ConfigRow::SubagentModel,
+            ConfigRow::Login,
+            ConfigRow::Create,
+        ],
+        "`+ model override` reveals every alias row: {rows:?}"
     );
 }
 

@@ -2096,7 +2096,7 @@ fn the_preset_picker_styles_its_delete_key() {
     use crate::tui::app::PresetPickerForm;
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let form = PresetPickerForm {
-        target: "work".to_string(),
+        target: "work".into(),
         presets: Vec::new(),
         cursor: 0,
         scroll: std::cell::Cell::new(0),

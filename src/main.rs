@@ -1144,7 +1144,10 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
             target.to_string(),
             base_url,
             api_key,
-            args.model.clone(),
+            profile::ModelSettings {
+                default: args.model.clone(),
+                ..Default::default()
+            },
         )?;
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     } else {
@@ -1154,7 +1157,10 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         actions::capture_into_profile(
             &mut config,
             target.to_string(),
-            args.model.clone(),
+            profile::ModelSettings {
+                default: args.model.clone(),
+                ..Default::default()
+            },
             snapshot,
         )?;
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
@@ -1286,7 +1292,10 @@ fn cmd_login_setup_token(
             target.to_string(),
             None,
             None,
-            model.map(str::to_string),
+            profile::ModelSettings {
+                default: model.map(str::to_string),
+                ..Default::default()
+            },
         )?;
     } else if let Some(model) = model {
         actions::set_profile_default_model(config, &target, model)?;

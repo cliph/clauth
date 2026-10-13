@@ -747,9 +747,10 @@ pub(crate) struct ConfigDraft {
     /// `+ model override` reveal state. Draft-scoped: a fresh draft starts
     /// collapsed (set overrides still render; unset ones hide behind the chip).
     pub(crate) overrides_expanded: bool,
-    /// The override rows this draft opened with a value. They stay listed for
-    /// the draft's life, so emptying one never pulls the row out from under
-    /// the cursor; a fresh draft tucks an unset one behind the chip again.
+    /// The override rows this draft opened with a value, or the last preset
+    /// stamp filled. They stay listed until the next stamp or the draft's end,
+    /// so emptying one never pulls the row out from under the cursor; a fresh
+    /// draft tucks an unset one behind the chip again.
     pub(crate) overrides_shown: Vec<ConfigRow>,
     /// A `+ new`-form login stash, held in memory until `create account`
     /// consumes it (capture-then-commit): the browser mint `+ login` produced,
@@ -766,6 +767,27 @@ pub(crate) struct ConfigDraft {
 }
 
 impl ConfigDraft {
+    /// The model block the six model buffers spell, each trimmed, a blank
+    /// one unset.
+    fn typed_models(&self) -> ModelSettings {
+        ModelSettings {
+            default: self.model.trimmed_some(),
+            opus: self.opus_model.trimmed_some(),
+            sonnet: self.sonnet_model.trimmed_some(),
+            haiku: self.haiku_model.trimmed_some(),
+            fable: self.fable_model.trimmed_some(),
+            subagent: self.subagent_model.trimmed_some(),
+        }
+    }
+
+    /// The alias-override rows whose buffer holds a value, in row order.
+    fn filled_overrides(&self) -> Vec<ConfigRow> {
+        OVERRIDE_ROWS
+            .into_iter()
+            .filter(|&row| self.field(row).is_some_and(|i| !i.value.trim().is_empty()))
+            .collect()
+    }
+
     /// The edit buffer behind a text, `Model`, or actively-edited env row; `None`
     /// for toggle/action rows. The env buffers resolve only while their row is the
     /// active one — an idle `EnvEntry` renders from the read-only snapshot instead.
@@ -874,6 +896,60 @@ pub(crate) struct ConfirmScroll {
     pub(crate) viewport: std::cell::Cell<u16>,
 }
 
+/// The three buttons of the apply-preset confirm, left to right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PresetApplyButton {
+    Cancel,
+    Keep,
+    Clear,
+}
+
+/// What `apply preset` stamps: the `+ new` draft, or a saved account. Fixed
+/// when the picker opens, so a reload moving the roster under an open picker
+/// or confirm never re-routes the apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PresetTarget {
+    NewAccount,
+    Account(String),
+}
+
+impl From<&str> for PresetTarget {
+    fn from(name: &str) -> Self {
+        Self::Account(name.to_string())
+    }
+}
+
+impl From<String> for PresetTarget {
+    fn from(name: String) -> Self {
+        Self::Account(name)
+    }
+}
+
+impl std::fmt::Display for PresetTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NewAccount => f.write_str("the new account"),
+            Self::Account(name) => write!(f, "'{name}'"),
+        }
+    }
+}
+
+/// `apply preset` over an account (or the `+ new` draft) holding a value
+/// where the preset leaves the field unset: `keep them` or `clear them`.
+#[derive(Debug, Clone)]
+pub(crate) struct PresetApplyForm {
+    pub(crate) target: PresetTarget,
+    pub(crate) preset: String,
+    /// The confirm's first line, naming the preset and its target.
+    pub(crate) message: String,
+    /// Fields whose value the preset's own replaces, in Setup row order.
+    pub(crate) replaces: Vec<&'static str>,
+    /// Fields holding a value the preset leaves unset, in Setup row order.
+    pub(crate) leaves: Vec<&'static str>,
+    pub(crate) focus: PresetApplyButton,
+    pub(crate) scroll: ConfirmScroll,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum ConfirmAction {
     /// `bool` = `from_divergence`, carried through for deferred-detach semantics.
@@ -923,10 +999,10 @@ pub(crate) enum ConfirmAction {
     /// Setup menu `save as preset`: a custom preset already holds the typed
     /// name. `(preset name, source account)` — confirming re-saves over it.
     OverwritePreset(String, String),
-    /// Setup menu `apply preset`: the target account already carries a base url
-    /// or model settings the preset would replace. `(account, preset name)` —
-    /// the preset is re-read at apply, so what lands is what is on disk now.
-    ApplyPresetOver(String, String),
+    /// Setup menu `apply preset`: the target already carries values the preset
+    /// would replace. `(target, preset name, the fields the confirm names)` —
+    /// the preset is re-read at apply, and a diff that moved since asks again.
+    ApplyPresetOver(PresetTarget, String, Vec<&'static str>),
     /// Preset picker `d`: drop a custom preset from disk.
     DeletePreset(String),
     /// Info-only modal: an action the user asked for is refused for a reason
@@ -1058,7 +1134,7 @@ impl NamePromptAction {
 #[derive(Debug, Clone)]
 pub(crate) struct PresetPickerForm {
     /// The account the pick is stamped onto.
-    pub(crate) target: String,
+    pub(crate) target: PresetTarget,
     pub(crate) presets: Vec<crate::presets::Preset>,
     pub(crate) cursor: usize,
     pub(crate) scroll: std::cell::Cell<usize>,
@@ -1460,6 +1536,8 @@ pub(crate) enum Modal {
     NamePrompt(NamePromptForm),
     /// Setup menu `apply preset`: pick which preset stamps the account.
     PresetPicker(PresetPickerForm),
+    /// `apply preset` over set fields the preset leaves unset: keep or clear.
+    PresetApply(PresetApplyForm),
     /// Divergence "save elsewhere": pick which profile the live login lands in.
     DivergenceTarget(DivergenceTargetForm),
     /// `+ add token`: pick which claude profile gets a client token.
@@ -14858,6 +14936,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::CaptureName(_) => handle_capture_name_key(app, key),
         Modal::NamePrompt(_) => handle_name_prompt_key(app, key),
         Modal::PresetPicker(_) => handle_preset_picker_key(app, key),
+        Modal::PresetApply(_) => handle_preset_apply_key(app, key),
         Modal::DivergenceTarget(_) => handle_divergence_target_key(app, key),
         Modal::TokenPicker(_) => handle_token_picker_key(app, key),
         Modal::ActionMenu(_) => handle_action_menu_key(app, key),
@@ -15851,6 +15930,42 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Alias overrides collapse: render the ones the draft shows (or, with no
+/// draft, the ones the profile sets), tuck the rest behind a single
+/// `+ model override` reveal until ⏎ expands them.
+fn push_override_rows(
+    rows: &mut Vec<ConfigRow>,
+    draft: Option<&ConfigDraft>,
+    profile: Option<&Profile>,
+) {
+    let expanded = draft.is_some_and(|d| d.overrides_expanded);
+    let override_set = |row: ConfigRow| match draft {
+        Some(d) => d.overrides_shown.contains(&row),
+        None => {
+            let v = match row {
+                ConfigRow::OpusModel => profile.and_then(|p| p.models.opus.as_deref()),
+                ConfigRow::SonnetModel => profile.and_then(|p| p.models.sonnet.as_deref()),
+                ConfigRow::HaikuModel => profile.and_then(|p| p.models.haiku.as_deref()),
+                ConfigRow::FableModel => profile.and_then(|p| p.models.fable.as_deref()),
+                ConfigRow::SubagentModel => profile.and_then(|p| p.models.subagent.as_deref()),
+                _ => None,
+            };
+            v.is_some_and(|s| !s.trim().is_empty())
+        }
+    };
+    let mut any_collapsed = false;
+    for row in OVERRIDE_ROWS {
+        if expanded || override_set(row) {
+            rows.push(row);
+        } else {
+            any_collapsed = true;
+        }
+    }
+    if any_collapsed {
+        rows.push(ConfigRow::ModelOverrideAdd);
+    }
+}
+
 /// Detail rows for the current selection. `+ new` → create form; account →
 /// settings (auto-start only for OAuth).
 pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
@@ -15863,8 +15978,9 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         if draft.is_some_and(|d| !d.base_url.value.trim().is_empty()) {
             rows.push(ConfigRow::ApiKey);
         }
-        // Base model only — the alias overrides + env rows stay existing-account-only.
+        // Env rows stay existing-account-only.
         rows.push(ConfigRow::Model);
+        push_override_rows(&mut rows, draft, None);
         if draft.is_none_or(|d| d.base_url.value.trim().is_empty()) {
             rows.push(ConfigRow::Login);
         }
@@ -15897,35 +16013,7 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         rows.push(ConfigRow::ApiKey);
     }
     rows.push(ConfigRow::Model);
-
-    // Alias overrides collapse: render the ones set when the draft opened, tuck
-    // the rest behind a single `+ model override` reveal until ⏎ expands them.
-    let expanded = draft.is_some_and(|d| d.overrides_expanded);
-    let override_set = |row: ConfigRow| match draft {
-        Some(d) => d.overrides_shown.contains(&row),
-        None => {
-            let v = match row {
-                ConfigRow::OpusModel => profile.and_then(|p| p.models.opus.as_deref()),
-                ConfigRow::SonnetModel => profile.and_then(|p| p.models.sonnet.as_deref()),
-                ConfigRow::HaikuModel => profile.and_then(|p| p.models.haiku.as_deref()),
-                ConfigRow::FableModel => profile.and_then(|p| p.models.fable.as_deref()),
-                ConfigRow::SubagentModel => profile.and_then(|p| p.models.subagent.as_deref()),
-                _ => None,
-            };
-            v.is_some_and(|s| !s.trim().is_empty())
-        }
-    };
-    let mut any_collapsed = false;
-    for row in OVERRIDE_ROWS {
-        if expanded || override_set(row) {
-            rows.push(row);
-        } else {
-            any_collapsed = true;
-        }
-    }
-    if any_collapsed {
-        rows.push(ConfigRow::ModelOverrideAdd);
-    }
+    push_override_rows(&mut rows, draft, profile);
 
     // One row per custom env entry (sorted), then the `+ add env` row. Indices
     // must match the sorted env snapshot used by the renderer and the commit path.
@@ -16051,10 +16139,7 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
         captured_login: None,
         mint_for: None,
     };
-    draft.overrides_shown = OVERRIDE_ROWS
-        .into_iter()
-        .filter(|&row| draft.field(row).is_some_and(|i| !i.value.trim().is_empty()))
-        .collect();
+    draft.overrides_shown = draft.filled_overrides();
     draft
 }
 
@@ -17789,7 +17874,7 @@ fn commit_new_account(app: &mut App) {
     let name = d.name.trimmed().to_string();
     let base_url = d.base_url.trimmed_some();
     let api_key = d.api_key.trimmed_some();
-    let model = d.model.trimmed_some();
+    let models = d.typed_models();
     // The `+ new profile` marker, armed only while the base url still names
     // the gateway and no live login is captured; editing the url away or
     // capturing a login disarms it, so `create account` is then an ordinary
@@ -17809,6 +17894,15 @@ fn commit_new_account(app: &mut App) {
         base_url.is_some() && matches!(d.captured_login, Some(DraftLogin::Mint(_)));
     let endpoint_overridden =
         base_url.is_some() && matches!(d.captured_login, Some(DraftLogin::LiveLogin(_)));
+    // The form's model rows were picked for the form's endpoint, so a captured
+    // login on another one takes none of them.
+    let models_dropped = !models.is_empty()
+        && matches!(&captured, Some(DraftLogin::LiveLogin(s)) if s.base_url != base_url);
+    let models = if models_dropped {
+        ModelSettings::default()
+    } else {
+        models
+    };
     let validation = validate_profile_name(&name, Harness::Claude, None);
     if let Err(e) = validation {
         app.toast(ToastKind::Danger, format!("{e}"));
@@ -17857,18 +17951,18 @@ fn commit_new_account(app: &mut App) {
             // Both stashes parked the login's uuid until this moment fixed the
             // name; the commit functions anchor it on the create.
             Some(DraftLogin::LiveLogin(snapshot)) => {
-                capture_into_profile(&mut cfg, name.clone(), model, *snapshot)
+                capture_into_profile(&mut cfg, name.clone(), models, *snapshot)
             }
             // The draft parked the login's uuid until this moment fixed the
             // name; `create_profile_from_login` anchors it on the commit.
             Some(DraftLogin::Mint(login)) => create_profile_from_login(
                 &mut cfg,
                 name.clone(),
-                model,
+                models,
                 login.credentials,
                 login.account_uuid,
             ),
-            None => create_blank_profile(&mut cfg, name.clone(), base_url, api_key, model),
+            None => create_blank_profile(&mut cfg, name.clone(), base_url, api_key, models),
         }
     };
     match result {
@@ -17879,10 +17973,18 @@ fn commit_new_account(app: &mut App) {
                     "base url set\nthe captured oauth login was discarded",
                 );
             }
-            if endpoint_overridden {
+            let unused = match (endpoint_overridden, models_dropped) {
+                (true, true) => Some("endpoint and model fields"),
+                (true, false) => Some("endpoint fields"),
+                (false, true) => Some("model fields"),
+                (false, false) => None,
+            };
+            if let Some(unused) = unused {
                 app.toast(
                     ToastKind::Info,
-                    "created from the captured current login\nthe typed endpoint fields were not used",
+                    format!(
+                        "created from the captured current login\nthe typed {unused} were not used"
+                    ),
                 );
             }
             finish_created_profile(app, &name);
@@ -18057,20 +18159,16 @@ fn prompt_save_preset(app: &mut App) {
 }
 
 /// `apply preset`: open the picker. The list always holds the built-ins, so
-/// it is never empty and needs no empty state. On `+ new` the target is the
-/// draft's name buffer (empty until the user types one); the preset's fields
+/// it is never empty and needs no empty state. On `+ new` the preset's fields
 /// are stamped into the draft, not a saved profile.
 fn open_preset_picker(app: &mut App) {
     let target = if let Some((name, _, _)) = focused_account(app) {
-        name.to_string()
+        PresetTarget::from(name.to_string())
     } else if app.profile_cursor >= app.profile_count() {
         if app.config_draft.is_none() {
             app.config_draft = Some(build_draft_new());
         }
-        app.config_draft
-            .as_ref()
-            .map(|d| d.name.trimmed().to_string())
-            .unwrap_or_default()
+        PresetTarget::NewAccount
     } else {
         return;
     };
@@ -18234,141 +18332,184 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
             let picked = state.presets.get(state.cursor.min(last)).cloned();
             let target = state.target.clone();
             app.modals.pop();
-            let Some(preset) = picked else {
-                return;
-            };
-            // Naming the fields that would change is the whole point of the
-            // warning: "this overwrites settings" says nothing a user can act on.
-            let clobbered = {
-                let cfg = app.config();
-                cfg.find(&ProfileName::from(target.clone()))
-                    .map(preset_clobbers)
-                    .unwrap_or_default()
-            };
-            if clobbered.is_empty() {
-                apply_preset_to(app, &target, &preset.name);
-                return;
+            if let Some(preset) = picked {
+                offer_preset_apply(app, target, &preset);
             }
-            app.open_modal(Modal::Confirm(ConfirmState {
-                message: format!("apply '{}' over '{target}'?", preset.name),
-                detail: Some(format!("replaces {}.", clobbered.join(", "))),
-                choice: false,
-                scroll: ConfirmScroll::default(),
-                on_confirm: ConfirmAction::ApplyPresetOver(target, preset.name),
-            }));
         }
         _ => {}
     }
 }
 
-/// Which of the target's own fields an apply would land on, in row order and
-/// spelled the way the Setup rows are. Empty means the preset writes into a
-/// blank endpoint + model block and can go straight through. Every set field
-/// counts: the apply REPLACES both blocks wholesale, so a field the preset
-/// leaves unset is cleared rather than kept.
-fn preset_clobbers(profile: &Profile) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if profile.base_url.is_some() {
-        out.push("base url");
-    }
-    let m = &profile.models;
-    for (label, set) in [
-        ("model", m.default.is_some()),
-        ("fable", m.fable.is_some()),
-        ("opus", m.opus.is_some()),
-        ("sonnet", m.sonnet.is_some()),
-        ("haiku", m.haiku.is_some()),
-        ("subagent", m.subagent.is_some()),
-    ] {
-        if set {
-            out.push(label);
+/// The endpoint + model block `apply preset` lands on: the draft's buffers on
+/// `+ new`, which stand in for an account's values, the saved account's own
+/// otherwise. `None` once the account is gone.
+fn preset_target_block(
+    app: &App,
+    target: &PresetTarget,
+) -> Option<(Option<String>, ModelSettings)> {
+    match target {
+        PresetTarget::NewAccount => app
+            .config_draft
+            .as_ref()
+            .map(|d| (d.base_url.trimmed_some(), d.typed_models())),
+        PresetTarget::Account(name) => {
+            let cfg = app.config();
+            cfg.find(&ProfileName::from(name.as_str()))
+                .map(|p| (p.base_url.clone(), p.models.clone()))
         }
     }
-    out
 }
 
-/// Stamp `preset` onto `target`. A saved account is written in a single locked
-/// transaction ([`edit_profile_preset`]) so a failure leaves the whole profile on
-/// its prior state. On `+ new` (cursor past the roster) the target names the
-/// unsaved draft, not a profile on disk — the preset's fields are written into
-/// the draft's input buffers directly and committed when the create form fires.
-/// Rebuilds the draft afterwards for a saved account, since every buffer it
-/// holds is stale.
+/// Apply `preset` to `target`, asking first whenever it would change a value:
+/// the keep / clear confirm when the target holds a value the preset leaves
+/// unset, the plain confirm when it only replaces values, straight through
+/// otherwise. Naming the fields is the point of asking: "this overwrites
+/// settings" says nothing a user can act on.
+fn offer_preset_apply(app: &mut App, target: PresetTarget, preset: &crate::presets::Preset) {
+    let Some((base_url, models)) = preset_target_block(app, &target) else {
+        app.toast(ToastKind::Danger, format!("{target} is gone"));
+        return;
+    };
+    let (replaces, leaves) = preset.apply_diff(base_url.as_deref(), &models);
+    let message = format!("apply '{}' to {target}?", preset.name);
+    if !leaves.is_empty() {
+        app.open_modal(Modal::PresetApply(PresetApplyForm {
+            target,
+            preset: preset.name.clone(),
+            message,
+            replaces,
+            leaves,
+            focus: PresetApplyButton::Keep,
+            scroll: ConfirmScroll::default(),
+        }));
+    } else if !replaces.is_empty() {
+        app.open_modal(Modal::Confirm(ConfirmState {
+            message,
+            detail: Some(format!("replaces {}.", replaces.join(", "))),
+            choice: false,
+            scroll: ConfirmScroll::default(),
+            on_confirm: ConfirmAction::ApplyPresetOver(target, preset.name.clone(), replaces),
+        }));
+    } else {
+        apply_preset_to(
+            app,
+            &target,
+            &preset.name,
+            crate::presets::Leftover::Keep,
+            &[],
+            &[],
+        );
+    }
+}
+
+/// Stamp `preset` onto `target`: every field the preset sets, and every field
+/// it leaves unset kept or cleared per `leftover`. `replaces` and `leaves` are
+/// the fields the confirm named; a reload or a preset edit since it opened can
+/// move them, and then the apply asks again over the fresh diff rather than
+/// change a field nobody was shown.
+///
+/// A saved account is written in a single locked transaction
+/// ([`edit_profile_preset`]) so a failure leaves the whole profile on its prior
+/// state, and its draft is rebuilt, since every buffer it holds is stale. On
+/// `+ new` the result lands in the draft's input buffers and is committed when
+/// the create form fires.
 ///
 /// The preset is re-read here rather than carried from the picker: a confirm can
 /// sit open across an edit to the store, and what the user confirmed was a NAME.
 /// The account's own api key is preserved — a template names an endpoint, never
 /// the credential for one.
-fn apply_preset_to(app: &mut App, target: &str, preset: &str) {
+fn apply_preset_to(
+    app: &mut App,
+    target: &PresetTarget,
+    preset: &str,
+    leftover: crate::presets::Leftover,
+    replaces: &[&'static str],
+    leaves: &[&'static str],
+) {
     let Some(preset) = crate::presets::load_preset(preset) else {
         app.toast(ToastKind::Danger, format!("preset '{preset}' is gone"));
         return;
     };
-    // `+ new`: target names the draft. Stamp the input buffers and return —
-    // nothing is on disk until the create form commits.
-    if app.profile_cursor >= app.profile_count() {
-        stamp_draft_from_preset(app, &preset);
+    let Some((base_url, models)) = preset_target_block(app, target) else {
+        app.toast(ToastKind::Danger, format!("{target} is gone"));
+        return;
+    };
+    if preset.apply_diff(base_url.as_deref(), &models) != (replaces.to_vec(), leaves.to_vec()) {
+        offer_preset_apply(app, target.clone(), &preset);
         return;
     }
-    let target = ProfileName::from(target);
+    let name = match target {
+        PresetTarget::NewAccount => {
+            let selected = config_rows(app).get(app.config_action_cursor).copied();
+            stamp_draft_from_preset(app, &preset, leftover);
+            if let Some(pos) = selected.and_then(|row| config_row_index(app, row)) {
+                app.config_action_cursor = pos;
+            }
+            return;
+        }
+        PresetTarget::Account(name) => ProfileName::from(name.as_str()),
+    };
+    let (new_url, new_models) = preset.applied_to(&base_url, &models, leftover);
+    let repointed = new_url != base_url;
     let result = {
         let mut cfg = app.config();
-        edit_profile_preset(
-            &mut cfg,
-            &target,
-            preset.base_url.clone(),
-            preset.models.clone(),
-        )
+        edit_profile_preset(&mut cfg, &name, new_url, new_models)
     };
     match result {
         Ok(()) => {
             app.refresh_tokens();
-            // The repoint retires the old provider's verdicts — the shared
+            // A repoint retires the old provider's verdicts — the shared
             // clear keeps its streak from accusing the new endpoint.
-            clear_profile_status_chrome(app, &target);
+            if repointed {
+                clear_profile_status_chrome(app, &name);
+            }
             app.last_reload_fp = reload_fingerprint();
             if app.config_draft.is_some() {
                 let selected = config_rows(app).get(app.config_action_cursor).copied();
-                app.config_draft = Some(build_draft_existing(app, &target));
+                app.config_draft = Some(build_draft_existing(app, &name));
                 if let Some(pos) = selected.and_then(|row| config_row_index(app, row)) {
                     app.config_action_cursor = pos;
                 }
             }
             app.toast(
                 ToastKind::Success,
-                format!("applied '{}' to '{target}'", preset.name),
+                format!("applied '{}' to '{name}'", preset.name),
             );
         }
         Err(e) => app.toast(ToastKind::Danger, format!("apply preset failed\n{e}")),
     }
 }
 
-/// Write `preset`'s fields into the `+ new` draft's input buffers. Only fields
-/// the preset carries are touched — a draft is a work in progress, so clearing
-/// a buffer the user had typed (because the preset left that field unset) would
-/// lose their work for no reason. The model-override fields the preset does
-/// carry land in the corresponding tier row.
-fn stamp_draft_from_preset(app: &mut App, preset: &crate::presets::Preset) {
+/// Write `preset`'s fields into the `+ new` draft's input buffers, the typed
+/// buffers standing in for a saved account's values: the draft ends where the
+/// same apply leaves a saved account, alias rows shown the way that account's
+/// rebuilt pane shows them.
+fn stamp_draft_from_preset(
+    app: &mut App,
+    preset: &crate::presets::Preset,
+    leftover: crate::presets::Leftover,
+) {
     let Some(draft) = app.config_draft.as_mut() else {
         return;
     };
-    if let Some(url) = preset.base_url.as_deref() {
-        draft.base_url = InputState::new(url);
-    }
-    if let Some(m) = preset.models.default.as_deref() {
-        draft.model = InputState::new(m);
-    }
+    let (base_url, models) = preset.applied_to(
+        &draft.base_url.trimmed_some(),
+        &draft.typed_models(),
+        leftover,
+    );
     for (value, field) in [
-        (preset.models.opus.as_deref(), &mut draft.opus_model),
-        (preset.models.sonnet.as_deref(), &mut draft.sonnet_model),
-        (preset.models.haiku.as_deref(), &mut draft.haiku_model),
-        (preset.models.fable.as_deref(), &mut draft.fable_model),
-        (preset.models.subagent.as_deref(), &mut draft.subagent_model),
+        (base_url, &mut draft.base_url),
+        (models.default, &mut draft.model),
+        (models.opus, &mut draft.opus_model),
+        (models.sonnet, &mut draft.sonnet_model),
+        (models.haiku, &mut draft.haiku_model),
+        (models.fable, &mut draft.fable_model),
+        (models.subagent, &mut draft.subagent_model),
     ] {
-        if let Some(m) = value {
-            *field = InputState::new(m);
-        }
+        *field = InputState::new(value.as_deref().unwrap_or_default());
     }
+    draft.overrides_expanded = false;
+    draft.overrides_shown = draft.filled_overrides();
     let name = preset.name.clone();
     app.toast(
         ToastKind::Success,
@@ -18556,6 +18697,75 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
             app.modals.pop();
             if confirmed {
                 run_confirm_action(app, action);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Keys on the apply-preset keep / clear confirm: the confirm's grammar over
+/// three buttons. `←`/`→` step and stop at either end, `tab` wraps, `↵`/space
+/// choose, esc/q cancel; `↑`/`↓` and the page keys scroll the body.
+fn handle_preset_apply_key(app: &mut App, key: KeyEvent) {
+    use PresetApplyButton::{Cancel, Clear, Keep};
+    let Some(Modal::PresetApply(form)) = app.modals.last_mut() else {
+        return;
+    };
+    let scroll = &mut form.scroll;
+    match key.code {
+        KeyCode::Left => {
+            form.focus = match form.focus {
+                Clear => Keep,
+                Keep | Cancel => Cancel,
+            };
+        }
+        KeyCode::Right => {
+            form.focus = match form.focus {
+                Cancel => Keep,
+                Keep | Clear => Clear,
+            };
+        }
+        KeyCode::Tab => {
+            form.focus = match form.focus {
+                Cancel => Keep,
+                Keep => Clear,
+                Clear => Cancel,
+            };
+        }
+        KeyCode::Up => {
+            scroll.offset = scroll.offset.min(scroll.max_scroll.get()).saturating_sub(1);
+        }
+        KeyCode::Down => {
+            scroll.offset = scroll.offset.saturating_add(1).min(scroll.max_scroll.get());
+        }
+        KeyCode::PageUp => {
+            scroll.offset = page_up_scroll(
+                scroll.offset as usize,
+                scroll.max_scroll.get() as usize,
+                scroll.viewport.get() as usize,
+            ) as u16;
+        }
+        KeyCode::PageDown => {
+            scroll.offset = page_down_scroll(
+                scroll.offset as usize,
+                scroll.max_scroll.get() as usize,
+                scroll.viewport.get() as usize,
+            ) as u16;
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.modals.pop();
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let leftover = match form.focus {
+                Cancel => None,
+                Keep => Some(crate::presets::Leftover::Keep),
+                Clear => Some(crate::presets::Leftover::Clear),
+            };
+            let (target, preset) = (form.target.clone(), form.preset.clone());
+            let (replaces, leaves) = (form.replaces.clone(), form.leaves.clone());
+            app.modals.pop();
+            if let Some(leftover) = leftover {
+                apply_preset_to(app, &target, &preset, leftover, &replaces, &leaves);
             }
         }
         _ => {}
@@ -18852,7 +19062,16 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         }
         ConfirmAction::AddChainCandidate(name) => commit_chain_add(app, &ProfileName::from(name)),
         ConfirmAction::OverwritePreset(preset, source) => save_preset_from(app, &source, &preset),
-        ConfirmAction::ApplyPresetOver(target, preset) => apply_preset_to(app, &target, &preset),
+        ConfirmAction::ApplyPresetOver(target, preset, replaces) => {
+            apply_preset_to(
+                app,
+                &target,
+                &preset,
+                crate::presets::Leftover::Keep,
+                &replaces,
+                &[],
+            );
+        }
         ConfirmAction::DeletePreset(preset) => match crate::presets::delete_preset(&preset) {
             Ok(()) => app.toast(ToastKind::Success, format!("deleted preset '{preset}'")),
             Err(e) => app.toast(ToastKind::Danger, format!("delete preset failed\n{e}")),
@@ -19363,7 +19582,7 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
             }
             let result = {
                 let mut cfg = app.config();
-                capture_into_profile(&mut cfg, name.clone(), None, *snapshot)
+                capture_into_profile(&mut cfg, name.clone(), Default::default(), *snapshot)
             };
             match result {
                 Ok(()) => {

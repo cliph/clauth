@@ -2641,7 +2641,7 @@ fn a_fresh_capture_after_a_switch_off_strips_the_departed_accounts_env() {
     capture_into_profile(
         &mut config,
         "incoming".to_string(),
-        None,
+        Default::default(),
         login_snapshot("rt-incoming", None),
     )
     .expect("capture the incoming account");
@@ -2710,7 +2710,7 @@ fn a_tui_create_account_after_a_switch_off_strips_the_departed_accounts_env() {
     create_profile_from_login(
         &mut config,
         "incoming".to_string(),
-        None,
+        Default::default(),
         ClaudeCredentials {
             claude_ai_oauth: Some(crate::profile::OAuthToken {
                 access_token: "at-incoming".to_string(),
@@ -3283,7 +3283,7 @@ fn capture_into_profile_anchors_the_account_it_committed() {
     capture_into_profile(
         &mut config,
         "fresh".to_string(),
-        None,
+        Default::default(),
         login_snapshot("minted", Some("uuid-fresh")),
     )
     .expect("capture");
@@ -3343,7 +3343,7 @@ fn first_capture_over_a_foreign_live_login_refuses_and_rolls_back() {
     let err = capture_into_profile(
         &mut config,
         "work".to_string(),
-        None,
+        Default::default(),
         login_snapshot("minted-refresh", None),
     )
     .expect_err("the guarded link must refuse over a foreign live file");
@@ -3424,8 +3424,14 @@ fn first_create_from_login_over_a_foreign_live_login_refuses_and_rolls_back() {
         }),
     };
 
-    let err = create_profile_from_login(&mut config, "work".to_string(), None, minted, None)
-        .expect_err("the guarded link must refuse over a foreign live file");
+    let err = create_profile_from_login(
+        &mut config,
+        "work".to_string(),
+        Default::default(),
+        minted,
+        None,
+    )
+    .expect_err("the guarded link must refuse over a foreign live file");
 
     let msg = err.to_string();
     assert!(
@@ -3683,14 +3689,14 @@ fn a_capture_onto_an_orphan_dir_removes_its_stale_anchor() {
     capture_into_profile(
         &mut config,
         "orphan".to_string(),
-        None,
+        Default::default(),
         login_snapshot("minted", None),
     )
     .expect("capture");
     capture_into_profile(
         &mut config,
         "brandnew".to_string(),
-        None,
+        Default::default(),
         login_snapshot("minted2", None),
     )
     .expect("capture brand new");
@@ -4216,7 +4222,7 @@ fn delete_active_api_profile_unwires_settings_endpoint() {
         "api-acct".to_string(),
         Some("https://api.example.com".to_string()),
         Some("sk-secret".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create api profile");
     // create_blank_profile does not activate; mark it active and wire the live
@@ -4267,8 +4273,14 @@ fn delete_refuses_live_session_unless_forced() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "busy".to_string(), None, None, None)
-        .expect("create profile");
+    create_blank_profile(
+        &mut config,
+        "busy".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
 
     // Simulate a live session: a locked pid file in the profile's sessions dir
     // reads as alive via `has_live_session` (the probe's `try_lock` on a
@@ -4340,7 +4352,7 @@ fn delete_refuses_while_a_rotation_holds_the_lock() {
         "rotating".to_string(),
         Some("https://api.example.com".to_string()),
         Some("sk-secret".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create api profile");
     // Active, so the delete's unwire leg is armed: an api key in the live
@@ -4438,8 +4450,14 @@ fn rename_refuses_while_a_rotation_holds_the_lock() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "ren-old".to_string(), None, None, None)
-        .expect("create profile");
+    create_blank_profile(
+        &mut config,
+        "ren-old".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
 
     let holder = hold_rotation_lock("ren-old");
 
@@ -4509,8 +4527,14 @@ fn rename_refuses_a_live_session() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "busy".to_string(), None, None, None)
-        .expect("create profile");
+    create_blank_profile(
+        &mut config,
+        "busy".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
 
     // Simulate a live session: a locked pid file in the profile's sessions dir
     // reads as alive via `has_live_session` (the probe's `try_lock` on a
@@ -4562,7 +4586,14 @@ fn rename_refuses_a_leftover_target_directory() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "src".to_string(), None, None, None).expect("create profile");
+    create_blank_profile(
+        &mut config,
+        "src".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
 
     // A leftover: the target's directory exists with a cache file in it, but no
     // record names the target.
@@ -4611,8 +4642,14 @@ fn rename_retry_completes_the_record_when_the_old_dir_is_already_moved() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "mid-src".to_string(), None, None, None)
-        .expect("create profile");
+    create_blank_profile(
+        &mut config,
+        "mid-src".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create profile");
 
     // The crash window: the dir move happened, the record rename did not.
     std::fs::rename(
@@ -4682,7 +4719,14 @@ fn a_delete_does_not_release_the_lock_it_is_holding() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "victim".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "victim".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
 
     // Bound to a `let`, so the guard outlives the delete the way `cmd_delete`'s
     // does — it drops at end of scope, well after `remove_dir_all`.
@@ -4734,7 +4778,14 @@ fn an_unopenable_rotation_lock_refuses_in_the_fault_vocabulary() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "broken".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "broken".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
 
     // A regular file where the locks DIRECTORY belongs, so `mkdir_700` fails.
     let lock = crate::runtime::rotation_lock_path(&crate::profile::ProfileName::from("broken"))
@@ -4773,7 +4824,14 @@ fn a_case_only_rename_is_not_a_collision_with_itself() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "work".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "work".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
 
     rename_profile(
         &mut config,
@@ -4805,8 +4863,22 @@ fn a_rename_onto_a_case_variant_of_another_account_is_refused() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "work".to_string(), None, None, None).expect("create");
-    create_blank_profile(&mut config, "work2".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "work".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
+    create_blank_profile(
+        &mut config,
+        "work2".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
 
     let _ = rename_profile(
         &mut config,
@@ -4827,7 +4899,14 @@ fn the_mutation_refusal_matches_the_rotation_lock_held_copy() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "shared".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "shared".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
 
     // Bound, not discarded: `let _ =` would drop the handle and release the
     // flock before the refusal under test is even attempted.
@@ -4858,7 +4937,14 @@ fn disable_refuses_the_active_profile() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "acme".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "acme".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
     config.state.active_profile = Some("acme".into());
 
     let err = disable_profile(&mut config, &crate::profile::ProfileName::from("acme"))
@@ -4883,7 +4969,14 @@ fn disable_refuses_a_profile_with_a_live_session() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "busy".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "busy".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
 
     // Same live-session simulation as `delete_refuses_live_session_unless_forced`:
     // a locked pid file in the profile's sessions dir reads as alive.
@@ -4916,7 +5009,14 @@ fn disable_sets_the_flag_and_a_reload_observes_it() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "acme".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "acme".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
 
     let changed = disable_profile(&mut config, &crate::profile::ProfileName::from("acme"))
         .expect("disable succeeds");
@@ -4945,7 +5045,14 @@ fn disable_is_idempotent_on_an_already_disabled_profile() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "acme".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "acme".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
     disable_profile(&mut config, &crate::profile::ProfileName::from("acme"))
         .expect("first disable");
 
@@ -5047,7 +5154,14 @@ fn enable_is_idempotent_on_an_already_enabled_profile() {
         state: AppState::default(),
         profiles: Vec::new(),
     };
-    create_blank_profile(&mut config, "acme".to_string(), None, None, None).expect("create");
+    create_blank_profile(
+        &mut config,
+        "acme".to_string(),
+        None,
+        None,
+        Default::default(),
+    )
+    .expect("create");
 
     let changed = enable_profile(&mut config, &crate::profile::ProfileName::from("acme"))
         .expect("enable on an enabled profile");
@@ -5077,7 +5191,7 @@ fn delete_active_unwire_failure_keeps_profile_retryable() {
         "api-acct".to_string(),
         Some("https://api.example.com".to_string()),
         Some("sk-secret".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create api profile");
     config.state.active_profile = Some("api-acct".into());
@@ -5124,7 +5238,7 @@ fn clear_profile_api_key_keeps_base_url_and_active_status() {
         "api-acct".to_string(),
         Some("https://api.example.com".to_string()),
         Some("sk-secret".to_string()),
-        None,
+        Default::default(),
     )
     .expect("create api profile");
     config.state.active_profile = Some("api-acct".into());
@@ -7063,8 +7177,14 @@ fn blank_profiles(names: &[&str]) -> AppConfig {
         profiles: Vec::new(),
     };
     for name in names {
-        create_blank_profile(&mut config, (*name).to_string(), None, None, None)
-            .expect("create profile");
+        create_blank_profile(
+            &mut config,
+            (*name).to_string(),
+            None,
+            None,
+            Default::default(),
+        )
+        .expect("create profile");
     }
     config
 }

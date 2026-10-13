@@ -896,9 +896,9 @@ pub(crate) fn edit_profile_preferred_days(
     })
 }
 
-/// Apply a preset (`base_url` + `models`) in a single locked transaction. A
-/// preset never carries the api key, so the account's own credential is
-/// preserved. Building the full profile state and writing it once — one lock
+/// Write an applied preset's result (`base_url` + `models`, already merged over
+/// the account's own by the caller) in a single locked transaction. A preset
+/// never carries the api key, so the account's own credential is preserved. Building the full profile state and writing it once — one lock
 /// acquisition, one disk write, one live-settings re-apply — means a failure
 /// leaves the account on its prior state rather than half-stamped (new endpoint,
 /// old models) the way chaining [`edit_profile_endpoint`] +
@@ -1818,23 +1818,37 @@ pub(crate) fn enable_profile(config: &mut AppConfig, name: &ProfileName) -> Resu
     })
 }
 
+/// `models` with every id trimmed and a blank one dropped to unset.
+fn trimmed_models(models: ModelSettings) -> ModelSettings {
+    let trim = |m: Option<String>| {
+        m.as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+    };
+    ModelSettings {
+        default: trim(models.default),
+        opus: trim(models.opus),
+        sonnet: trim(models.sonnet),
+        haiku: trim(models.haiku),
+        fable: trim(models.fable),
+        subagent: trim(models.subagent),
+    }
+}
+
 pub(crate) fn create_blank_profile(
     config: &mut AppConfig,
     name: String,
     base_url: Option<String>,
     api_key: Option<String>,
-    model: Option<String>,
+    models: ModelSettings,
 ) -> Result<()> {
     with_state_lock(|_held| {
         let mut profile = Profile::new(name, base_url, api_key);
         // Part of the same single save as the profile itself — a chained
         // edit-after-create would leave a saved-but-model-less profile behind
         // when the second write fails, reported as a flat "create failed".
-        profile.models.default = model
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(str::to_string);
+        profile.models = trimmed_models(models);
         save_profile(&profile)?;
         config.add(profile);
         save_app_state(&config.state)
@@ -2071,17 +2085,17 @@ pub(crate) fn capture_current_login(config: &mut AppConfig, name: &str) -> Resul
         bail!("these credentials already belong to '{owner}'; switch to it with:  clauth {owner}");
     }
     let becomes_active = config.state.active_profile.is_none();
-    capture_into_profile(config, name.to_string(), None, snapshot)?;
+    capture_into_profile(config, name.to_string(), Default::default(), snapshot)?;
     Ok(becomes_active)
 }
 
-/// `model` rides along the same way [`create_profile_from_login`]'s does: the
-/// Setup `+ new` form's typed default model. Every capture-from-a-name-prompt
-/// caller passes `None`.
+/// `models` rides along the same way [`create_profile_from_login`]'s does: the
+/// Setup `+ new` form's model block. Every capture-from-a-name-prompt caller
+/// passes an empty one.
 pub(crate) fn capture_into_profile(
     config: &mut AppConfig,
     name: String,
-    model: Option<String>,
+    models: ModelSettings,
     snapshot: CaptureSnapshot,
 ) -> Result<()> {
     let CaptureSnapshot {
@@ -2094,11 +2108,7 @@ pub(crate) fn capture_into_profile(
     let seed_name = name.clone();
     with_state_lock(|held| {
         let mut profile = Profile::new(name.to_string(), base_url, api_key);
-        profile.models.default = model
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(str::to_string);
+        profile.models = trimmed_models(models);
         // A fresh profile can sit on an orphan dir holding a stale anchor (a
         // hand-edited roster, a crash before the record landed): remove it before
         // the store write, like every other install.
@@ -2145,13 +2155,13 @@ pub(crate) fn capture_into_profile(
 
 /// Create a fresh OAuth profile from an in-memory minted login — the Setup
 /// tab's capture-then-commit path (`create account` consuming the draft-held
-/// mint). One save carries credentials + model so a failed write never leaves
+/// mint). One save carries credentials + models so a failed write never leaves
 /// a half-configured profile behind; the first profile links + activates
 /// exactly like [`capture_into_profile`].
 pub(crate) fn create_profile_from_login(
     config: &mut AppConfig,
     name: String,
-    model: Option<String>,
+    models: ModelSettings,
     credentials: ClaudeCredentials,
     account_uuid: Option<AccountId>,
 ) -> Result<()> {
@@ -2159,11 +2169,7 @@ pub(crate) fn create_profile_from_login(
     let seed_name = name.clone();
     with_state_lock(|held| {
         let mut profile = Profile::new(name.to_string(), None, None);
-        profile.models.default = model
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(str::to_string);
+        profile.models = trimmed_models(models);
         // Same orphan-dir guard as `capture_into_profile`: remove any stale
         // anchor before the store write.
         crate::profile_cache::remove_profile_cache(

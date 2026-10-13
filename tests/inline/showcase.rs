@@ -1031,10 +1031,11 @@ fn demo_data_drives_all_actions() {
     type_str(&mut app, "sk-test-key-0000");
     press(&mut app, KeyCode::Enter); // commit ApiKey
 
-    // Navigate to Create row and commit (skipping over the base model row —
-    // left untouched, so the created profile's default stays unset).
+    // Navigate to Create row and commit (skipping over the base model row and
+    // the collapsed overrides — left untouched, so every model stays unset).
     press(&mut app, KeyCode::Down); // ApiKey → Model
-    press(&mut app, KeyCode::Down); // Model → Create
+    press(&mut app, KeyCode::Down); // Model → + model override
+    press(&mut app, KeyCode::Down); // + model override → Create
 
     assert!(
         app.config_draft

@@ -12,8 +12,8 @@ use crate::profile::DivergenceChoice;
 use super::super::app::{
     ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceAction, DivergenceForm,
     DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginMethod,
-    LoginStage, Modal, NamePromptForm, PresetPickerForm, StatusFocus, Tab, TokenPickerForm,
-    TokenView, token_model_count,
+    LoginStage, Modal, NamePromptForm, PresetApplyButton, PresetApplyForm, PresetPickerForm,
+    StatusFocus, Tab, TokenPickerForm, TokenView, token_model_count,
 };
 use super::super::theme;
 use super::chain::reason_marker;
@@ -35,6 +35,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         Modal::CaptureName(form) => draw_capture_name(frame, area, &form.input),
         Modal::NamePrompt(form) => draw_name_prompt(frame, area, form),
         Modal::PresetPicker(form) => draw_preset_picker(frame, area, form),
+        Modal::PresetApply(form) => draw_preset_apply(frame, area, form),
         Modal::DivergenceTarget(form) => draw_divergence_target(frame, area, form),
         Modal::TokenPicker(form) => draw_token_picker(frame, area, form),
         Modal::Help => draw_help(frame, area, app),
@@ -646,6 +647,51 @@ fn modal_button(label: &str, focused: bool) -> Span<'static> {
     }
 }
 
+/// The apply-preset confirm with a third button: the fields the preset leaves
+/// unset are kept or cleared. Laid out like `draw_confirm`, the body
+/// scrolling over pinned buttons.
+fn draw_preset_apply(frame: &mut Frame<'_>, area: Rect, form: &PresetApplyForm) {
+    let mut lines = vec![Line::from(Span::styled(
+        form.message.clone(),
+        theme::body(),
+    ))];
+    if !form.replaces.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("replaces {}.", form.replaces.join(", ")),
+            theme::dim(),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("the preset leaves {} unset.", form.leaves.join(", ")),
+        theme::dim(),
+    )));
+    // The full labels overflow a phone-width modal; the body above still
+    // names what keep and clear act on.
+    let (keep, clear) = if super::panes::narrow(area.width) {
+        (" keep ", " clear ")
+    } else {
+        (" keep them ", " clear them ")
+    };
+    let buttons = Line::from(vec![
+        modal_button(" cancel ", form.focus == PresetApplyButton::Cancel),
+        Span::raw(" "),
+        modal_button(keep, form.focus == PresetApplyButton::Keep),
+        Span::raw(" "),
+        danger_button(clear, form.focus == PresetApplyButton::Clear),
+    ]);
+    let d = draw_modal_scrolled(
+        frame,
+        area,
+        "CONFIRM",
+        lines,
+        form.scroll.offset,
+        None,
+        Some(ModalExtra::Buttons(buttons.alignment(Alignment::Right))),
+    );
+    form.scroll.max_scroll.set(d.max_scroll);
+    form.scroll.viewport.set(d.viewport);
+}
+
 /// Destructive variant of `modal_button`: DANGER fg unfocused, inverse DANGER block
 /// focused. Same bar-less house style as `modal_button` (no `▐`/`▌`).
 pub(super) fn danger_button(label: &str, focused: bool) -> Span<'static> {
@@ -1016,7 +1062,7 @@ fn draw_preset_picker(frame: &mut Frame<'_>, area: Rect, form: &PresetPickerForm
 
     let mut lines: Vec<Line<'_>> = vec![
         Line::from(Span::styled(
-            format!("sets the base url and models on '{}'.", form.target),
+            format!("sets the base url and models on {}.", form.target),
             theme::dim(),
         )),
         Line::from(""),

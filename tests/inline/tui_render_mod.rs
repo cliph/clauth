@@ -2425,7 +2425,7 @@ fn the_setup_model_row_wraps_between_options_at_80_columns() {
         [
             "❯ model           default  [fable]  opus  sonnet",
             "                  haiku  opusplan",
-            "  + login",
+            "  + model override",
         ],
         "{out}"
     );

@@ -40,21 +40,58 @@ struct PresetFile {
 struct Builtin {
     name: &'static str,
     base_url: &'static str,
-    model: &'static str,
-    /// Whether `model` is written to every alias and the subagent row, or to
-    /// `models.default` alone.
-    ///
-    /// `default` alone is the lighter template: it is CC's top-level `model`
-    /// setting, the fallback every alias resolves through when no per-tier
-    /// override covers it, so it leaves the tier rows free for the operator.
-    /// That only holds while the endpoint tolerates whatever an uncovered alias
-    /// resolves to. Alibaba's does not: `POST /apps/anthropic/v1/messages` with
-    /// `claude-sonnet-4-5` or `claude-haiku-4-5-20251001` answers
-    /// `400 InvalidParameter "Model not exist."` (measured 2026-08-11 against
-    /// `token-plan.ap-southeast-1`), so an alias left unpinned is a hard failure
-    /// rather than a degraded route. Alibaba's own `bl config agent --agent
-    /// claude-code` writes all of them for the same reason.
-    pin_every_tier: bool,
+    binds: Binds,
+}
+
+/// How a built-in fills the account's model block.
+enum Binds {
+    /// One id per Claude tier. `default` becomes the `opus` alias, so the main
+    /// model follows the opus bind and a model release touches tier rows only;
+    /// `subagent` stays unset, so a subagent's own tier pick resolves through
+    /// that tier's bind. A `[1m]` suffix makes Claude Code size the context
+    /// window at 1M, so it rides only an id whose endpoint takes that much.
+    Tiers {
+        opus: &'static str,
+        sonnet: &'static str,
+        haiku: &'static str,
+        fable: &'static str,
+    },
+    /// One id on `default`, every tier and the subagent row. Alibaba's
+    /// `POST /apps/anthropic/v1/messages` answers `400 InvalidParameter "Model
+    /// not exist."` to `claude-sonnet-4-5` and `claude-haiku-4-5-20251001`
+    /// (measured 2026-08-11 against `token-plan.ap-southeast-1`), so a row left
+    /// unset is a hard failure there; Alibaba's own `bl config agent --agent
+    /// claude-code` writes every row for the same reason.
+    Every(&'static str),
+}
+
+impl Binds {
+    fn models(&self) -> ModelSettings {
+        let id = |s: &str| Some(s.to_string());
+        match *self {
+            Binds::Tiers {
+                opus,
+                sonnet,
+                haiku,
+                fable,
+            } => ModelSettings {
+                default: id("opus"),
+                opus: id(opus),
+                sonnet: id(sonnet),
+                haiku: id(haiku),
+                fable: id(fable),
+                subagent: None,
+            },
+            Binds::Every(model) => ModelSettings {
+                default: id(model),
+                opus: id(model),
+                sonnet: id(model),
+                haiku: id(model),
+                fable: id(model),
+                subagent: id(model),
+            },
+        }
+    }
 }
 
 /// The built-ins, in menu order.
@@ -62,14 +99,22 @@ const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "DeepSeek",
         base_url: "https://api.deepseek.com/anthropic",
-        model: "deepseek-chat",
-        pin_every_tier: false,
+        binds: Binds::Tiers {
+            opus: "deepseek-v4-pro[1m]",
+            sonnet: "deepseek-flash[1m]",
+            haiku: "deepseek-flash[1m]",
+            fable: "deepseek-v4-pro[1m]",
+        },
     },
     Builtin {
         name: "Z.ai",
         base_url: "https://api.z.ai/api/anthropic",
-        model: "glm-5.2",
-        pin_every_tier: false,
+        binds: Binds::Tiers {
+            opus: "glm-5.3[1m]",
+            sonnet: "glm-5.3-flash[1m]",
+            haiku: "glm-5.3-flash[1m]",
+            fable: "glm-5.3[1m]",
+        },
     },
     Builtin {
         name: "OpenRouter",
@@ -77,8 +122,15 @@ const BUILTINS: &[Builtin] = &[
         // `/v1/messages` lands on `/api/v1/messages` (openrouter.ai docs,
         // "Connect Claude to OpenRouter").
         base_url: "https://openrouter.ai/api",
-        model: "openrouter/auto",
-        pin_every_tier: false,
+        // OpenRouter serves the real Claude models, so each tier binds its own
+        // family's moving `-latest` alias instead of a pro/flash pair; the same
+        // guide marks only the fable, opus and sonnet aliases `[1m]`-capable.
+        binds: Binds::Tiers {
+            opus: "~anthropic/claude-opus-latest[1m]",
+            sonnet: "~anthropic/claude-sonnet-latest[1m]",
+            haiku: "~anthropic/claude-haiku-latest",
+            fable: "~anthropic/claude-fable-latest[1m]",
+        },
     },
     Builtin {
         name: "MiniMax",
@@ -88,54 +140,45 @@ const BUILTINS: &[Builtin] = &[
         // account and endpoint; only the international one ships, matching what
         // `providers::minimax` claims.
         base_url: "https://api.minimax.io/anthropic",
-        model: "MiniMax-M3",
-        pin_every_tier: false,
+        // The fast model is sold on the M Plan alone: a pay-as-you-go key
+        // fails on sonnet and haiku until those two rows are re-pointed.
+        binds: Binds::Tiers {
+            opus: "MiniMax-M3[1m]",
+            sonnet: "MiniMax-M3.1-Flash-Preview[1m]",
+            haiku: "MiniMax-M3.1-Flash-Preview[1m]",
+            fable: "MiniMax-M3[1m]",
+        },
     },
     Builtin {
         name: "Qwen-TokenPlan-Intl",
         base_url: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
-        model: "qwen3.8-max",
-        pin_every_tier: true,
+        binds: Binds::Every("qwen3.8-max"),
     },
     Builtin {
         name: "Qwen-TokenPlan-CN",
         base_url: "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
-        model: "qwen3.8-max",
-        pin_every_tier: true,
+        binds: Binds::Every("qwen3.8-max"),
     },
     Builtin {
         name: "Qwen-CodingPlan-Intl",
         base_url: "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic",
-        model: "qwen3-coder-plus",
-        pin_every_tier: true,
+        binds: Binds::Every("qwen3-coder-plus"),
     },
     Builtin {
         name: "Qwen-CodingPlan-CN",
         base_url: "https://coding.dashscope.aliyuncs.com/apps/anthropic",
-        model: "qwen3-coder-plus",
-        pin_every_tier: true,
+        binds: Binds::Every("qwen3-coder-plus"),
     },
 ];
 
 fn builtins() -> Vec<Preset> {
     BUILTINS
         .iter()
-        .map(|b| {
-            let model = || Some(b.model.to_string());
-            let tier = || b.pin_every_tier.then(model).flatten();
-            Preset {
-                name: b.name.to_string(),
-                base_url: Some(b.base_url.to_string()),
-                models: ModelSettings {
-                    default: model(),
-                    opus: tier(),
-                    sonnet: tier(),
-                    haiku: tier(),
-                    fable: tier(),
-                    subagent: tier(),
-                },
-                builtin: true,
-            }
+        .map(|b| Preset {
+            name: b.name.to_string(),
+            base_url: Some(b.base_url.to_string()),
+            models: b.binds.models(),
+            builtin: true,
         })
         .collect()
 }

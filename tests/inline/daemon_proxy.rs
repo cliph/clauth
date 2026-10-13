@@ -405,6 +405,9 @@ fn a_proxy_still_draining_is_finished_by_the_next_daemon_at_its_deadline() {
     before.step(t0());
     rig.only_call();
     before.shutdown(std::time::Instant::now());
+    stub::wait_until("the stub records its SIGTERM", secs(10), || {
+        !stub::terms(&rig.dir).is_empty()
+    });
     let recorded = read_marker_at_for(&rig).expect("a marker");
     let deadline_ms = recorded.stop_deadline_ms.expect("the stop's deadline");
     let mut orphan = Owned(before.abandon().expect("still running"));
@@ -1265,6 +1268,35 @@ fn a_stop_hands_a_still_draining_child_to_a_reaper() {
     assert!(thread.shutdown(DAEMON_STOP_BUDGET), "the stop answers");
     // The child still drains (ignore-term); the reaper holds its handle.
     stub::signal(pid, "KILL");
+    stub::wait_until("the child is reaped, not a zombie", secs(5), || {
+        proc_state(pid).is_none()
+    });
+}
+
+/// A supervisor whose own deadline wake runs late still answers its stop: a
+/// late answer is a healthy thread, never a stuck one.
+#[cfg(unix)]
+#[test]
+fn a_stop_answered_late_past_its_deadline_still_answers() {
+    let rig = Rig::new("zcode");
+    std::fs::write(rig.dir.join("ignore-term"), "").expect("ignore-term");
+    let thread = start_kind(
+        Proxy {
+            service: rig.service.clone(),
+        },
+        Arc::clone(&rig.slots),
+        "zz-late",
+    )
+    .expect("start");
+    stub::wait_until("the child runs", secs(10), || {
+        stub::invocations(&rig.dir).len() == 1
+    });
+    let pid = rig.only_call().pid;
+    let _late =
+        crate::daemon::gateway::probe_seam::delay_answer("zz-late", Duration::from_millis(100));
+    let answered = thread.shutdown(Duration::from_millis(300));
+    stub::signal(pid, "KILL");
+    assert!(answered, "an answer 100 ms past the deadline still counts");
     stub::wait_until("the child is reaped, not a zombie", secs(5), || {
         proc_state(pid).is_none()
     });

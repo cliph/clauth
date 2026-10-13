@@ -3291,6 +3291,9 @@ fn a_stop_left_running_by_an_exiting_daemon_is_finished_at_its_recorded_deadline
     rig.only_call();
     rig.server.wait_serving(true);
     before.shutdown(Instant::now());
+    stub::wait_until("the stub records its SIGTERM", secs(10), || {
+        !stub::terms(&rig.dir).is_empty()
+    });
     let recorded = read_marker().expect("read").expect("a marker");
     let deadline_ms = recorded.stop_deadline_ms.expect("the stop's deadline");
     let mut orphan = Owned(before.abandon().expect("still running"));

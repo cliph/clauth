@@ -1702,6 +1702,7 @@ fn the_shunt_row_names_the_daemon_only_for_an_unobserved_record() {
             "enabled".to_string(),
             "admin  no [server.admin] table".to_string(),
             "f  add admin table".to_string(),
+            "f  require client tokens".to_string(),
         ],
         "an unobserved record names the daemon as what would run the gateway"
     );
@@ -19319,6 +19320,8 @@ fn the_shunt_card_offers_adopt_only_for_a_toml_find() {
         None,
         None,
         false,
+        false,
+        false,
     );
     assert_eq!(
         card.detail.last().map(String::as_str),
@@ -19349,6 +19352,8 @@ fn the_shunt_card_offers_adopt_only_for_a_toml_find() {
         None,
         None,
         false,
+        false,
+        false,
     );
     assert!(card.fix.is_none(), "a YAML find gets no adopt");
     assert!(card.shunt_focus.is_empty());
@@ -19378,6 +19383,8 @@ fn the_shunt_card_offers_adopt_only_for_a_toml_find() {
         None,
         None,
         None,
+        false,
+        false,
         false,
     );
     assert!(
@@ -19570,6 +19577,8 @@ fn an_env_bind_does_not_offer_adopt_for_an_unreadable_config() {
             None,
             None,
             false,
+            false,
+            false,
         );
         assert!(
             card.fix.is_none(),
@@ -19616,6 +19625,8 @@ fn a_toml_name_linked_onto_yaml_reads_as_yaml() {
         None,
         None,
         None,
+        false,
+        false,
         false,
     );
     assert_eq!(
@@ -19685,6 +19696,8 @@ fn an_unrecorded_daemon_env_offers_no_adopt() {
         None,
         None,
         false,
+        false,
+        false,
     );
     assert_eq!(
         card.detail,
@@ -19720,6 +19733,8 @@ fn the_shunt_card_builds_the_enabled_admin_and_pool_section() {
         None,
         None,
         false,
+        false,
+        false,
     );
     assert_eq!(
         card.detail,
@@ -19754,6 +19769,8 @@ fn the_shunt_card_builds_the_enabled_admin_and_pool_section() {
         None,
         None,
         false,
+        false,
+        false,
     );
     assert!(
         key_card.detail.iter().any(|l| l == "f  add admin key"),
@@ -19770,6 +19787,8 @@ fn the_shunt_card_builds_the_enabled_admin_and_pool_section() {
         None,
         None,
         false,
+        false,
+        false,
     );
     assert!(
         table_card.detail.iter().any(|l| l == "f  add admin table"),
@@ -19785,6 +19804,8 @@ fn the_shunt_card_builds_the_enabled_admin_and_pool_section() {
         Some(crate::gateway::AdminNeed::Neither),
         None,
         None,
+        false,
+        false,
         false,
     );
     assert!(
@@ -19806,6 +19827,8 @@ fn the_shunt_card_builds_the_enabled_admin_and_pool_section() {
         None,
         None,
         Some(&two),
+        false,
+        false,
         false,
     );
     assert!(
@@ -19829,6 +19852,8 @@ fn the_shunt_card_builds_the_enabled_admin_and_pool_section() {
         None,
         None,
         Some(&err),
+        false,
+        false,
         false,
     );
     assert!(
@@ -19894,6 +19919,8 @@ fn the_move_plan_names_every_kept_reason_no_home_and_refusal() {
         Some(&super::MovePlanOutcome::Plan(plan)),
         None,
         false,
+        false,
+        false,
     );
     let start = card.shunt_action_start.unwrap();
     assert_eq!(
@@ -19940,6 +19967,8 @@ fn the_move_plan_names_every_kept_reason_no_home_and_refusal() {
         )),
         None,
         false,
+        false,
+        false,
     );
     let start = card.shunt_action_start.unwrap();
     assert_eq!(
@@ -19976,6 +20005,8 @@ fn the_move_plan_names_every_kept_reason_no_home_and_refusal() {
         Some(&super::MovePlanOutcome::Nothing),
         None,
         false,
+        false,
+        false,
     );
     assert!(
         !card.detail.iter().any(|l| l == "MOVE PLAN"),
@@ -19999,6 +20030,8 @@ fn the_held_state_reads_stopped_until_the_daemon_restarts() {
         None,
         None,
         false,
+        false,
+        false,
     );
     assert!(
         card.detail
@@ -20010,7 +20043,9 @@ fn the_held_state_reads_stopped_until_the_daemon_restarts() {
 
     let mut foreign = shunt_slot(GatewayState::Foreign);
     foreign.answerer = Some(Answerer::Shunt);
-    let card = super::shunt_card(&foreign, true, false, None, None, None, None, None, false);
+    let card = super::shunt_card(
+        &foreign, true, false, None, None, None, None, None, false, false, false,
+    );
     assert!(card.detail.iter().any(|l| l == "state: foreign"));
     assert!(card.detail.iter().any(|l| l == "answerer: shunt"));
     let card = super::shunt_card(
@@ -20023,6 +20058,8 @@ fn the_held_state_reads_stopped_until_the_daemon_restarts() {
         None,
         None,
         false,
+        false,
+        false,
     );
     assert!(card.detail.iter().any(|l| l == "state: below_floor"));
     let card = super::shunt_card(
@@ -20034,6 +20071,8 @@ fn the_held_state_reads_stopped_until_the_daemon_restarts() {
         None,
         None,
         None,
+        false,
+        false,
         false,
     );
     assert!(card.detail.iter().any(|l| l == "state: yaml_refused"));
@@ -21163,6 +21202,8 @@ fn the_shunt_confirms_carry_the_approved_copy() {
         None,
         None,
         false,
+        false,
+        false,
     );
     let mut app = bare_app();
     app.tab = super::Tab::Services;
@@ -21211,6 +21252,8 @@ fn the_shunt_confirms_carry_the_approved_copy() {
         Some(&super::MovePlanOutcome::Plan(plan.clone())),
         None,
         false,
+        false,
+        false,
     );
     let mut app = bare_app();
     app.tab = super::Tab::Services;
@@ -21246,6 +21289,8 @@ fn the_shunt_confirms_carry_the_approved_copy() {
         Some(&super::MovePlanOutcome::Plan(plan.clone())),
         None,
         false,
+        false,
+        false,
     );
     let mut app = bare_app();
     app.tab = super::Tab::Services;
@@ -21273,6 +21318,8 @@ fn the_shunt_confirms_carry_the_approved_copy() {
         Some(crate::gateway::AdminNeed::WriteKey),
         None,
         None,
+        false,
+        false,
         false,
     );
     let mut app = bare_app();
@@ -21303,6 +21350,8 @@ fn the_shunt_confirms_carry_the_approved_copy() {
         Some(crate::gateway::AdminNeed::AdminTable),
         None,
         None,
+        false,
+        false,
         false,
     );
     let mut app = bare_app();
@@ -21353,6 +21402,8 @@ fn a_running_gateway_shows_no_move_plan() {
         Some(&super::MovePlanOutcome::Plan(plan)),
         None,
         false,
+        false,
+        false,
     );
     assert!(
         !card.detail.iter().any(|l| l == "MOVE PLAN"),
@@ -21375,6 +21426,8 @@ fn a_running_gateway_shows_no_move_plan() {
         None,
         Some(&super::MovePlanOutcome::Plan(plan)),
         None,
+        false,
+        false,
         false,
     );
     assert!(
@@ -21413,6 +21466,8 @@ fn the_move_confirm_counts_n_and_k_separately() {
         None,
         Some(&super::MovePlanOutcome::Plan(plan.clone())),
         None,
+        false,
+        false,
         false,
     );
     let mut app = bare_app();
@@ -21697,6 +21752,8 @@ fn the_shunt_card_escapes_control_and_bidi_in_a_provider_name() {
         None,
         Some(&super::PoolOutcome::Providers(vec![provider.to_string()])),
         false,
+        false,
+        false,
     );
     assert!(
         card.detail
@@ -21733,6 +21790,8 @@ fn a_dead_daemon_reads_the_card_off_over_a_stale_healthy_slot() {
         None,
         Some(&super::MovePlanOutcome::Plan(plan)),
         None,
+        false,
+        false,
         false,
     );
     assert!(
@@ -22026,6 +22085,8 @@ fn a_landed_add_admin_key_re_settles_focus_to_the_enabled_row() {
         None,
         None,
         false,
+        false,
+        false,
     )];
     app.services.shunt_record = Some(record.clone());
     app.services.shunt_action.prober = Some(admin_landing_prober);
@@ -22097,6 +22158,8 @@ fn a_landed_move_re_settles_focus_to_the_enabled_row() {
         None,
         Some(&super::MovePlanOutcome::Plan(plan.clone())),
         None,
+        false,
+        false,
         false,
     )];
     app.services.shunt_record = Some(record.clone());
@@ -23070,6 +23133,7 @@ fn the_production_recompute_renders_the_config_groups_and_walks_onto_them() {
             "  enabled  ─●".to_string(),
             "admin  no [server.admin] table".to_string(),
             "  f  add admin table".to_string(),
+            "  f  require client tokens".to_string(),
             String::new(),
             "SERVER".to_string(),
             "  bind              127.0.0.1:3001".to_string(),
@@ -23089,10 +23153,11 @@ fn the_production_recompute_renders_the_config_groups_and_walks_onto_them() {
     );
 
     // The walk from `enabled` reaches the first entry row: enabled → the admin
-    // fix → the bind and default_provider field rows → the entry.
+    // fix → the require fix → the bind and default_provider field rows → the
+    // entry.
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
-    for _ in 0..4 {
+    for _ in 0..5 {
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
         term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
     }
@@ -29377,6 +29442,839 @@ fn the_armed_key_row_tooltip_reads_minted_by_equality() {
             .all(|c| c.fg == crate::tui::theme::text_faint_color()),
         "the armed row's cells render faint"
     );
+}
+
+// ── require client tokens (E5 C3) ────────────────────────────────────────────
+
+/// A sandbox holding an adopted config + a stub `shunt` that passes checks,
+/// and a recomputed Services app over `profiles`. The `HomeSandbox` and its
+/// `EnvPin` are the caller's, held for the test's life.
+#[cfg(unix)]
+struct RequireRig {
+    config: std::path::PathBuf,
+    app: App,
+}
+
+#[cfg(unix)]
+fn require_rig(
+    home: &crate::testutil::HomeSandbox,
+    config_text: &str,
+    env_text: &str,
+    profiles: Vec<crate::profile::Profile>,
+) -> RequireRig {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::create_dir_all(home.home().join("etc")).unwrap();
+    let etc = std::fs::canonicalize(home.home().join("etc")).unwrap();
+    let config = etc.join("shunt.toml");
+    std::fs::write(&config, config_text).unwrap();
+    let stub = home.home().join("stub");
+    std::fs::create_dir_all(&stub).unwrap();
+    let binary = stub.join("shunt");
+    std::fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\nd='{}'\necho call >> \"$d/calls\"\ncp \"$3\" \"$d/candidate\"\nif [ -e \"$d/fail\" ]; then echo 'config error: boom' >&2; exit 1; fi\nexit 0\n",
+            stub.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config.clone()).unwrap();
+    record.binary = Some(binary);
+    if !env_text.is_empty() {
+        let env_file = home.home().join("tokens.env");
+        std::fs::write(&env_file, env_text).unwrap();
+        record.env_file = Some(env_file);
+    }
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record);
+        Ok(())
+    })
+    .unwrap();
+    use crate::profile::{AppConfig, AppState};
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles,
+    });
+    app.tab = super::Tab::Services;
+    app.services.shunt_action.prober = Some(super::run_shunt_action);
+    app.services.shunt_save_worker.prober = Some(super::run_shunt_action);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    RequireRig { config, app }
+}
+
+/// Write the daemon's status feed naming a gateway at `state`/`pid` and pin
+/// the app's daemon health fresh, then recompute the checks (the feed the TUI
+/// reads each tick). Resolution of a pending require is a separate explicit
+/// step — the real tick runs it as `poll_pending_require`.
+#[cfg(unix)]
+fn set_feed(app: &mut App, state: &str, pid: Option<u32>) {
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    let feed = serde_json::json!({
+        "gateway": {
+            "state": state,
+            "pid": pid,
+            "floor": "0.48.0",
+            "restarts": 0,
+        }
+    });
+    std::fs::write(dir.join("status.json"), serde_json::to_vec(&feed).unwrap()).unwrap();
+    app.daemon_health = crate::daemon::DaemonHealth::Fresh;
+    super::recompute_services_checks(app, false, super::ShuntRefresh::Keep);
+}
+
+/// Focus the `f  require client tokens` line and press `↵`, descending first.
+#[cfg(unix)]
+fn press_require(app: &mut App) {
+    use ratatui::crossterm::event::KeyCode;
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::RequireTokens));
+    super::handle_key(app, crate::testutil::key(KeyCode::Enter));
+}
+
+/// Whether the rendered shunt card carries a line holding `needle`.
+fn card_has(app: &App, needle: &str) -> bool {
+    shunt_config_rows(app).iter().any(|r| r.contains(needle))
+}
+
+/// The whole frame's rendered, trimmed, non-empty rows (for pinning a modal's
+/// body lines by equality).
+#[cfg(unix)]
+fn confirm_render_lines(app: &App) -> Vec<String> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer())
+        .into_iter()
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .collect()
+}
+
+/// The require fix line renders on a table-less config, and not on one with
+/// `[server.auth]` or an env-layer `SHUNT_SERVER__AUTH__*` key building it.
+#[test]
+fn the_require_line_shows_only_when_the_gateway_would_run_open() {
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        adopt_token_record(&home, TOKEN_CONFIG, "");
+        let app = token_app(Vec::new());
+        assert!(
+            card_has(&app, "f  require client tokens"),
+            "a table-less config shows the require line"
+        );
+    }
+
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        adopt_token_record(&home, "[server]\n[server.auth]\n", "");
+        let app = token_app(Vec::new());
+        assert!(
+            !card_has(&app, "f  require client tokens"),
+            "a config with [server.auth] shows no require line"
+        );
+    }
+
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        adopt_token_record(
+            &home,
+            TOKEN_CONFIG,
+            "SHUNT_SERVER__AUTH__TOKENS_ENV=SHUNT_CLIENT_TOKENS\nSHUNT_CLIENT_TOKENS=envname:tok1\n",
+        );
+        let app = token_app(Vec::new());
+        assert!(
+            !card_has(&app, "f  require client tokens"),
+            "an env-layer auth key builds the table, so no require line"
+        );
+    }
+}
+
+/// `f` reaches the require line (F1's walk, no per-line code) and `↵` opens
+/// the confirm by equality — with and without the profiles line.
+#[cfg(unix)]
+#[test]
+fn f_reaches_the_require_line_and_enter_opens_the_confirm() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    {
+        // A token stored: `↵` takes the confirm path, not the picker. Two
+        // gateway-pointed profiles pin the `, ` join and the rendered line.
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        let record = adopt_token_record(&home, TOKEN_CONFIG, "");
+        crate::gateway_tokens::add_client_token(&record, "alice").unwrap();
+        let mut app = token_app(vec![
+            Profile::new("alice".into(), Some("http://127.0.0.1:3001".into()), None),
+            Profile::new("bob".into(), Some("http://127.0.0.1:3001".into()), None),
+        ]);
+        // Two `f` presses from the list: the admin fix, then the require fix.
+        app.services.focus = super::ServicesFocus::List;
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+        assert_eq!(
+            app.services.shunt_focus_kind(),
+            Some(super::ShuntFocusLine::RequireTokens),
+            "F1's walk reaches the require fix with no walk code"
+        );
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        let confirm = top_confirm(&app);
+        assert_eq!(confirm.message, "require client tokens?");
+        assert_eq!(
+            confirm.detail.as_deref(),
+            Some("every consumer that sends no token is refused from then on."),
+            "the require confirm body by equality"
+        );
+        assert!(
+            matches!(
+                &confirm.on_confirm,
+                super::ConfirmAction::RequireClientTokens { profiles } if profiles == "alice, bob"
+            ),
+            "the profiles field joins the two gateway names with `, `"
+        );
+        let lines = confirm_render_lines(&app);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("profiles using the gateway: alice, bob.")),
+            "the profiles line renders by equality:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    {
+        // Without a profile pointing at the gateway, no profiles line.
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        let record = adopt_token_record(&home, TOKEN_CONFIG, "");
+        crate::gateway_tokens::add_client_token(&record, "alice").unwrap();
+        let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+        press_require(&mut app);
+        let confirm = top_confirm(&app);
+        assert!(
+            matches!(
+                &confirm.on_confirm,
+                super::ConfirmAction::RequireClientTokens { profiles } if profiles.is_empty()
+            ),
+            "no profile names the gateway, so the profiles field is empty"
+        );
+        let lines = confirm_render_lines(&app);
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("profiles using the gateway")),
+            "no profiles line renders when none names the gateway:\n{}",
+            lines.join("\n")
+        );
+    }
+}
+
+/// A confirmed require lands `[server.auth]` (file read back) through the
+/// `shunt check` stub; `cancel` writes nothing.
+#[cfg(unix)]
+#[test]
+fn a_confirmed_require_lands_server_auth_and_cancel_writes_nothing() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let rig = require_rig(
+        &home,
+        TOKEN_CONFIG,
+        "",
+        vec![Profile::new("alice".into(), None, None)],
+    );
+    crate::gateway_tokens::add_client_token(
+        &crate::gateway::GatewayRecord::load().unwrap().unwrap(),
+        "alice",
+    )
+    .unwrap();
+    let before = std::fs::read_to_string(&rig.config).unwrap();
+    let mut app = rig.app;
+    // The minted token must reach the card's cached token read before the fix
+    // decides confirm-vs-picker.
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    press_require(&mut app);
+    // cancel first: nothing is written.
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        std::fs::read_to_string(&rig.config).unwrap(),
+        before,
+        "cancel writes nothing"
+    );
+    // confirm: `require` lands the table through the stub check.
+    press_require(&mut app);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    drain_shunt_action(&mut app);
+    let after = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        after.contains("[server.auth]"),
+        "the require lands [server.auth]:\n{after}"
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Success,
+            "client tokens required\nconsumers without a token are refused now"
+        )),
+        "the require success toast by equality"
+    );
+}
+
+/// With no token, `↵` opens the picker (which remembers it serves the require
+/// flow); a cancelled picker leaves no pending state.
+#[cfg(unix)]
+#[test]
+fn with_no_token_enter_opens_the_require_picker_and_cancel_leaves_no_state() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(Vec::new());
+    press_require(&mut app);
+    match app.modals.last() {
+        Some(super::Modal::TokenPicker(form)) => assert!(
+            form.require,
+            "the picker remembers it serves the require flow"
+        ),
+        other => panic!("expected the picker, got {other:?}"),
+    }
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert!(
+        app.services.pending_require.is_none(),
+        "a cancelled picker leaves no pending state"
+    );
+}
+
+/// A refused overwrite (a profile that vanished from the roster) and a
+/// cancelled `+ new profile` form leave no pending state: the pending require
+/// is set only after a landed mint.
+#[cfg(unix)]
+#[test]
+fn a_refused_overwrite_and_a_cancelled_create_leave_no_pending_state() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        adopt_token_record(&home, TOKEN_CONFIG, "");
+        let mut app = token_app(vec![Profile::new("alice".into(), None, None)]);
+        press_require(&mut app);
+        // Alice vanishes between the picker and the overwrite confirm.
+        app.config().profiles.retain(|p| p.name != "alice");
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert_eq!(
+            app.toasts.back().map(|t| t.body.as_str()),
+            Some("add failed\nalice no longer exists"),
+            "the vanished profile refuses before any mint"
+        );
+        assert!(
+            app.services.pending_require.is_none(),
+            "a refused overwrite leaves no pending state"
+        );
+    }
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        adopt_token_record(&home, TOKEN_CONFIG, "");
+        let mut app = token_app(Vec::new());
+        press_require(&mut app);
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert!(app.config_draft.is_some(), "the + new profile form opened");
+        app.config_draft = None;
+        assert!(
+            app.services.pending_require.is_none(),
+            "a cancelled create leaves no pending state"
+        );
+    }
+}
+
+/// A require pick with the feed showing no gateway pid still waits: the card
+/// reads pending until the first `healthy` pid shows (a gateway that spawned
+/// after the mint carries the token), and only then lands the table.
+#[cfg(unix)]
+#[test]
+fn a_require_pick_with_no_gateway_pid_waits_for_the_first_healthy_pid() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let rig = require_rig(
+        &home,
+        TOKEN_CONFIG,
+        "",
+        vec![Profile::new("alice".into(), None, None)],
+    );
+    let mut app = rig.app;
+    press_require(&mut app);
+    // Pick alice: row 0 is `+ new profile`, one Down reaches alice.
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    // Confirm the overwrite.
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    drain_shunt_action(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "no gateway pid: the require still waits for the first healthy pid"
+    );
+    assert!(
+        card_has(&app, "waiting for the gateway to restart"),
+        "the card reads that it waits"
+    );
+    let before = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        !before.contains("[server.auth]"),
+        "the table lands only once a healthy pid shows:\n{before}"
+    );
+    // The first healthy pid (a gateway that spawned after the mint) lands it.
+    set_feed(&mut app, "healthy", Some(4002));
+    super::poll_pending_require(&mut app);
+    drain_shunt_action(&mut app);
+    let after = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        after.contains("[server.auth]"),
+        "the first healthy pid lands the table:\n{after}"
+    );
+    assert!(
+        app.services.pending_require.is_none(),
+        "the pending require clears once it runs"
+    );
+}
+
+/// A require pick with a running gateway pid waits for a NEW healthy pid: the
+/// waiting line shows, the file stays unchanged on the same pid, and a new
+/// healthy pid lands the table.
+#[cfg(unix)]
+#[test]
+fn a_require_pick_with_a_pid_waits_for_a_new_healthy_pid() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let rig = require_rig(
+        &home,
+        TOKEN_CONFIG,
+        "",
+        vec![Profile::new("alice".into(), None, None)],
+    );
+    let mut app = rig.app;
+    set_feed(&mut app, "healthy", Some(4001));
+    press_require(&mut app);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    drain_shunt_action(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "a gateway pid at the mint marks the card pending"
+    );
+    assert!(
+        card_has(&app, "waiting for the gateway to restart"),
+        "the card reads that it waits for the restart"
+    );
+    assert!(
+        !card_has(&app, "f  require client tokens"),
+        "the waiting line is read-only, no `f` stop"
+    );
+    let before = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        !before.contains("[server.auth]"),
+        "the file is unchanged while it waits"
+    );
+    // A tick with the same pid changes nothing.
+    set_feed(&mut app, "healthy", Some(4001));
+    super::poll_pending_require(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "the same pid leaves the pending require in place"
+    );
+    // A new healthy pid runs the require.
+    set_feed(&mut app, "healthy", Some(4002));
+    super::poll_pending_require(&mut app);
+    drain_shunt_action(&mut app);
+    let after = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        after.contains("[server.auth]"),
+        "a new healthy pid lands the table:\n{after}"
+    );
+    assert!(
+        app.services.pending_require.is_none(),
+        "the pending require clears once it runs"
+    );
+}
+
+/// A record change (or drop) ends the pending require with its info toast.
+#[cfg(unix)]
+#[test]
+fn a_record_change_drops_the_pending_require_with_its_toast() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let rig = require_rig(
+        &home,
+        TOKEN_CONFIG,
+        "",
+        vec![Profile::new("alice".into(), None, None)],
+    );
+    let mut app = rig.app;
+    set_feed(&mut app, "healthy", Some(4001));
+    press_require(&mut app);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    drain_shunt_action(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "pending before the change"
+    );
+    // Re-adopt a different config: the record changes.
+    let other = home.home().join("etc").join("other.toml");
+    std::fs::write(&other, "[server]\n").unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(other).unwrap();
+    record.binary = Some(home.home().join("stub").join("shunt"));
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record);
+        Ok(())
+    })
+    .unwrap();
+    super::poll_pending_require(&mut app);
+    assert!(
+        app.services.pending_require.is_none(),
+        "the record change drops the pending require"
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Info,
+            "require client tokens cancelled\nthe gateway changed"
+        )),
+        "the pending-require cancellation toast by equality"
+    );
+}
+
+/// A pending require resolves on the every-tick step, whatever tab is focused
+/// and whether a modal is open (the picker route leaves the user on Setup):
+/// the tick — never `recompute_services_checks`, which only runs on Services
+/// with no modal — runs the require once the feed shows a new healthy pid.
+#[cfg(unix)]
+#[test]
+fn a_pending_require_resolves_on_any_tab_with_a_modal_open() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let rig = require_rig(
+        &home,
+        TOKEN_CONFIG,
+        "",
+        vec![Profile::new("alice".into(), None, None)],
+    );
+    let mut app = rig.app;
+    set_feed(&mut app, "healthy", Some(4001));
+    press_require(&mut app);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    drain_shunt_action(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "the card waits for a new healthy pid"
+    );
+    // Move off Services and open a modal: the tick must still resolve.
+    app.tab = super::Tab::Overview;
+    app.open_modal(super::Modal::Help);
+    // Publish the new healthy pid, then run the tick (pinning the daemon
+    // probe's 1s throttle so the pinned Fresh health is the one it reads).
+    set_feed(&mut app, "healthy", Some(4002));
+    app.last_daemon_probe = std::time::Instant::now();
+    super::on_tick(&mut app);
+    drain_shunt_action(&mut app);
+    let after = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        after.contains("[server.auth]"),
+        "the tick resolves the require off Services with a modal open:\n{after}"
+    );
+    assert!(
+        app.services.pending_require.is_none(),
+        "the pending require clears once it runs"
+    );
+}
+
+/// The pid the wait compares against is read BEFORE the mint: a restart that
+/// lands during the add (the store-change restart) publishes a new pid that
+/// then completes the wait, rather than being recorded as the pid to wait
+/// past.
+#[cfg(unix)]
+#[test]
+fn a_restart_during_the_mint_waits_for_a_pid_after_the_pre_mint_read() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let rig = require_rig(
+        &home,
+        TOKEN_CONFIG,
+        "",
+        vec![Profile::new("alice".into(), None, None)],
+    );
+    let mut app = rig.app;
+    set_feed(&mut app, "healthy", Some(4001));
+    press_require(&mut app);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    // The mint's restart publishes a new pid before the outcome drains.
+    set_feed(&mut app, "healthy", Some(4002));
+    drain_shunt_action(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "the card waits for a pid after the one read before the mint"
+    );
+    let before = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        !before.contains("[server.auth]"),
+        "the table lands only once a pid after the pre-mint one shows"
+    );
+    // The already-published pid (after the pre-mint read) completes the wait.
+    set_feed(&mut app, "healthy", Some(4002));
+    super::poll_pending_require(&mut app);
+    drain_shunt_action(&mut app);
+    let after = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        after.contains("[server.auth]"),
+        "the restart pid completes the wait:\n{after}"
+    );
+}
+
+/// The tick's `healthy` clause and its one-save guard: a new pid that is
+/// `starting` (not yet healthy) completes nothing, and a new healthy pid while
+/// a save holds the one-save slot defers the require to a later tick rather
+/// than dropping it.
+#[cfg(unix)]
+#[test]
+fn the_pending_require_resolves_only_on_a_new_healthy_pid() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let rig = require_rig(
+        &home,
+        TOKEN_CONFIG,
+        "",
+        vec![Profile::new("alice".into(), None, None)],
+    );
+    let mut app = rig.app;
+    set_feed(&mut app, "healthy", Some(4001));
+    press_require(&mut app);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    drain_shunt_action(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "the card waits for a new healthy pid"
+    );
+
+    // A new pid that is still starting completes nothing.
+    set_feed(&mut app, "starting", Some(4002));
+    super::poll_pending_require(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "a `starting` pid is not healthy: the require stays pending"
+    );
+
+    // A new healthy pid while a save holds the one-save slot defers, never drops.
+    app.services.shunt_save_worker.running = true;
+    set_feed(&mut app, "healthy", Some(4003));
+    super::poll_pending_require(&mut app);
+    assert!(
+        app.services.pending_require.is_some(),
+        "a save in flight defers the require rather than dropping it"
+    );
+    let before = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        !before.contains("[server.auth]"),
+        "the table still has not landed"
+    );
+
+    // The save finishes; the next tick runs the deferred require.
+    app.services.shunt_save_worker.running = false;
+    super::poll_pending_require(&mut app);
+    drain_shunt_action(&mut app);
+    let after = std::fs::read_to_string(&rig.config).unwrap();
+    assert!(
+        after.contains("[server.auth]"),
+        "the deferred require lands on a later tick:\n{after}"
+    );
+}
+
+/// The require's outcome routing: a refused `shunt check` toasts `save failed`
+/// with the compact line and holds the stderr as `check output`; any other
+/// error toasts `save failed` with the chain.
+#[cfg(unix)]
+#[test]
+fn a_refused_check_and_another_error_route_the_require_outcome() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        let rig = require_rig(
+            &home,
+            TOKEN_CONFIG,
+            "",
+            vec![Profile::new("alice".into(), None, None)],
+        );
+        crate::gateway_tokens::add_client_token(
+            &crate::gateway::GatewayRecord::load().unwrap().unwrap(),
+            "alice",
+        )
+        .unwrap();
+        let mut app = rig.app;
+        super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+        std::fs::write(home.home().join("stub").join("fail"), "").unwrap();
+        press_require(&mut app);
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        drain_shunt_action(&mut app);
+        let expected = crate::tui::render::prose::mark_commands(&format!(
+            "save failed\n{}",
+            super::escape_control(&format!(
+                "`shunt check` refused the save (exit 1) · shunt.toml unchanged · {} check output on the shunt card",
+                crate::tui::render::prose::key("↵"),
+            ))
+        ));
+        assert_eq!(
+            app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+            Some((super::ToastKind::Danger, expected.as_str())),
+            "a refused check toasts save failed + the compact line"
+        );
+        assert_eq!(
+            app.services
+                .check_output
+                .as_ref()
+                .map(|held| (held.source, held.stderr.text())),
+            Some((super::CheckOutputSource::ConfigSave, "config error: boom")),
+            "the failed check's stderr is held on the card"
+        );
+    }
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        let rig = require_rig(
+            &home,
+            TOKEN_CONFIG,
+            "",
+            vec![Profile::new("alice".into(), None, None)],
+        );
+        let mut app = rig.app;
+        // No token stored: the engine refuses `NoToken` before any write.
+        let record = app.services.shunt_record.clone().unwrap();
+        super::start_shunt_require(&mut app, record);
+        drain_shunt_action(&mut app);
+        assert_eq!(
+            app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+            Some((
+                super::ToastKind::Danger,
+                "save failed\ncannot require client tokens: no client token exists yet; add one first"
+            )),
+            "another error toasts save failed + the chain"
+        );
+        assert!(
+            app.services.check_output.is_none(),
+            "a non-check failure holds no check output"
+        );
+    }
+}
+
+/// The `+ new profile` route of the require flow (`TokenMint.require` ->
+/// `commit_new_account` -> the pending wait): row 0, fill the name, create —
+/// under no gateway pid the card waits for the first healthy pid, under a pid
+/// for a new healthy pid.
+#[cfg(unix)]
+#[test]
+fn the_require_flow_new_profile_route_mints_and_waits() {
+    use ratatui::crossterm::event::KeyCode;
+    // No gateway pid: the first healthy pid lands the table.
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        let rig = require_rig(&home, TOKEN_CONFIG, "", vec![]);
+        let mut app = rig.app;
+        press_require(&mut app);
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+        let create = super::config_rows(&app)
+            .iter()
+            .position(|r| *r == super::ConfigRow::Create)
+            .expect("create row");
+        app.config_action_cursor = create;
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert!(
+            app.services.pending_require.is_some(),
+            "no pid: the require waits"
+        );
+        let before = std::fs::read_to_string(&rig.config).unwrap();
+        assert!(
+            !before.contains("[server.auth]"),
+            "the table lands only on a healthy pid"
+        );
+        set_feed(&mut app, "healthy", Some(4002));
+        super::poll_pending_require(&mut app);
+        drain_shunt_action(&mut app);
+        let after = std::fs::read_to_string(&rig.config).unwrap();
+        assert!(
+            after.contains("[server.auth]"),
+            "the first healthy pid lands the table:\n{after}"
+        );
+    }
+    // A running pid: the new healthy pid lands the table.
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        let _env = crate::testutil::no_shunt_env(&home);
+        let rig = require_rig(&home, TOKEN_CONFIG, "", vec![]);
+        let mut app = rig.app;
+        set_feed(&mut app, "healthy", Some(4001));
+        press_require(&mut app);
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+        let create = super::config_rows(&app)
+            .iter()
+            .position(|r| *r == super::ConfigRow::Create)
+            .expect("create row");
+        app.config_action_cursor = create;
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert!(
+            app.services.pending_require.is_some(),
+            "a pid at the mint marks the card pending"
+        );
+        let before = std::fs::read_to_string(&rig.config).unwrap();
+        assert!(
+            !before.contains("[server.auth]"),
+            "the table lands only on a new healthy pid"
+        );
+        set_feed(&mut app, "healthy", Some(4002));
+        super::poll_pending_require(&mut app);
+        drain_shunt_action(&mut app);
+        let after = std::fs::read_to_string(&rig.config).unwrap();
+        assert!(
+            after.contains("[server.auth]"),
+            "a new healthy pid lands the table:\n{after}"
+        );
+    }
 }
 
 // ── Tokens dashboard: card focus + whole-card scroll (tui-fix S3) ────────────

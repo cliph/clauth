@@ -518,7 +518,7 @@ pub(super) fn services_hints(app: &App) -> Vec<(&'static str, &'static str)> {
 /// The `f` hint under the fix grammar: the key walks, it never applies.
 const NEXT_FIX: (&str, &str) = ("f", "next fix");
 
-/// True for the four fixes an in-flight shunt action gates (a second shunt
+/// True for the five fixes an in-flight shunt action gates (a second shunt
 /// press starts nothing); the plugin and herdr fixes keep working, so their
 /// `↵` hint stays while a shunt action runs.
 fn shunt_fix(fix: &ServiceFix) -> bool {
@@ -528,6 +528,7 @@ fn shunt_fix(fix: &ServiceFix) -> bool {
             | ServiceFix::MoveStoresIn
             | ServiceFix::AddAdminKey
             | ServiceFix::AddAdminTable
+            | ServiceFix::RequireClientTokens
     )
 }
 

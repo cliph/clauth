@@ -701,6 +701,9 @@ pub(crate) enum GlobalConfigRow {
 pub(crate) struct TokenMint {
     pub(crate) record: crate::gateway::GatewayRecord,
     pub(crate) bind: crate::gateway::GatewayBind,
+    /// The mint serves the `require client tokens` flow: once it lands, run the
+    /// require (or wait for the gateway restart).
+    pub(crate) require: bool,
 }
 
 /// Inline editor state for the Config detail pane. Built on entry, torn down
@@ -991,12 +994,22 @@ pub(crate) enum ConfirmAction {
     /// `point <profile> at the shunt gateway?`'s `overwrite`: mint the profile's
     /// client token, then point the profile at the gateway (`url`). `replace`
     /// is the confirm's third body line (`None` = nothing to replace), built
-    /// when the confirm opened.
+    /// when the confirm opened. `require` = the add serves the
+    /// `require client tokens` flow, so its mint also runs the require (or the
+    /// restart wait).
     AddToken {
         record: crate::gateway::GatewayRecord,
         profile: String,
         url: String,
         replace: Option<String>,
+        require: bool,
+    },
+    /// `require client tokens?`'s `require`: add `[server.auth]` (checked,
+    /// hot-reloads). `profiles` = the profile names whose `base_url` names the
+    /// gateway, pre-joined with `, ` for the confirm's third line (empty = no
+    /// line).
+    RequireClientTokens {
+        profiles: String,
     },
 }
 
@@ -1174,6 +1187,9 @@ pub(crate) struct TokenPickerForm {
     pub(crate) starts: std::cell::RefCell<Vec<usize>>,
     pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
     pub(crate) total: std::cell::Cell<usize>,
+    /// The picker serves the `require client tokens` flow, so its mint also
+    /// runs the require (or the restart wait).
+    pub(crate) require: bool,
 }
 
 /// A choice on the env-key collision prompt (3 vertical options).
@@ -1849,6 +1865,9 @@ pub(crate) enum ServiceFix {
     AddAdminKey,
     /// Add a `[server.admin]` table carrying clauth's key.
     AddAdminTable,
+    /// Add `[server.auth]` so the gateway refuses consumers that send no
+    /// client token (checked, hot-reloaded).
+    RequireClientTokens,
 }
 
 /// One focusable line inside a service row's detail. When the detail pane is
@@ -1957,6 +1976,10 @@ impl ShuntFocus {
                 fix: ServiceFix::AddAdminKey | ServiceFix::AddAdminTable,
                 ..
             } => ShuntFocusLine::Admin,
+            ShuntFocus::Fix {
+                fix: ServiceFix::RequireClientTokens,
+                ..
+            } => ShuntFocusLine::RequireTokens,
             // No other fix line appears on the shunt card.
             ShuntFocus::Fix { .. } => unreachable!("no other fix appears on the shunt card"),
         }
@@ -1977,6 +2000,8 @@ pub(crate) enum ShuntFocusLine {
     Adopt,
     /// The `f  add admin key` / `f  add admin table` line.
     Admin,
+    /// The `f  require client tokens` line.
+    RequireTokens,
     /// The `f  move stores in` line.
     Move,
     /// The `check output` line (a held failed-check stderr).
@@ -2314,6 +2339,8 @@ pub(crate) enum ShuntSaveKey {
     Token(String),
     /// The `+ add token` row's add.
     AddToken,
+    /// The `require client tokens` fix's `[server.auth]` add.
+    RequireTokens,
 }
 
 /// The row whose caret slot shows the `SUCCESS` `✓` after a successful save:
@@ -2376,6 +2403,40 @@ pub(crate) struct ShuntTokens {
     pub(crate) unparsed: Option<(String, ShuntTokenSource)>,
     pub(crate) error: Option<String>,
     pub(crate) unmanaged_error: Option<String>,
+    /// The gateway would run open (no `[server.auth]` table from the config or
+    /// the env layer): the card offers `f  require client tokens`.
+    pub(crate) run_open: bool,
+}
+
+impl ShuntTokens {
+    /// `require_client_tokens` would refuse `NoToken`: no stored token and no
+    /// client name in the env file / inherited env. An unparsed value, a store
+    /// read failure or a client-auth read failure is a different refusal (or
+    /// hides the answer), so it reads as not-no-token here.
+    pub(crate) fn has_no_token(&self) -> bool {
+        self.error.is_none()
+            && self.unmanaged_error.is_none()
+            && self.stored.is_empty()
+            && self.unmanaged.is_empty()
+            && self.unparsed.is_none()
+    }
+}
+
+/// A `require client tokens` whose first token was minted through the picker:
+/// the require waits for the feed to show a `healthy` pid that is `Some` and
+/// differs from the one read when the add/create job started (the running
+/// gateway would hot-reload a table it cannot satisfy, so the store-change
+/// restart must land first). `None` (no gateway ran) waits for the first
+/// healthy pid — a gateway that spawned after the read carries the token. In
+/// memory only: a TUI exit drops it, and the next `f` then takes the confirm
+/// path with the token now stored.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingRequire {
+    /// The gateway pid the feed showed when the add/create job started, read
+    /// BEFORE the mint.
+    pid: Option<u32>,
+    /// The record the require runs against; a change or a drop ends the wait.
+    record: crate::gateway::GatewayRecord,
 }
 
 /// The shunt card's open field editor: which field, its edit state, and a
@@ -2484,12 +2545,23 @@ pub(crate) fn fix_verb(fix: &ServiceFix) -> &'static str {
         ServiceFix::MoveStoresIn => "move stores in",
         ServiceFix::AddAdminKey => "add admin key",
         ServiceFix::AddAdminTable => "add admin table",
+        ServiceFix::RequireClientTokens => "require client tokens",
     }
 }
 
 /// The `f  <verb>` detail line for a fix.
 pub(crate) fn fix_line(fix: &ServiceFix) -> String {
     format!("f  {}", fix_verb(fix))
+}
+
+/// The pending-require card line: the fix verb, then the dim waiting clause.
+/// The `f  ` prefix drops and no focus stop joins it, so the line is read-only
+/// while it waits.
+pub(crate) fn pending_require_line() -> String {
+    format!(
+        "{}  waiting for the gateway to restart",
+        fix_verb(&ServiceFix::RequireClientTokens)
+    )
 }
 
 /// One Services probe that must never hold a frame: at most one run in
@@ -2682,12 +2754,21 @@ pub(crate) enum ShuntActionJob {
     },
     /// Mint a client token for `profile`, then point it at the gateway (`url`),
     /// off the UI thread. `config` is the shared handle the endpoint write
-    /// locks.
+    /// locks. `require` = the mint serves the `require client tokens` flow.
+    /// `pid_at_mint` = the gateway pid read when the job started (before the
+    /// mint), the pid the restart wait compares against.
     AddToken {
         record: crate::gateway::GatewayRecord,
         profile: String,
         url: String,
         config: JobConfig,
+        require: bool,
+        pid_at_mint: Option<u32>,
+    },
+    /// `require client tokens`: add `[server.auth]` through the engine, off
+    /// the UI thread.
+    RequireClientTokens {
+        record: crate::gateway::GatewayRecord,
     },
 }
 
@@ -2790,8 +2871,13 @@ pub(crate) enum ShuntActionOutcome {
         error: String,
     },
     /// A client-token add landed: the profile's row appears, focus on it.
+    /// `require` = the add served the `require client tokens` flow, so the
+    /// mint must now mark the card waiting. `pid_at_mint` = the pid read when
+    /// the job started, the pid the restart wait compares against.
     TokenAdded {
         profile: String,
+        require: bool,
+        pid_at_mint: Option<u32>,
     },
     /// The add refused (a bad name, a name the base uses, an unparsed base, or
     /// an untyped failure): `add failed` + the message.
@@ -2948,6 +3034,9 @@ pub(crate) struct ServicesState {
     /// sentence)`, rendered on the `└` line under the token row. RefCell so the
     /// focus setter can retire it the moment focus leaves the row.
     pub(crate) shunt_token_refusal: std::cell::RefCell<Option<(String, String)>>,
+    /// A `require client tokens` waiting for the gateway to restart after its
+    /// picker minted the first token (see [`PendingRequire`]).
+    pub(crate) pending_require: Option<PendingRequire>,
     /// The cached standalone-store move plan (`None` = not yet planned). The
     /// plan runs on a worker — it spawns `ps`/`powershell` on macOS/Windows —
     /// on tab entry, on `r`, and after any shunt-card action lands.
@@ -3093,6 +3182,7 @@ impl Default for ServicesState {
             shunt_remove_refusal: std::cell::RefCell::new(None),
             shunt_tokens: ShuntTokens::default(),
             shunt_token_refusal: std::cell::RefCell::new(None),
+            pending_require: None,
             move_plan: None,
             move_plan_probe: ProbeWorker::new(move_plan_probe),
             admin_need: None,
@@ -6767,7 +6857,7 @@ fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
                 let key = key.clone();
                 confirm_shunt_remove_token(app, &key);
             }
-            Some(ShuntFocus::AddToken) => open_token_picker(app),
+            Some(ShuntFocus::AddToken) => open_token_picker(app, false),
             Some(ShuntFocus::Fix { .. }) => apply_service_fix(app),
             None => {}
         },
@@ -6789,7 +6879,7 @@ fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
                 }
             }
             Some(ShuntFocus::Add { kind }) => toggle_shunt_add(app, *kind),
-            Some(ShuntFocus::AddToken) => open_token_picker(app),
+            Some(ShuntFocus::AddToken) => open_token_picker(app, false),
             Some(ShuntFocus::SaveAdd { .. })
             | Some(ShuntFocus::Remove { .. })
             | Some(ShuntFocus::Token { .. }) => {}
@@ -7786,8 +7876,14 @@ fn start_shunt_token_add(
     record: crate::gateway::GatewayRecord,
     profile: String,
     url: String,
+    require: bool,
 ) {
     let config = JobConfig(Arc::clone(&app.config));
+    // Read the gateway pid BEFORE the mint (the running gateway would
+    // hot-reload a table it cannot satisfy, so the store-change restart must
+    // land first): the pid the wait compares against is the one running when
+    // the job starts, never the one the mint's own restart publishes.
+    let pid_at_mint = crate::daemon::gateway_slot(app.daemon_health).0.pid;
     start_on_save_worker(
         app,
         ShuntSaveKey::AddToken,
@@ -7798,7 +7894,21 @@ fn start_shunt_token_add(
             profile,
             url,
             config,
+            require,
+            pid_at_mint,
         },
+    );
+}
+
+/// Start the `require client tokens` add on the one save worker (the same
+/// one-save slot every config save, add, remove and token op shares).
+fn start_shunt_require(app: &mut App, record: crate::gateway::GatewayRecord) {
+    start_on_save_worker(
+        app,
+        ShuntSaveKey::RequireTokens,
+        None,
+        None,
+        ShuntActionJob::RequireClientTokens { record },
     );
 }
 
@@ -7951,6 +8061,7 @@ fn apply_service_fix(app: &mut App) {
                 | ServiceFix::MoveStoresIn
                 | ServiceFix::AddAdminKey
                 | ServiceFix::AddAdminTable
+                | ServiceFix::RequireClientTokens
         )
     {
         return;
@@ -8032,6 +8143,16 @@ fn apply_service_fix(app: &mut App) {
                 on_confirm: ConfirmAction::AddAdminTable,
             }));
         }
+        ServiceFix::RequireClientTokens => {
+            if app.services.shunt_tokens.has_no_token() {
+                // No token anywhere: shunt would refuse the empty table, so the
+                // fix mints one through the picker first (the owner ruling
+                // 2026-10-08).
+                open_token_picker(app, true);
+            } else {
+                open_require_confirm(app);
+            }
+        }
     }
 }
 
@@ -8067,6 +8188,47 @@ fn account_files_word(n: usize) -> &'static str {
 /// The `stay`/`stays` verb, singular at 1 (the owner's copy).
 fn stays_word(k: usize) -> &'static str {
     if k == 1 { "stays" } else { "stay" }
+}
+
+/// The `require client tokens?` confirm: the warning, then (when any profile's
+/// `base_url` names the gateway) the profiles line. The profiles names ride in
+/// the confirm action for the render's third line.
+fn open_require_confirm(app: &mut App) {
+    if app.services.shunt_record.is_none() {
+        app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{NO_ADOPTED_CONFIG}"),
+        );
+        return;
+    }
+    let profiles = gateway_profile_names(app)
+        .into_iter()
+        .map(|name| escape_control(&name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    app.disarm_quit();
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message: "require client tokens?".to_string(),
+        detail: Some("every consumer that sends no token is refused from then on.".to_string()),
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::RequireClientTokens { profiles },
+    }));
+}
+
+/// After a require-flow mint: mark the card pending. There is no "run at once"
+/// branch — with any pid read before the mint, `None` included, the require
+/// runs once the feed shows a `healthy` pid that is `Some` and differs from
+/// the one read (a gateway that spawned after the read carries the token). A
+/// gateway that never comes up leaves the card waiting.
+fn require_after_mint(app: &mut App, pid_at_mint: Option<u32>) {
+    let Some(record) = app.services.shunt_record.clone() else {
+        return;
+    };
+    app.services.pending_require = Some(PendingRequire {
+        pid: pid_at_mint,
+        record,
+    });
 }
 
 /// The herdr detail's keymap: ↑↓ walks the `f  heal herdr config` line (while
@@ -8732,6 +8894,8 @@ pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, sh
         app.services.move_plan.as_ref(),
         app.services.pool.as_ref(),
         app.services.check_output.is_some(),
+        app.services.shunt_tokens.run_open,
+        app.services.pending_require.is_some(),
     );
     // The config rows join the focus walk after the action section, in card
     // order (server fields, then each entry and its expanded fields); the
@@ -8900,17 +9064,24 @@ fn drain_service_probes(app: &mut App) {
         handle_shunt_action_outcome(app, outcome);
     }
     if let Some(outcome) = save {
-        // The save worker runs `ConfigEdit`, `RemoveToken` and `AddToken`,
-        // none of which yields `NoOp`, so a `NoOp` here is a panicked save: it
-        // drains as a failed outcome that clears the guard. A config edit's
-        // panic can land only before the staged rename (the rename is the
+        // The save worker runs `ConfigEdit`, `RemoveToken`, `AddToken` and
+        // `RequireClientTokens`, none of which yields `NoOp`, so a `NoOp` here
+        // is a panicked save: it drains as a failed outcome that clears the
+        // guard. A config edit's panic can land only before the staged rename (the rename is the
         // write's last step and everything after it is pure), so nothing was
         // written holds there; a token job's panic can land after the store
         // write (a minted add), so its copy never claims nothing was written.
+        // The require's `apply_edit` write can land before a later panic, so it
+        // takes the same copy.
         let outcome = match outcome {
             ShuntActionOutcome::NoOp => {
                 let token_job = app.services.shunt_save.as_ref().is_some_and(|s| {
-                    matches!(s.key, ShuntSaveKey::Token(_) | ShuntSaveKey::AddToken)
+                    matches!(
+                        s.key,
+                        ShuntSaveKey::Token(_)
+                            | ShuntSaveKey::AddToken
+                            | ShuntSaveKey::RequireTokens
+                    )
                 });
                 if token_job {
                     ShuntActionOutcome::ConfigFailed {
@@ -9192,6 +9363,12 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
                 ShuntSaveKey::Token(_) | ShuntSaveKey::AddToken => {
                     unreachable!("a token save never yields ConfigSaved")
                 }
+                ShuntSaveKey::RequireTokens => {
+                    app.toast(
+                        ToastKind::Success,
+                        "client tokens required\nconsumers without a token are refused now",
+                    );
+                }
             }
         }
         ShuntActionOutcome::ConfigRefused { key, sentence } => {
@@ -9260,6 +9437,9 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
                 ShuntSaveKey::Token(_) | ShuntSaveKey::AddToken => {
                     unreachable!("a token save never yields ConfigRefused")
                 }
+                ShuntSaveKey::RequireTokens => {
+                    unreachable!("the require never yields ConfigRefused")
+                }
             }
         }
         ShuntActionOutcome::ConfigCheckFailed {
@@ -9326,7 +9506,11 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
                 format!("remove failed\n{}", escape_control(&error)),
             );
         }
-        ShuntActionOutcome::TokenAdded { profile } => {
+        ShuntActionOutcome::TokenAdded {
+            profile,
+            require,
+            pid_at_mint,
+        } => {
             app.services.shunt_save = None;
             // A repointed credential retires the old provider's verdict pill
             // and throttle streak — the shared clear every credential-replacing
@@ -9335,18 +9519,25 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
             // profile's first fetch same-frame.
             app.refresh_tokens();
             clear_profile_status_chrome(app, &ProfileName::from(profile.as_str()));
-            // The new token row appears in store order; focus lands on it with
-            // the `✓` for `SHUNT_OK_MS`.
-            app.services.shunt_ok = Some((ShuntOkKey::Token(profile.clone()), Instant::now()));
-            app.services
-                .set_shunt_focus(Some(ShuntFocusLine::Token(profile.clone())));
-            app.toast(
-                ToastKind::Success,
-                format!(
-                    "{} uses the gateway\nthe gateway restarts once to read its token",
-                    escape_control(&profile)
-                ),
-            );
+            if require {
+                // The require flow's pick: no `uses the gateway` toast and no
+                // token-row focus — the card reads that it waits for the
+                // restart.
+                require_after_mint(app, pid_at_mint);
+            } else {
+                // The new token row appears in store order; focus lands on it
+                // with the `✓` for `SHUNT_OK_MS`.
+                app.services.shunt_ok = Some((ShuntOkKey::Token(profile.clone()), Instant::now()));
+                app.services
+                    .set_shunt_focus(Some(ShuntFocusLine::Token(profile.clone())));
+                app.toast(
+                    ToastKind::Success,
+                    format!(
+                        "{} uses the gateway\nthe gateway restarts once to read its token",
+                        escape_control(&profile)
+                    ),
+                );
+            }
         }
         ShuntActionOutcome::TokenAddRefused { error } => {
             app.services.shunt_save = None;
@@ -9541,7 +9732,9 @@ fn confirm_shunt_remove_token(app: &mut App, profile: &str) {
 /// `↵`/`space` on `+ add token`: open the profile picker — row 0 is
 /// `+ new profile`, then one row per claude profile in roster order (the
 /// Overview's roster; codex profiles live in their own store, never here).
-fn open_token_picker(app: &mut App) {
+/// `require` = the picker serves the `require client tokens` flow, so its
+/// mint also runs the require (or the restart wait).
+fn open_token_picker(app: &mut App, require: bool) {
     if app.services.saving(&ShuntSaveKey::AddToken) {
         return;
     }
@@ -9568,13 +9761,14 @@ fn open_token_picker(app: &mut App) {
         starts: std::cell::RefCell::new(Vec::new()),
         block_ends: std::cell::RefCell::new(Vec::new()),
         total: std::cell::Cell::new(0),
+        require,
     }));
 }
 
 /// The `+ new profile` row: close the picker and open the new-account form
 /// through [`start_new_account`], seeded with the gateway's base url and the
 /// marker naming the record it mints for. A bind read failure opens no form.
-fn open_new_profile_form(app: &mut App) {
+fn open_new_profile_form(app: &mut App, require: bool) {
     let Some(record) = app.services.shunt_record.clone() else {
         app.toast(
             ToastKind::Danger,
@@ -9605,7 +9799,11 @@ fn open_new_profile_form(app: &mut App) {
     start_new_account(app);
     if let Some(d) = app.config_draft.as_mut() {
         d.base_url = InputState::new(&url);
-        d.mint_for = Some(TokenMint { record, bind });
+        d.mint_for = Some(TokenMint {
+            record,
+            bind,
+            require,
+        });
     }
 }
 
@@ -9616,7 +9814,7 @@ fn open_new_profile_form(app: &mut App) {
 /// `it replaces <base>.` with no key), and a profile with no base url (an OAuth
 /// subscription login) reads the OAuth copy. A profile that vanished from the
 /// roster refuses with `add failed` / `<profile> no longer exists`, no confirm.
-fn open_token_overwrite_confirm(app: &mut App, profile: String) {
+fn open_token_overwrite_confirm(app: &mut App, profile: String, require: bool) {
     let Some(record) = app.services.shunt_record.clone() else {
         app.toast(
             ToastKind::Danger,
@@ -9681,6 +9879,7 @@ fn open_token_overwrite_confirm(app: &mut App, profile: String) {
             profile,
             url,
             replace,
+            require,
         },
     }));
 }
@@ -10179,6 +10378,8 @@ pub(crate) fn shunt_card(
     move_plan: Option<&MovePlanOutcome>,
     pool: Option<&PoolOutcome>,
     check_output: bool,
+    run_open: bool,
+    pending_require: bool,
 ) -> Check {
     let mut check = shunt_check(slot, supervised, standalone);
 
@@ -10280,6 +10481,25 @@ pub(crate) fn shunt_card(
             });
         }
         Some(crate::gateway::AdminNeed::Neither) | None => {}
+    }
+
+    // The `require client tokens` fix, right after the admin fix (both are
+    // `[server.*]` tables): while the gateway would run open, the card offers
+    // the fix; a require that minted its first token through the picker and
+    // waits for the restart reads the dim, read-only waiting line instead.
+    if run_open {
+        if pending_require {
+            check.detail.push(pending_require_line());
+        } else {
+            let line = check.detail.len();
+            check
+                .detail
+                .push(fix_line(&ServiceFix::RequireClientTokens));
+            check.shunt_focus.push(ShuntFocus::Fix {
+                line,
+                fix: ServiceFix::RequireClientTokens,
+            });
+        }
     }
 
     // The failed check's output, after the admin fix lines (an admin edit's
@@ -10446,25 +10666,31 @@ fn read_shunt_tokens(record: &crate::gateway::GatewayRecord) -> ShuntTokens {
         }
     };
     match crate::gateway::client_auth(record) {
-        Ok(auth) => match auth.unmanaged {
-            Some((crate::gateway_tokens::TokensState::Names(names), source)) => ShuntTokens {
-                stored,
-                unmanaged: names
-                    .into_iter()
-                    .map(|name| (name, token_source(source.clone())))
-                    .collect(),
-                ..ShuntTokens::default()
-            },
-            Some((crate::gateway_tokens::TokensState::Unparsed, source)) => ShuntTokens {
-                stored,
-                unparsed: Some((auth.variable, token_source(source))),
-                ..ShuntTokens::default()
-            },
-            Some((crate::gateway_tokens::TokensState::Unset, _)) | None => ShuntTokens {
-                stored,
-                ..ShuntTokens::default()
-            },
-        },
+        Ok(auth) => {
+            let run_open = !auth.in_config && !auth.in_env;
+            match auth.unmanaged {
+                Some((crate::gateway_tokens::TokensState::Names(names), source)) => ShuntTokens {
+                    stored,
+                    unmanaged: names
+                        .into_iter()
+                        .map(|name| (name, token_source(source.clone())))
+                        .collect(),
+                    run_open,
+                    ..ShuntTokens::default()
+                },
+                Some((crate::gateway_tokens::TokensState::Unparsed, source)) => ShuntTokens {
+                    stored,
+                    unparsed: Some((auth.variable, token_source(source))),
+                    run_open,
+                    ..ShuntTokens::default()
+                },
+                Some((crate::gateway_tokens::TokensState::Unset, _)) | None => ShuntTokens {
+                    stored,
+                    run_open,
+                    ..ShuntTokens::default()
+                },
+            }
+        }
         Err(e) => ShuntTokens {
             stored,
             unmanaged_error: Some(token_read_reason(&e)),
@@ -11486,7 +11712,10 @@ fn run_shunt_action(job: ShuntActionJob) -> ShuntActionOutcome {
             profile,
             url,
             config,
-        } => run_add_client_token(&record, &profile, &url, &config),
+            require,
+            pid_at_mint,
+        } => run_add_client_token(&record, &profile, &url, &config, require, pid_at_mint),
+        ShuntActionJob::RequireClientTokens { record } => run_require_client_tokens(&record),
     }
 }
 
@@ -11535,6 +11764,8 @@ fn run_add_client_token(
     profile: &str,
     url: &str,
     config: &JobConfig,
+    require: bool,
+    pid_at_mint: Option<u32>,
 ) -> ShuntActionOutcome {
     let profile_name = ProfileName::from(profile);
     // A profile that vanished between the picker and the job refuses before
@@ -11566,6 +11797,8 @@ fn run_add_client_token(
     ) {
         Ok(()) => ShuntActionOutcome::TokenAdded {
             profile: profile.to_string(),
+            require,
+            pid_at_mint,
         },
         Err(e) => {
             // Decide the copy from the profile as saved on disk after the
@@ -11604,7 +11837,6 @@ fn run_config_edit(
     key: ShuntSaveKey,
     confirmed: bool,
 ) -> ShuntActionOutcome {
-    use crate::gateway::ConfigEditRefusal;
     match crate::gateway_edit::apply_edit(record, edit) {
         Ok(applied) => ShuntActionOutcome::ConfigSaved {
             key,
@@ -11620,22 +11852,59 @@ fn run_config_edit(
                     sentence: refusal.to_string(),
                 };
             }
-            if let Some(ConfigEditRefusal::CheckFailed {
-                binary,
-                config,
-                code,
-                stderr,
-            }) = e.downcast_ref::<ConfigEditRefusal>()
-            {
-                return ShuntActionOutcome::ConfigCheckFailed {
-                    error: check_refused_line(binary, config, code, "save"),
-                    check_output: Some(stderr.clone()),
-                    config: record.config().to_path_buf(),
-                };
+            if let Some(outcome) = check_failed_outcome(&e, record) {
+                return outcome;
             }
             ShuntActionOutcome::ConfigFailed {
                 error: error_toast_detail(&e),
             }
+        }
+    }
+}
+
+/// Classify a [`crate::gateway::ConfigEditRefusal::CheckFailed`] into the
+/// held-stderr outcome (`None` for any other error): the compact `save failed`
+/// line plus the stderr the card's `check output` line holds. Shared by the
+/// config-save and the require runners, so a copy change lands in both.
+fn check_failed_outcome(
+    e: &anyhow::Error,
+    record: &crate::gateway::GatewayRecord,
+) -> Option<ShuntActionOutcome> {
+    let refusal = e.downcast_ref::<crate::gateway::ConfigEditRefusal>()?;
+    let crate::gateway::ConfigEditRefusal::CheckFailed {
+        binary,
+        config,
+        code,
+        stderr,
+    } = refusal
+    else {
+        return None;
+    };
+    Some(ShuntActionOutcome::ConfigCheckFailed {
+        error: check_refused_line(binary, config, code, "save"),
+        check_output: Some(stderr.clone()),
+        config: record.config().to_path_buf(),
+    })
+}
+
+/// Run the `require client tokens` engine step, classifying the failure the
+/// same way a config save routes it: a refused `shunt check` keeps its compact
+/// line + held stderr (`save failed` + `check output`), anything else the error
+/// chain. There is no `└` line — the require runs off a confirm, never an open
+/// editor — so an `EditRefusal` toasts like any other failure.
+fn run_require_client_tokens(record: &crate::gateway::GatewayRecord) -> ShuntActionOutcome {
+    match crate::gateway_tokens::require_client_tokens(record) {
+        Ok(applied) => ShuntActionOutcome::ConfigSaved {
+            key: ShuntSaveKey::RequireTokens,
+            written: applied.written,
+            restart_only: applied.restart_only,
+            value: None,
+            confirmed: false,
+        },
+        Err(e) => {
+            check_failed_outcome(&e, record).unwrap_or_else(|| ShuntActionOutcome::ConfigFailed {
+                error: error_toast_detail(&e),
+            })
         }
     }
 }
@@ -15094,19 +15363,54 @@ fn gateway_session_count(app: &App) -> Option<usize> {
         bind.configured.set_port(port);
         bind.probe.set_port(port);
     }
+    let config = app.config();
     Some(
-        app.config()
-            .profiles
-            .iter()
-            .filter(|profile| {
-                profile
-                    .base_url
-                    .as_deref()
-                    .is_some_and(|url| crate::gateway::url_names_bind(url, &bind))
-            })
+        profiles_naming_bind(&config, &bind)
+            .into_iter()
             .map(|profile| app.live_sessions.member(&profile.name).sessions)
             .sum(),
     )
+}
+
+/// The profile names whose `base_url` names the gateway's address, in roster
+/// order — the `stop shunt?` count's reader, names instead of a count, for the
+/// require confirm's `profiles using the gateway` line. Empty on a bind read
+/// failure or no adopted record.
+fn gateway_profile_names(app: &App) -> Vec<String> {
+    let Some(record) = app.services.shunt_record.as_ref() else {
+        return Vec::new();
+    };
+    let Ok(mut bind) = crate::gateway::displayed_gateway_bind(record) else {
+        return Vec::new();
+    };
+    if let Some(port) = crate::daemon::gateway_slot(app.daemon_health).0.port {
+        bind.configured.set_port(port);
+        bind.probe.set_port(port);
+    }
+    let config = app.config();
+    profiles_naming_bind(&config, &bind)
+        .into_iter()
+        .map(|profile| profile.name.to_string())
+        .collect()
+}
+
+/// The profiles whose `base_url` names `bind`'s gateway address, roster order.
+/// Both the `stop shunt?` session count and the require confirm's profiles
+/// line read the same set, so a predicate change lands in both.
+fn profiles_naming_bind<'a>(
+    config: &'a AppConfig,
+    bind: &crate::gateway::GatewayBind,
+) -> Vec<&'a crate::profile::Profile> {
+    config
+        .profiles
+        .iter()
+        .filter(|profile| {
+            profile
+                .base_url
+                .as_deref()
+                .is_some_and(|url| crate::gateway::url_names_bind(url, bind))
+        })
+        .collect()
 }
 
 /// Switch to the Services tab, select the `shunt` row, descend, and focus the
@@ -17366,6 +17670,14 @@ fn commit_new_account(app: &mut App) {
     }
     // Mint before the create, under C1's one-save guard; a refusal keeps the
     // form open. The token never reaches a toast, a buffer or a log line.
+    // Read the gateway pid BEFORE the mint: the pid the require's restart wait
+    // compares against is the one running when the create starts, never the one
+    // the mint's own store-change restart publishes.
+    let pid_at_mint = if mint.is_some() {
+        crate::daemon::gateway_slot(app.daemon_health).0.pid
+    } else {
+        None
+    };
     let minted = match mint {
         Some(mint) => {
             if app.services.shunt_save_worker.running {
@@ -17429,6 +17741,13 @@ fn commit_new_account(app: &mut App) {
             }
             finish_created_profile(app, &name);
             app.toast(ToastKind::Success, format!("created '{name}'"));
+            // A require-flow mint runs the require (or marks the card waiting
+            // for the restart) only once the profile landed — a failed create
+            // rolls the token back, so requiring before it could leave the
+            // gateway refusing to run open.
+            if minted.as_ref().is_some_and(|(mint, _)| mint.require) {
+                require_after_mint(app, pid_at_mint);
+            }
         }
         Err(e) => {
             let Some((mint, token)) = minted else {
@@ -18459,8 +18778,19 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             profile,
             url,
             replace: _,
+            require,
         } => {
-            start_shunt_token_add(app, record, profile, url);
+            start_shunt_token_add(app, record, profile, url, require);
+        }
+        ConfirmAction::RequireClientTokens { .. } => {
+            let Some(record) = app.services.shunt_record.clone() else {
+                app.toast(
+                    ToastKind::Danger,
+                    format!("save failed\n{NO_ADOPTED_CONFIG}"),
+                );
+                return;
+            };
+            start_shunt_require(app, record);
         }
         ConfirmAction::Acknowledge => {}
     }
@@ -18807,13 +19137,13 @@ fn handle_token_picker_key(app: &mut App, key: KeyEvent) {
                 return;
             };
             if cursor == 0 {
-                open_new_profile_form(app);
+                open_new_profile_form(app, form.require);
                 return;
             }
             let Some((profile, _)) = form.targets.get(cursor - 1).cloned() else {
                 return;
             };
-            open_token_overwrite_confirm(app, profile);
+            open_token_overwrite_confirm(app, profile, form.require);
         }
         _ => {}
     }
@@ -19397,6 +19727,7 @@ pub(crate) fn on_tick(app: &mut App) {
     poll_services_refresh(app);
     drain_daemon_control(app);
     poll_daemon_health(app);
+    poll_pending_require(app);
     drain_left_behind_probe(app);
 
     warn_day_claim_notices(app);
@@ -19467,6 +19798,40 @@ fn poll_daemon_health(app: &mut App) {
     app.last_daemon_probe = Instant::now();
     app.daemon_health = crate::daemon::daemon_health();
     sync_gateway_state(app);
+}
+
+/// Resolve a pending `require client tokens` on every tick, whatever tab is
+/// focused and whether a modal is open (the picker route leaves the user on
+/// Setup, and the daemon's restart takes seconds): a record change or a drop
+/// ends the wait; a `healthy` slot whose pid is `Some` and differs from the one
+/// read before the mint runs the require. The one-save guard defers a run to a
+/// later tick rather than dropping it, and clearing the pending before starting
+/// means a second tick before the outcome drains starts nothing.
+fn poll_pending_require(app: &mut App) {
+    let Some(pending) = app.services.pending_require.clone() else {
+        return;
+    };
+    let record = crate::gateway::GatewayRecord::load().ok().flatten();
+    if record.as_ref() != Some(&pending.record) {
+        app.services.pending_require = None;
+        app.toast(
+            ToastKind::Info,
+            "require client tokens cancelled\nthe gateway changed",
+        );
+        return;
+    }
+    let gateway_slot = crate::daemon::gateway_slot(app.daemon_health).0;
+    if gateway_slot.state == GatewayState::Healthy
+        && gateway_slot.pid.is_some()
+        && gateway_slot.pid != pending.pid
+    {
+        // A save in flight holds the one save slot; the next tick retries
+        // rather than dropping the pending require.
+        if !app.services.shunt_save_worker.running {
+            app.services.pending_require = None;
+            start_shunt_require(app, pending.record);
+        }
+    }
 }
 
 /// Re-tally the live-session registry for the Overview `live` column, the

@@ -513,6 +513,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             | ConfirmAction::RemoveEntry { .. }
             | ConfirmAction::RemoveToken { .. }
             | ConfirmAction::AddToken { .. }
+            | ConfirmAction::RequireClientTokens { .. }
     );
 
     // `AddChainCandidate` names the candidate in its confirm button so the
@@ -531,6 +532,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             "remove".to_string()
         }
         ConfirmAction::AddToken { .. } => "overwrite".to_string(),
+        ConfirmAction::RequireClientTokens { .. } => "require".to_string(),
         _ => "confirm".to_string(),
     };
 
@@ -562,6 +564,16 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         && let Some(replace) = replace
     {
         lines.push(Line::from(prose::spans(replace, theme::dim())));
+    }
+    // The require confirm's third line names the profiles whose `base_url`
+    // names the gateway; empty = none to name, no line.
+    if let ConfirmAction::RequireClientTokens { profiles } = &state.on_confirm
+        && !profiles.is_empty()
+    {
+        lines.push(Line::from(prose::spans(
+            &format!("profiles using the gateway: {profiles}."),
+            theme::dim(),
+        )));
     }
     // An acknowledge-only notice has nothing to cancel — a single focused `ok`.
     let buttons = if matches!(state.on_confirm, ConfirmAction::Acknowledge) {

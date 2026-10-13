@@ -25,7 +25,8 @@ pub(super) fn selector_width(body_w: u16) -> u16 {
 /// Phone-width threshold: below this, layouts that place panes side-by-side
 /// stack them vertically instead — at Moshi's ~45 columns the horizontal
 /// master-detail split leaves the detail pane ~13 usable cells. At or above
-/// it every layout is byte-identical to the desktop rendering.
+/// it every layout renders as on desktop, except the Overview chain rows: they
+/// test their panel's inner width (body − 4), so bodies 60–63 still narrow them.
 pub(super) const NARROW_BODY_W: u16 = 60;
 
 /// Key column width of the two master-detail settings cards, the Setup
@@ -454,9 +455,10 @@ pub(super) fn draw_scrollbar(
     }
 }
 
-/// Rows of context the form scroll keeps past the focused line while content
-/// remains (the cursor never rests against the viewport edge).
-const SCROLL_PAD: usize = 3;
+/// Rows of context every cursor-following scroll keeps past the focused line
+/// while content remains (the cursor never rests against the viewport edge):
+/// forms, modals, Status, the page-key landing and the selector lists.
+const SCROLL_PAD: usize = 2;
 
 /// Render a form pane's assembled lines into `inner`, scrolled so the focused
 /// block `focus.0..focus.1` stays on screen, plus the overflow scrollbar.
@@ -724,7 +726,9 @@ pub(super) fn draw_following_list(
     let mut state = ListState::default().with_offset(prior);
     state.select(Some(sel));
     frame.render_stateful_widget(
-        List::new(rows).style(theme::base()).scroll_padding(3),
+        List::new(rows)
+            .style(theme::base())
+            .scroll_padding(SCROLL_PAD),
         inner,
         &mut state,
     );

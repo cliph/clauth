@@ -211,6 +211,46 @@ fn account_selectors_hold_separate_viewports_across_tabs_and_resize() {
     );
 }
 
+/// The Status selector keeps two lines of context past its two-line cursor
+/// row: walking down from the top, the offset holds at 0 until the incident's
+/// block plus two lines would pass the even viewport, then follows it.
+#[test]
+fn the_incident_selector_scrolls_with_two_lines_of_context() {
+    use crate::tui::app::Tab;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    let template = demo_incidents().remove(0);
+    app.status.incidents = (0..12)
+        .map(|i| {
+            let mut incident = template.clone();
+            incident.title = format!("incident-{i:02}");
+            incident
+        })
+        .collect();
+    app.tab = Tab::Status;
+    let mut term = Terminal::new(TestBackend::new(80, 17)).unwrap();
+    let mut offsets = Vec::new();
+    for c in 0..12 {
+        app.status.cursor = c;
+        term.draw(|f| super::draw(f, &app)).unwrap();
+        offsets.push(app.status.selector.offset.get());
+    }
+    let viewport = app.status.selector.viewport.get();
+    assert_eq!(
+        viewport, 10,
+        "the 80x17 status selector shows five incidents"
+    );
+    // Incident c spans lines 2c..2c+2; two lines past it end at 2c+4. The last
+    // offset that still fills the view is 24 - 10 = 14.
+    let expected: Vec<usize> = (0..12_usize)
+        .map(|c| (2 * c + 4).saturating_sub(10).min(14))
+        .collect();
+    assert_eq!(offsets, expected, "status offset per cursor incident");
+}
+
 #[test]
 fn incident_selector_moves_by_two_rows_without_recentering() {
     use crate::tui::app::Tab;
@@ -299,7 +339,7 @@ fn incident_selector_moves_by_two_rows_without_recentering() {
 }
 
 /// PageDown on the Overview selector moves the cursor one page (12 visible
-/// rows at 80x24 → cursor 2 becomes 13) and keeps the selection at least three
+/// rows at 80x24 → cursor 2 becomes 13) and keeps the selection at least two
 /// rows off the list's bottom edge; both page keys stop at the ends.
 #[test]
 fn overview_selector_pages_the_cursor_and_stops_at_the_ends() {
@@ -342,9 +382,10 @@ fn overview_selector_pages_the_cursor_and_stops_at_the_ends() {
         .position(|r| r.contains('╰'))
         .map(|i| caret + i - 1)
         .expect("the accounts pane's bottom border sits below the caret");
-    assert!(
-        caret + 3 <= list_bottom,
-        "three context rows below the selection (caret {caret}, list bottom {list_bottom})"
+    assert_eq!(
+        list_bottom - caret,
+        2,
+        "two context rows below the selection (caret {caret}, list bottom {list_bottom})"
     );
     app.overview_cursor = 24;
     handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
@@ -2564,8 +2605,8 @@ fn scroll_offset_keeps_the_whole_focused_block_on_screen() {
     use super::panes::scroll_offset;
 
     // Block 18..22 in a 20-row viewport. Scrolling to the ROW alone yields 1
-    // (18 + 3 pad - 20) and clips the block's tail at 21.
-    assert_eq!(scroll_offset(30, 20, (18, 22)), 5);
+    // (19 + 2 pad - 20) and clips the block's tail at 21.
+    assert_eq!(scroll_offset(30, 20, (18, 22)), 4);
     // A block taller than the viewport caps at its first line, so the row it
     // explains survives even though its hint cannot.
     assert_eq!(scroll_offset(40, 10, (5, 30)), 5);
@@ -2575,13 +2616,59 @@ fn scroll_offset_keeps_the_whole_focused_block_on_screen() {
     assert_eq!(scroll_offset(30, 20, (2, 5)), 0);
 }
 
+/// The Usage selector keeps two rows of context past the cursor: walking down
+/// from the top, the view holds still until the cursor sits two rows above the
+/// viewport's bottom edge, then scrolls one row per press.
+#[test]
+fn the_usage_selector_scrolls_with_two_rows_of_context() {
+    use crate::tui::app::{Tab, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let profiles: Vec<Profile> = (0..25)
+        .map(|i| crate::testutil::blank_profile(&ProfileName::from(format!("acct-{i:02}"))))
+        .collect();
+    let names = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: names,
+            ..AppState::default()
+        },
+        profiles,
+    });
+    app.tab = Tab::Usage;
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let viewport = app.usage_selector.viewport.get();
+    assert_eq!(viewport, 18, "the 80x24 usage selector lists eighteen rows");
+    let mut offsets = vec![app.usage_selector.offset.get()];
+    for _ in 1..viewport {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        term.draw(|f| super::draw(f, &app)).unwrap();
+        offsets.push(app.usage_selector.offset.get());
+    }
+    assert_eq!(app.profile_cursor, viewport - 1, "each press moved one row");
+    // Row c keeps rows c+1 and c+2 on screen: the first visible row is at
+    // least c + 3 - viewport.
+    let expected: Vec<usize> = (0..viewport)
+        .map(|c| (c + 3).saturating_sub(viewport))
+        .collect();
+    assert_eq!(
+        offsets, expected,
+        "offset per cursor row, viewport {viewport}"
+    );
+}
+
 #[test]
 fn form_scroll_follows_without_repinning_and_clamps_wrapped_blocks() {
     use super::panes::follow_scroll_offset;
     assert_eq!(follow_scroll_offset(30, 10, (15, 16), 10), 10);
     assert_eq!(follow_scroll_offset(30, 10, (16, 17), 10), 10);
-    assert_eq!(follow_scroll_offset(30, 10, (7, 8), 10), 4);
-    assert_eq!(follow_scroll_offset(30, 10, (18, 22), 10), 15);
+    assert_eq!(follow_scroll_offset(30, 10, (7, 8), 10), 5);
+    assert_eq!(follow_scroll_offset(30, 10, (18, 22), 10), 14);
+    // Two rows of context below: row 7 of a fresh 10-row view keeps rows 8 and
+    // 9 on screen without scrolling; row 8 scrolls one.
+    assert_eq!(follow_scroll_offset(20, 10, (7, 8), 0), 0);
+    assert_eq!(follow_scroll_offset(20, 10, (8, 9), 0), 1);
     assert_eq!(follow_scroll_offset(40, 10, (5, 30), 0), 5);
     assert_eq!(follow_scroll_offset(8, 10, (7, 8), 20), 0);
 }
@@ -4508,7 +4595,7 @@ fn the_preferred_days_hint_reads_whole_on_a_narrow_card() {
 
 /// A candidate mid-list keeps its whole note on screen, not only its own line:
 /// the view holds the note as part of the cursor's block. At 28 columns the
-/// blocker note wraps to four lines, past the three rows of context the scroll
+/// blocker note wraps to four lines, past the two rows of context the scroll
 /// keeps after a line, with more candidates below to scroll into.
 #[test]
 fn a_mid_list_add_candidate_keeps_its_whole_note_on_screen() {
@@ -4551,8 +4638,8 @@ fn a_mid_list_add_candidate_keeps_its_whole_note_on_screen() {
         .take_while(|r| r.starts_with(" └ ") || r.starts_with("   "))
         .count();
     assert!(
-        note_lines > 3,
-        "precondition: the note wraps past the scroll's 3-row pad:\n{out}"
+        note_lines > 2,
+        "precondition: the note wraps past the scroll's 2-row pad:\n{out}"
     );
     assert!(
         inner[at + 1 + note_lines..]

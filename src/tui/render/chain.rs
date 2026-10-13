@@ -24,8 +24,8 @@ use super::super::app::{
     parse_max_spend, parse_weekly_override, preferred_days_preset,
 };
 use super::super::theme;
-use super::format::{ResetFmt, fixed_split, relative_age, reset_pill, reset_resume};
-use super::global_config::default_reminder;
+use super::format::{ResetFmt, fixed_split, relative_age, reset_pill, reset_resume, truncate};
+use super::global_config::reminder_text;
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED,
     DIAG_DISABLED, DIAG_KEY_REJECTED, DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT,
@@ -135,13 +135,22 @@ fn draw_chain_selector(
                                 // actually carries a marker pays the clamp — the name
                                 // column's width therefore tracks blocked state.
                                 Some(reason) => {
-                                    let name_w = (w as usize).saturating_sub(rail_w + 2);
+                                    let name_w = (w as usize).saturating_sub(rail_w + 4);
                                     let (text, pad) = fixed_split(&name, name_w);
                                     spans.push(Span::styled(text, ns));
-                                    spans.push(Span::raw(format!("{pad} ")));
+                                    spans.push(Span::raw(format!("{pad}   ")));
                                     spans.push(reason_marker(reason));
                                 }
-                                None => spans.push(Span::styled(name.to_string(), ns)),
+                                None => {
+                                    // No marker to reserve: the name clamps to the
+                                    // pane's own edge (the scrollbar owns the padding
+                                    // cell beyond it) instead of running raw into the
+                                    // border — the same clamp, minus the marker.
+                                    let (text, pad) =
+                                        fixed_split(&name, (w as usize).saturating_sub(rail_w));
+                                    spans.push(Span::styled(text, ns));
+                                    spans.push(Span::raw(pad));
+                                }
                             }
                             Line::from(spans)
                         }
@@ -174,7 +183,9 @@ fn draw_chain_detail(
     key_rejected: &HashSet<crate::profile::ProfileName>,
 ) {
     let detail_focused = app.fallback_focus == FallbackFocus::Detail;
-    let inner_w = section_box("", detail_focused, false).inner(area).width as usize;
+    let inner_w = section_box("", detail_focused, false, area.width)
+        .inner(area)
+        .width as usize;
     let items = chain_items(app);
     let selected = items
         .get(app.chain_cursor.min(items.len().saturating_sub(1)))
@@ -291,9 +302,9 @@ fn draw_chain_detail(
     };
 
     let block = if is_name {
-        section_box_verbatim(&title, detail_focused, false)
+        section_box_verbatim(&title, detail_focused, false, area.width)
     } else {
-        section_box(&title, detail_focused, false)
+        section_box(&title, detail_focused, false, area.width)
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -822,29 +833,49 @@ fn member_detail(
     // key and the figure leave, up to `GAUGE_W`, so on a narrow pane the bar
     // gives and the figure reads whole.
     let (figure, figure_style) = match pct {
-        Some(v) => (format!("  {v:.0}% used"), theme::util(v)),
-        None => ("  no data yet".to_string(), theme::faint()),
+        Some(v) => (format!("{v:.0}% used"), theme::util(v)),
+        None => ("no data yet".to_string(), theme::faint()),
     };
-    let gauge_w = width
-        .saturating_sub(DETAIL_KEY_W + DETAIL_KEY_GUTTER + figure.chars().count())
-        .clamp(4, GAUGE_W);
+    let key_w = DETAIL_KEY_W + DETAIL_KEY_GUTTER;
+    // The figure rides the key row only while the gauge keeps its floor; below
+    // that it drops to its own line under the value column rather than
+    // hard-wrapping an orphan tail off the pane edge.
+    let gauge_w = width.saturating_sub(key_w + Span::raw(&figure).width() + 2);
     let mut gauge_spans = vec![Span::styled(
         key_cell("5h usage", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
         theme::label(),
     )];
-    gauge_spans.extend(gauge_with_tick(pct, Some(threshold), gauge_w));
-    gauge_spans.push(Span::styled(figure, figure_style));
-    lines.push(Line::from(gauge_spans));
+    if gauge_w >= 4 {
+        gauge_spans.extend(gauge_with_tick(
+            pct,
+            Some(threshold),
+            gauge_w.clamp(4, GAUGE_W),
+        ));
+        gauge_spans.push(Span::styled(format!("  {figure}"), figure_style));
+        lines.push(Line::from(gauge_spans));
+    } else {
+        gauge_spans.extend(gauge_with_tick(
+            pct,
+            Some(threshold),
+            width.saturating_sub(key_w).clamp(4, GAUGE_W),
+        ));
+        lines.push(Line::from(gauge_spans));
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(key_w)),
+            Span::styled(figure, figure_style),
+        ]));
+    }
 
     // No 5h reading means no headroom figure — an empty continuation line here
     // read as a deliberate gap on exactly the accounts that had nothing to say.
     if let Some(v) = pct {
+        let hint = truncate(
+            &format!("{:.0}% until rotate", (threshold - v).max(0.0)),
+            width.saturating_sub(key_w),
+        );
         lines.push(Line::from(vec![
-            Span::raw(" ".repeat(DETAIL_KEY_W + DETAIL_KEY_GUTTER)),
-            Span::styled(
-                format!("{:.0}% until rotate", (threshold - v).max(0.0)),
-                theme::faint(),
-            ),
+            Span::raw(" ".repeat(key_w)),
+            Span::styled(hint, theme::faint()),
         ]));
     }
     lines.push(Line::from(""));
@@ -1233,12 +1264,26 @@ fn detail_row(
                     spans.push(Span::styled(" %", pct_style));
                 }
                 None => {
-                    spans.push(Span::styled(format!("{threshold:.0}%"), theme::accent()));
+                    let value = format!("{threshold:.0}%");
+                    spans.push(Span::styled(value.clone(), theme::accent()));
                     if (threshold - DEFAULT_THRESHOLD).abs() > f64::EPSILON {
-                        spans.push(Span::styled(
-                            format!("   default: {DEFAULT_THRESHOLD:.0}%"),
-                            theme::faint(),
-                        ));
+                        let reminder = reminder_text(format!("{DEFAULT_THRESHOLD:.0}%"));
+                        // The reminder trails the value inline while it fits; past
+                        // that it drops to its own line under the value column (the
+                        // `remove` arm's shape) instead of clipping mid-word.
+                        if VALUE_COL + Span::raw(&value).width() + 3 + Span::raw(&reminder).width()
+                            <= width
+                        {
+                            spans.push(Span::styled(format!("   {reminder}"), theme::faint()));
+                        } else {
+                            return vec![
+                                Line::from(spans),
+                                Line::from(vec![
+                                    Span::raw(" ".repeat(VALUE_COL)),
+                                    Span::styled(reminder, theme::faint()),
+                                ]),
+                            ];
+                        }
                     }
                 }
             }
@@ -1284,11 +1329,28 @@ fn detail_row(
                         } else {
                             theme::accent()
                         };
-                        spans.push(Span::styled(format!("{v:.0}%"), value_style));
+                        let value = format!("{v:.0}%");
+                        spans.push(Span::styled(value.clone(), value_style));
                         // Mirrors `rotate at`: only remind of the default once the
                         // value actually differs from it (else it's noise).
                         if (v - weekly_default).abs() > f64::EPSILON {
-                            spans.push(default_reminder(format!("{weekly_default:.0}%")));
+                            let reminder = reminder_text(format!("{weekly_default:.0}%"));
+                            if VALUE_COL
+                                + Span::raw(&value).width()
+                                + 3
+                                + Span::raw(&reminder).width()
+                                <= width
+                            {
+                                spans.push(Span::styled(format!("   {reminder}"), theme::faint()));
+                            } else {
+                                return vec![
+                                    Line::from(spans),
+                                    Line::from(vec![
+                                        Span::raw(" ".repeat(VALUE_COL)),
+                                        Span::styled(reminder, theme::faint()),
+                                    ]),
+                                ];
+                            }
                         }
                     }
                     // Unset follows the chain-wide line — show that value, but
@@ -1392,14 +1454,24 @@ fn detail_row(
             } else {
                 "remove from chain".to_string()
             };
-            Line::from(vec![
+            let lead = vec![
                 arrow,
                 Span::styled(
                     key_cell("remove", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
                     label_style(selected),
                 ),
-                Span::styled(label, theme::danger()),
-            ])
+            ];
+            // The value drops to its own line past the caret gutter once the
+            // value column leaves no room, instead of clipping off the pane.
+            if VALUE_COL + Span::raw(&label).width() <= width {
+                let mut spans = lead;
+                spans.push(Span::styled(label, theme::danger()));
+                return vec![Line::from(spans)];
+            }
+            return vec![
+                Line::from(lead),
+                Line::from(vec![Span::raw("  "), Span::styled(label, theme::danger())]),
+            ];
         }
     };
     vec![line]
@@ -1573,10 +1645,11 @@ fn add_detail(
     key_rejected: &HashSet<crate::profile::ProfileName>,
 ) -> AddDetail {
     let candidates = chain_candidates(app);
-    let mut lines: Vec<Line<'static>> = vec![
-        Line::from(Span::styled("add an account to the rotation", theme::dim())),
-        Line::from(""),
-    ];
+    let mut lines: Vec<Line<'static>> = wrap_words("add an account to the rotation", width)
+        .into_iter()
+        .map(|seg| Line::from(Span::styled(seg, theme::dim())))
+        .collect();
+    lines.push(Line::from(""));
     lines.extend(
         wrap_words(
             "when an account runs out, clauth points claude code at the next one.",

@@ -3834,6 +3834,10 @@ pub(crate) struct App {
     /// Whether the terminal is currently too short for the normal layout (< 14 rows).
     /// Tracked across frames so the "too small" toast fires only on the transition in.
     pub(crate) compact: bool,
+    /// Whether the terminal is below [`Self::WIDTH_FLOOR`] — the narrowest
+    /// width at which the Overview accounts row still reads whole (the binding
+    /// surface; the Fallback picker and blurb fit narrower).
+    pub(crate) below_width_floor: bool,
     /// Startup update check result; drained in `on_tick`. Silent on errors.
     pub(crate) update_results: std::sync::mpsc::Receiver<UpdateEvent>,
     /// Join handle for the update check thread; joined on TUI exit for clean shutdown.
@@ -4407,6 +4411,7 @@ impl App {
             chain_cursor: 0,
             toasts: VecDeque::new(),
             compact: false,
+            below_width_floor: false,
             update_results,
             update_handle,
             login: None,
@@ -5337,11 +5342,22 @@ impl App {
         });
     }
 
-    /// Called each frame with the current terminal height. Tracks compact
-    /// state; the matching warning banner is recomputed from this flag in
-    /// `update_banner` each tick, so it self-clears on resize (no toast).
-    pub(crate) fn update_compact(&mut self, terminal_height: u16) {
+    /// The narrowest terminal width every surface still reads at whole or
+    /// visibly ellipsized. Set by the Overview accounts row: with the 5h bar
+    /// shed to its `%` figure, the row's floor is cursor(2) + marker(2) +
+    /// name(8) + gap(2) + kind(6) + narrow(1) + timer(5) + `%`(4) = 30 cells
+    /// inside a 4-cell-chromed panel, so the terminal needs 34. The Fallback
+    /// card's `preferred days` picker only needs 28; the Overview row is the
+    /// binding surface.
+    const WIDTH_FLOOR: u16 = 34;
+
+    /// Called each frame with the current terminal size. Tracks compact
+    /// state and the width floor; the matching warning banner is recomputed
+    /// from these flags in `update_banner` each tick, so it self-clears on
+    /// resize (no toast).
+    pub(crate) fn update_compact(&mut self, terminal_height: u16, terminal_width: u16) {
         self.compact = terminal_height < 14;
+        self.below_width_floor = terminal_width < Self::WIDTH_FLOOR;
     }
 
     /// Mark a background tab with an activity color. Only sets if `tab` is not
@@ -20152,7 +20168,7 @@ fn update_banner(app: &mut App) {
             severity: BannerSeverity::Warning,
             message,
         })
-    } else if app.compact {
+    } else if app.compact || app.below_width_floor {
         // Terminal too small for the full layout. Lower severity than the
         // all-spent danger above, so danger wins the tie.
         Some(Banner {

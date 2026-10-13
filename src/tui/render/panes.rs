@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wra
 
 use super::super::app::{App, InputState};
 use super::super::theme;
+use super::format::{fixed_split, grapheme_cells, truncate};
 use super::prose;
 use crate::profile::AppConfig;
 
@@ -372,9 +373,14 @@ pub(super) fn picker_row(
     } else {
         Span::raw("  ")
     };
+    // A profile name longer than the selector (an email address passes
+    // `validate_name_chars`) clamps with `…` instead of running past the pane
+    // edge — the marked Fallback arm's clamp, without the marker column.
+    let (text, pad) = fixed_split(&name, usize::from(width).saturating_sub(2));
     let line = Line::from(vec![
         arrow,
-        Span::styled(name, bold_when(name_style, selected && focused)),
+        Span::styled(text, bold_when(name_style, selected && focused)),
+        Span::raw(pad),
     ]);
     select_line(line, selected, focused, width)
 }
@@ -736,7 +742,7 @@ pub(super) fn draw_selector_list(
     list: &ListView,
     build_rows: impl FnOnce(u16) -> Vec<Line<'static>>,
 ) {
-    let block = section_box(title, focused, true);
+    let block = section_box(title, focused, true, area.width);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -944,14 +950,19 @@ pub(super) fn value_caret(input: &InputState, invalid: bool) -> Vec<Span<'static
 /// Border: `LINE_STRONG` when focused, `LINE` when blurred.
 /// Title: always italic, always UPPERCASE; bold added only when focused.
 /// Color: `ACCENT_2` for the first bordered panel on the screen body, `TEXT_DIM` for the rest.
-pub(super) fn section_box(title: &str, focused: bool, first: bool) -> Block<'static> {
-    section_box_impl(title, focused, first, true, Vec::new(), None)
+pub(super) fn section_box(title: &str, focused: bool, first: bool, width: u16) -> Block<'static> {
+    section_box_impl(title, focused, first, true, Vec::new(), None, width)
 }
 
 /// Like [`section_box`] but preserves the title's original case — use only when
 /// the title is a profile/account name, not a structural label.
-pub(super) fn section_box_verbatim(title: &str, focused: bool, first: bool) -> Block<'static> {
-    section_box_impl(title, focused, first, false, Vec::new(), None)
+pub(super) fn section_box_verbatim(
+    title: &str,
+    focused: bool,
+    first: bool,
+    width: u16,
+) -> Block<'static> {
+    section_box_impl(title, focused, first, false, Vec::new(), None, width)
 }
 
 /// Border cells of rule a title must keep before the meta slot may render: a
@@ -986,13 +997,16 @@ pub(super) fn section_box_meta(
     // `╭─` + ` TITLE ` + (the bare border cell + ` left `) + rule + ` meta ─` + `╮`:
     // the corner-adjacent dash is a border cell of its own, counted here so the
     // right slot keeps its ≥[`META_RULE_MIN`] rule cells at the compliant shape.
+    // This builder keeps the title un-ellipsized: its left slot never gives way,
+    // so a too-narrow row clips from the right (the left slot first) — the
+    // documented shape, not a title `…`.
     let insets = 3
-        + Line::from(title_label(title, true)).width()
+        + Line::from(title_label(title, true, u16::MAX)).width()
         + left.as_ref().map_or(0, |left| 1 + left.width())
         + meta_line(meta, Style::default()).width();
     let rule = usize::from(width).saturating_sub(insets);
     let meta = (!meta.is_empty() && rule >= META_RULE_MIN).then_some(meta);
-    let block = section_box_impl(title, focused, first, true, Vec::new(), meta);
+    let block = section_box_impl(title, focused, first, true, Vec::new(), meta, u16::MAX);
     match left {
         Some(left) => block.title_top(left),
         None => block,
@@ -1008,9 +1022,10 @@ pub(super) fn section_box_loading(
     focused: bool,
     first: bool,
     frame: &str,
+    width: u16,
 ) -> Block<'static> {
     let suffix = vec![Span::styled(format!("{frame} "), theme::accent())];
-    section_box_impl(title, focused, first, true, suffix, None)
+    section_box_impl(title, focused, first, true, suffix, None, width)
 }
 
 /// The note editor's docked slot: an empty-title section box whose title break
@@ -1027,6 +1042,7 @@ pub(super) fn edit_slot_block() -> Block<'static> {
             Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold()),
         ],
         None,
+        u16::MAX,
     )
 }
 
@@ -1037,6 +1053,7 @@ fn section_box_impl(
     uppercase: bool,
     suffix: Vec<Span<'static>>,
     meta: Option<&str>,
+    width: u16,
 ) -> Block<'static> {
     let border_style = if focused {
         Style::default().fg(theme::line_strong_color())
@@ -1058,12 +1075,20 @@ fn section_box_impl(
             base
         }
     };
+    let suffix_w: usize = suffix.iter().map(Span::width).sum();
     let mut title_spans = Vec::with_capacity(2 + suffix.len());
     if !title.is_empty() {
         // The corner-adjacent dash `╭─ TITLE`: chrome owns every `─` cell, so it
         // carries the border token, never the title style.
         title_spans.push(Span::styled("─", border_style));
-        title_spans.push(Span::styled(title_label(title, uppercase), title_style));
+        // A trailing suffix (the loading spinner) shares the border break with
+        // the title, so the title budget must leave it room or the spinner
+        // pushes into the corner.
+        let title_w = width.saturating_sub(suffix_w.min(u16::MAX as usize) as u16);
+        title_spans.push(Span::styled(
+            title_label(title, uppercase, title_w),
+            title_style,
+        ));
     }
     // An EMPTY title pushes no spans at all — not even `title_label("")`'s
     // two-space inset, which would punch a hole in the top border. The
@@ -1081,13 +1106,24 @@ fn section_box_impl(
     block
 }
 
-/// A panel title as it sits in the border break: ` TITLE `.
-fn title_label(title: &str, uppercase: bool) -> String {
-    if uppercase {
-        format!(" {} ", title.to_uppercase())
+/// A panel title as it sits in the border break: ` TITLE `, ellipsized to the
+/// border when the panel is narrower than it. The title line renders into the
+/// `width - 2` area past the corner; `─` plus the two insets leave `width - 5`
+/// cells for the title itself, so a longer title ends in `…` inside the border
+/// instead of running into the corner. Byte-identical whenever the title fits.
+fn title_label(title: &str, uppercase: bool, width: u16) -> String {
+    let text = if uppercase {
+        title.to_uppercase()
     } else {
-        format!(" {title} ")
-    }
+        title.to_string()
+    };
+    let budget = usize::from(width).saturating_sub(5);
+    let text = if grapheme_cells(&text) > budget {
+        truncate(&text, budget)
+    } else {
+        text
+    };
+    format!(" {text} ")
 }
 
 /// The title-right meta slot. A right-aligned title ends flush against the

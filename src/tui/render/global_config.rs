@@ -48,7 +48,7 @@ const KEY_W: usize = 17;
 const KEY_GUTTER: usize = 2;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let block = section_box("settings", true, true);
+    let block = section_box("settings", true, true, area.width);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -436,7 +436,7 @@ fn detail_row(
             if rows.reset_display.shows_clock() {
                 cycle_row(arrow, "clock", &options, selected, width)
             } else {
-                vec![dimmed_cycle_row("clock", &options, selected)]
+                dimmed_cycle_row("clock", &options, selected, width)
             }
         }
         GlobalConfigRow::HomeTab => {
@@ -545,7 +545,7 @@ fn detail_row(
             if rows.spend_budget {
                 cycle_row(arrow, "extra usage spent", &options, selected, width)
             } else {
-                vec![dimmed_cycle_row("extra usage spent", &options, selected)]
+                dimmed_cycle_row("extra usage spent", &options, selected, width)
             }
         }
         GlobalConfigRow::PreemptiveRotation => {
@@ -584,16 +584,10 @@ fn detail_row(
     }
 }
 
-/// Trailing faint ` default: X` reminder appended to a value row only when its
-/// live value is off the shipped default — the operator sees the default at the
-/// moment they've moved away from it, and never as noise otherwise (the chain
-/// `rotate at` idiom).
-pub(super) fn default_reminder(value: String) -> Span<'static> {
-    Span::styled(format!("   {}", reminder_text(value)), theme::faint())
-}
-
-/// The reminder's words alone, for a cycle row, which lays out its own gap.
-fn reminder_text(value: impl std::fmt::Display) -> String {
+/// The reminder's words alone: `default: X`. Cycle rows lay out their own gap;
+/// the chain card shares the same words and drops its inline reminder to its
+/// own line under the value column when the row is too narrow.
+pub(super) fn reminder_text(value: impl std::fmt::Display) -> String {
     format!("default: {value}")
 }
 
@@ -834,7 +828,7 @@ fn burn_floor_lines(
         .map(|(label, p)| (label.as_str(), *p == floor_pct))
         .collect();
     if !burn_aware {
-        return vec![dimmed_cycle_row("burn floor", &options, selected)];
+        return dimmed_cycle_row("burn floor", &options, selected, width);
     }
     let custom = (!BURN_FLOOR_PRESETS.contains(&floor_pct))
         .then(|| format!("{}%", format_weekly_pct(floor_pct)));
@@ -870,7 +864,7 @@ fn burn_horizon_lines(
         .map(|(label, ms)| (label.as_str(), *ms == horizon_ms))
         .collect();
     if !burn_aware {
-        return vec![dimmed_cycle_row("burn horizon", &options, selected)];
+        return dimmed_cycle_row("burn horizon", &options, selected, width);
     }
     let custom =
         (!BURN_HORIZON_PRESETS.contains(&horizon_ms)).then(|| format!("{}s", horizon_ms / 1000));
@@ -920,8 +914,15 @@ fn cycle_lead(arrow: Span<'static>, key: &str, row_selected: bool) -> Vec<Span<'
 /// whole row (caret, key, current value) renders `TEXT_FAINT`, no bracket
 /// highlight — just the current value. Focusable but inert (the key handler
 /// no-ops it), so `TEXT_FAINT` keeps meaning "can't touch this". The `draw` loop
-/// still tints + shows the `└` reason on focus.
-fn dimmed_cycle_row(key: &str, options: &[(&str, bool)], selected: bool) -> Line<'static> {
+/// still tints + shows the `└` reason on focus. The value drops to its own
+/// line past the caret gutter when the key leaves no room, so the current
+/// option stays whole instead of clipping off the pane.
+fn dimmed_cycle_row(
+    key: &str,
+    options: &[(&str, bool)],
+    selected: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
     let arrow = if selected {
         Span::styled("❯ ", theme::faint())
     } else {
@@ -932,11 +933,23 @@ fn dimmed_cycle_row(key: &str, options: &[(&str, bool)], selected: bool) -> Line
         .find(|(_, active)| *active)
         .map(|(label, _)| *label)
         .unwrap_or("");
-    Line::from(vec![
+    let lead = vec![
         arrow,
         Span::styled(key_cell(key, KEY_W, KEY_GUTTER), theme::faint()),
-        Span::styled(value.to_string(), theme::faint()),
-    ])
+    ];
+    if 2 + KEY_W + KEY_GUTTER + Span::raw(value).width() <= width {
+        let mut spans = lead;
+        spans.push(Span::styled(value.to_string(), theme::faint()));
+        vec![Line::from(spans)]
+    } else {
+        vec![
+            Line::from(lead),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(value.to_string(), theme::faint()),
+            ]),
+        ]
+    }
 }
 
 /// [`dimmed_cycle_row`]'s toggle sibling: the whole row — caret, key, knob —

@@ -1477,6 +1477,7 @@ fn chain_row_switch_hint_rides_the_target_row() {
             name_w: 8,
             gauge_w: GAUGE_W,
             thr_w: 3,
+            figure_inline: true,
             reason: None,
             switch_eta: Some(7200),
         },
@@ -1520,6 +1521,7 @@ fn chain_row_renders_every_projected_hop_with_the_return_glyph() {
                 name_w: 8,
                 gauge_w: GAUGE_W,
                 thr_w: 3,
+                figure_inline: true,
                 reason: None,
                 switch_eta: Some(7200),
             },
@@ -1632,6 +1634,7 @@ fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
             name_w: 8,
             gauge_w: GAUGE_W,
             thr_w: 3,
+            figure_inline: true,
             reason: Some(BlockedReason::AuthBroken),
             switch_eta: Some(7200),
         },
@@ -1665,6 +1668,7 @@ fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
                 name_w: 8,
                 gauge_w: GAUGE_W,
                 thr_w: 3,
+                figure_inline: true,
                 reason: Some(BlockedReason::AuthBroken),
                 switch_eta: Some(7200),
             },
@@ -1936,6 +1940,106 @@ fn five_hour_cell_text(widths: &OverviewWidths, deepseek: bool, row: &Line<'stat
         .skip(col)
         .take(widths.five_hour)
         .collect()
+}
+
+/// A DeepSeek balance never fabricates a figure and never closes a bracket
+/// around a cut amount: the whole balance keeps its brackets while they fit,
+/// sheds them before cutting, and only then ends in `…`. The `[11]` and
+/// `[1132.60 CN]` shapes the char-take produced are the one outcome that must
+/// never ship.
+#[test]
+fn deepseek_balance_sheds_brackets_before_it_ever_cuts() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![deepseek_profile("ds", &["1132.60 CNY"])],
+        None,
+        vec![],
+    ));
+    // `OverviewWidths` takes the accounts list's INNER width (terminal − 4).
+    // Below 42 cols the 5h column is the 4-cell figure-only tier, so the whole
+    // 11-cell balance must cut — with `…`, never a closed bracket around a cut
+    // figure (`[11]`). At 42–60 the 12-cell column holds the whole balance,
+    // brackets shed before any cut; at 80 the 17-cell column keeps its brackets.
+    for (terminal, expected) in [
+        (34u16, "113…"),
+        (41u16, "113…"),
+        (42u16, "1132.60 CNY "),
+        (60u16, "1132.60 CNY "),
+    ] {
+        let widths = OverviewWidths::new(terminal.saturating_sub(4), &app);
+        let row = render_overview_row(&app, 0, &widths, false, false);
+        let cell = five_hour_cell_text(&widths, true, &row);
+        assert_eq!(cell, expected, "balance cell at {terminal} cols");
+    }
+}
+
+/// A long email-style chain name renders whole on desktop (no `…` with free
+/// cells left) — the round-1 clamp to 18 cells was the regression.
+#[test]
+fn a_long_chain_name_renders_whole_on_desktop() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "abcdefghijklmnopqrstuvwxyz";
+    let a = profile(name, 95.0, 10.0, 3600);
+    let config = config_with(vec![a], Some(name), vec![name]);
+    let app = App::new(config);
+    for w in [80usize, 160] {
+        let lines = fallback_flow_lines(&app, w).0;
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let row = texts
+            .iter()
+            .find(|t| t.contains(name))
+            .expect("the member row renders");
+        assert_eq!(
+            row,
+            " ╶ 1 abcdefghijklmnopqrstuvwxyz  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%"
+        );
+    }
+}
+
+/// The all-spent caption's first line carries the 2-cell lead AND the chip, so
+/// its tail must wrap to `width - chip - 2` — the round-1 budget only
+/// subtracted the chip and let the first line overrun the pane by two cells.
+#[test]
+fn the_stay_caption_wraps_without_overrunning_the_first_line() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = profile("a", 95.0, 10.0, 3600);
+    let config = config_with(vec![a], Some("a"), vec!["a"]);
+    let app = App::new(config);
+    // Every caption line, chip included, stays within the pane: the round-1
+    // budget let the first line overrun by two cells. Pinned whole-row at the
+    // six terminal widths (inner = terminal − 4 chrome cells).
+    for (w, caption_lines) in [
+        (
+            23usize,
+            &[
+                "  [ stay ] on the",
+                "  active",
+                "  account when",
+                "  all spent",
+            ][..],
+        ),
+        (
+            24usize,
+            &["  [ stay ] on the active", "  account when", "  all spent"][..],
+        ),
+        (
+            30usize,
+            &["  [ stay ] on the active", "  account when all", "  spent"][..],
+        ),
+        (
+            41usize,
+            &["  [ stay ] on the active account when all", "  spent"][..],
+        ),
+    ] {
+        let lines = fallback_flow_lines(&app, w).0;
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let start = texts
+            .iter()
+            .position(|t| t.contains("[ stay ]"))
+            .unwrap_or_else(|| panic!("stay caption missing at inner {w}: {texts:?}"));
+        let got: Vec<String> = texts[start..].to_vec();
+        assert_eq!(got, caption_lines, "stay caption at inner {w} cells");
+    }
 }
 
 /// DeepSeek accounts carry a USD balance where OAuth profiles carry a 5h
@@ -2735,7 +2839,7 @@ fn an_empty_roster_pair_renders_no_meta_slot() {
 fn an_empty_title_keeps_the_full_rule_run() {
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(12, 3)).expect("terminal");
-    term.draw(|f| f.render_widget(section_box("", true, true), f.area()))
+    term.draw(|f| f.render_widget(section_box("", true, true, f.area().width), f.area()))
         .expect("draw");
     assert_eq!(
         crate::testutil::buffer_rows(term.backend().buffer())[0],
@@ -3766,7 +3870,7 @@ fn reviewer_r1_default_caption_names_the_next_member_for_a_healthy_burning_activ
     let lines = fallback_flow_lines(&app, 120).0;
     assert_eq!(
         hinted_row_text(&lines),
-        " ╰ 2 bravo   ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%  ↲ ~8m",
+        " ╰ 2 bravo   ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~8m",
         "the default-config caption names the member the walk lands on at the crossing"
     );
 }
@@ -3833,7 +3937,7 @@ fn the_projected_switch_skips_a_kick_rejected_member() {
     let lines = fallback_flow_lines(&app, 120).0;
     assert_eq!(
         hinted_row_text(&lines),
-        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%  ↲ ~6s",
+        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
         "the caption must name the clear member, not the kick-rejected one"
     );
 }
@@ -3885,7 +3989,7 @@ fn the_projected_switch_prefers_a_fresh_reading_over_a_dead_reading_member() {
     let lines = fallback_flow_lines(&app, 120).0;
     assert_eq!(
         hinted_row_text(&lines),
-        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%  ↲ ~6s",
+        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
         "the caption must prefer the fresh member over the dead-reading one"
     );
 }
@@ -3919,7 +4023,7 @@ fn the_projected_switch_names_the_next_member_under_burn_aware_default_floor() {
     let lines = fallback_flow_lines(&app, 120).0;
     assert_eq!(
         hinted_row_text(&lines),
-        " ╰ 2 bravo   ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%  ↲ ~6s",
+        " ╰ 2 bravo   ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
         "burn-aware with the default floor still projects the crossing"
     );
 }
@@ -3973,7 +4077,53 @@ fn the_projected_switch_skips_a_live_key_rejected_member() {
     let lines = fallback_flow_lines(&app, 120).0;
     assert_eq!(
         hinted_row_text(&lines),
-        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%  ↲ ~6s",
+        " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
         "the caption skips the live key-rejected sibling and names the clear one"
     );
+}
+
+/// Desktop pin: the DeepSeek balance cell renders byte-identical to the pre-S9
+/// render at 80/160 (the balance fits whole with brackets, padded to the 5h
+/// column).
+#[test]
+fn the_deepseek_balance_cell_desktop_matches_the_pre_s9_render() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![deepseek_profile("ds", &["1132.60 CNY"])],
+        None,
+        vec![],
+    ));
+    for (terminal, expected) in [
+        (80u16, "[1132.60 CNY]    "),
+        (160u16, "[1132.60 CNY]             "),
+    ] {
+        let widths = OverviewWidths::new(terminal.saturating_sub(4), &app);
+        let row = render_overview_row(&app, 0, &widths, false, false);
+        let cell = five_hour_cell_text(&widths, true, &row);
+        assert_eq!(cell, expected, "balance cell at {terminal} cols");
+    }
+}
+
+/// Desktop pin: the all-spent caption renders byte-identical to the pre-S9
+/// render at the desktop inner widths (76/156).
+#[test]
+fn the_stay_caption_desktop_rows_match_the_pre_s9_render() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = profile("a", 95.0, 10.0, 3600);
+    let config = config_with(vec![a], Some("a"), vec!["a"]);
+    let app = App::new(config);
+    for w in [76usize, 156] {
+        let lines = fallback_flow_lines(&app, w).0;
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let start = texts
+            .iter()
+            .position(|t| t.contains("[ stay ]"))
+            .unwrap_or_else(|| panic!("stay caption missing at inner {w}: {texts:?}"));
+        let got: Vec<String> = texts[start..].to_vec();
+        assert_eq!(
+            got,
+            vec!["  [ stay ] on the active account when all spent"],
+            "stay caption at inner {w} cells"
+        );
+    }
 }

@@ -1783,7 +1783,7 @@ fn narrow_overview_chain_row_keeps_its_figures_on_one_line() {
     let gauge_cells = |line: &str| line.chars().filter(|c| *c == '▰' || *c == '▱').count();
     assert_eq!(
         gauge_cells(row),
-        10,
+        11,
         "narrow gauge sized from leftover width"
     );
     let wide = dump(&app, 90, 24);
@@ -2718,7 +2718,360 @@ fn the_overview_column_budget_never_pays_for_a_new_column_with_an_old_one() {
     }
 }
 
-/// The overview column is the one reset surface with a width budget, and no
+/// Three-name fixture (ASCII + CJK + emoji) for the overview frame pins:
+/// active CJK profile, ASCII first in cursor order, emoji third.
+fn s9_overview_app() -> App {
+    let names = [
+        "cjk-日本語アカウント",
+        "emoji-🧭⚠️-account",
+        "abcdefghijklmnopqrstuvwxyz",
+    ];
+    // ASCII first so the cursor lands on it, CJK active, emoji third — the
+    // same order the accounts table renders them in.
+    let profiles = vec![
+        oauth(names[2], 12.0, 8.0, false),
+        oauth(names[0], 49.0, 30.0, true),
+        oauth(names[1], 63.0, 40.0, false),
+    ];
+    let profile_names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(names[0].into()),
+            profiles: profile_names,
+            fallback_chain: names.iter().map(|n| (*n).into()).collect(),
+            ..AppState::default()
+        },
+        profiles,
+    });
+    app.tab = Tab::Overview;
+    app
+}
+
+/// Below the width where the bracketed bar fits, the overview 5h column sheds
+/// the bar (brackets included) and keeps the `%` figure whole — never a
+/// clipped `[██░` with the `]` and `%` gone off the pane edge. Below the width
+/// floor the banner owns the "too small" signal; at and above it the `%` reads
+/// whole.
+#[test]
+fn the_five_hour_bar_sheds_before_clipping_its_figure() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = s9_overview_app();
+    // The 5h column sheds its bracketed bar below the width where it fits and
+    // keeps the `%` figure whole — never a clipped `[██░` with `]` and `%` gone.
+    // Pinned whole-row (ASCII + CJK + emoji names) at every width.
+    let want: &[(u16, &[&str])] = &[
+        (
+            27,
+            &[
+                "│ ❯   abcdefg…  —         │",
+                "│   ● cjk-日 …   —         │",
+                "│     emoji-…   —         │",
+            ],
+        ),
+        (
+            28,
+            &[
+                "│ ❯   abcdefg…  —          │",
+                "│   ● cjk-日 …   —          │",
+                "│     emoji-…   —          │",
+            ],
+        ),
+        (
+            34,
+            &[
+                "│ ❯   abcdefg…  —            12% │",
+                "│   ● cjk-日 …   —            49% │",
+                "│     emoji-…   —            63% │",
+            ],
+        ),
+        (
+            45,
+            &[
+                "│ ❯   abcdefghij…  —           [█░░░░]  12% │",
+                "│   ● cjk-日 本 語 …  —           [██░░░]  49% │",
+                "│     emoji-🧭 ⚠️ …  —           [███░░]  63% │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let rows: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
+        let got: Vec<String> = rows
+            .iter()
+            .filter(|r| {
+                r.starts_with("│ ❯") || r.starts_with("│   ●") || r.starts_with("│     emoji")
+            })
+            .cloned()
+            .collect();
+        assert_eq!(got, *expected, "accounts rows at {w} cols");
+    }
+}
+
+/// The chain threshold figure (`42 / 80%`) stays whole at every width: inline
+/// when it fits, on its own line when it doesn't, never an orphan `42 /`.
+#[test]
+fn the_chain_threshold_figure_stays_whole_at_narrow_widths() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = s9_overview_app();
+    // The chain threshold figure (`49 / 80%`) stays whole at every width:
+    // inline when it fits, on its own line when it doesn't, never an orphan
+    // `49 /`. Pinned whole-row (chain members + caption) at every width.
+    let want: &[(u16, &[&str])] = &[
+        (
+            27,
+            &[
+                "│  ╭ 1 cjk-…   ▰▰▰▰▰▰▱▱▱▱ │",
+                "│    49 / 80%             │",
+                "│  │ 2 emoji…  ▰▰▰▰▰▰▰▰▱▱ │",
+                "│    63 / 80%             │",
+                "│  ╰ 3 abcde…  ▰▰▱▱▱▱▱▱▱▱ │",
+                "│    12 / 80%             │",
+                "│   [ stay ] on the       │",
+                "│   active                │",
+                "│   account when          │",
+                "│   all spent             │",
+            ],
+        ),
+        (
+            28,
+            &[
+                "│  ╭ 1 cjk-…   ▰▰▰▰▰▰▰▱▱▱▱ │",
+                "│    49 / 80%              │",
+                "│  │ 2 emoji…  ▰▰▰▰▰▰▰▰▰▱▱ │",
+                "│    63 / 80%              │",
+                "│  ╰ 3 abcde…  ▰▰▱▱▱▱▱▱▱▱▱ │",
+                "│    12 / 80%              │",
+                "│   [ stay ] on the active │",
+                "│   account when           │",
+                "│   all spent              │",
+            ],
+        ),
+        (
+            34,
+            &[
+                "│  ╭ 1 cjk-日 …   ▰▰▱▱   49 / 80% │",
+                "│  │ 2 emoji-…   ▰▰▰▱   63 / 80% │",
+                "│  ╰ 3 abcdefg…  ▰▱▱▱   12 / 80% │",
+                "│   [ stay ] on the active       │",
+                "│   account when all             │",
+                "│   spent                        │",
+            ],
+        ),
+        (
+            45,
+            &[
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン …  ▰▰▱▱   49 / 80% │",
+                "│  │ 2 emoji-🧭 ⚠️ -account   ▰▰▰▱   63 / 80% │",
+                "│  ╰ 3 abcdefghijklmnopqr…  ▰▱▱▱   12 / 80% │",
+                "│   [ stay ] on the active account when all │",
+                "│   spent                                   │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let rows: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
+        let start = rows
+            .iter()
+            .position(|r| r.contains("FALLBACK CHAIN"))
+            .unwrap_or_else(|| panic!("fallback chain panel missing at {w} cols"));
+        let end = rows[start + 1..]
+            .iter()
+            .position(|r| r.starts_with("╰─"))
+            .map(|i| start + 1 + i)
+            .unwrap_or_else(|| panic!("fallback chain panel bottom missing at {w} cols"));
+        let got: Vec<String> = rows[start + 1..end]
+            .iter()
+            .filter(|r| !r.trim().is_empty())
+            .cloned()
+            .collect();
+        assert_eq!(got, *expected, "chain rows at {w} cols");
+    }
+}
+
+/// Desktop pin: the name column absorbs the spare width at 160, so the ASCII
+/// name renders whole instead of the pre-S9 clip (`abcdefghijklmnopqrstu…`).
+#[test]
+fn the_overview_name_column_desktop_rows_replace_the_pre_s9_clip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = s9_overview_app();
+    let wide = dump(&app, 160, 40);
+    let rows: Vec<String> = wide.lines().map(|l| l.trim_end().to_string()).collect();
+    let got: Vec<String> = rows
+        .iter()
+        .filter(|r| r.starts_with("│ ❯"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            "│ ❯   abcdefghijklmnopqrstuvwxyz                            —                        [█░░░░░░░░░]  12%                 [█░░░░░░░░░]   8%                       │",
+        ],
+        "name column ascii row at 160 cols"
+    );
+}
+
+/// Desktop pin: the CJK/emoji name columns render whole before and after —
+/// pre-S9 sized them by char count, so they sat left of the cell-sized column.
+/// Whole before, re-measured by cells now, not clips replaced.
+#[test]
+fn the_overview_name_column_desktop_rows_measure_by_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = s9_overview_app();
+    let wide = dump(&app, 160, 40);
+    let rows: Vec<String> = wide.lines().map(|l| l.trim_end().to_string()).collect();
+    let got: Vec<String> = rows
+        .iter()
+        .filter(|r| r.starts_with("│   ●") || r.starts_with("│     emoji"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            "│   ● cjk-日 本 語 ア カ ウ ン ト                                   —                        [█████░░░░░]  49%                 [███░░░░░░░]  30%                       │",
+            "│     emoji-🧭 ⚠️ -account                                    —                        [██████░░░░]  63%                 [████░░░░░░]  40%                       │",
+        ],
+        "name column wide rows at 160 cols"
+    );
+}
+
+/// Desktop pin: the ASCII accounts row renders byte-identical to the pre-S9
+/// render at 80 (no wide glyphs, so no char-count mis-sizing).
+#[test]
+fn the_overview_accounts_ascii_row_desktop_matches_the_pre_s9_render() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = s9_overview_app();
+    let out = dump(&app, 80, 40);
+    let rows: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
+    let got: Vec<String> = rows
+        .iter()
+        .filter(|r| r.starts_with("│ ❯"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        got,
+        vec!["│ ❯   abcdefghijklmno…      —                  [█░░░░░░░░░]  12%        8%     │"],
+        "ascii accounts row at 80 cols"
+    );
+}
+
+/// Desktop pin: the wide CJK account name replaces the pre-S9 clip — the CJK
+/// name pushed the 7d figure off the row.
+#[test]
+fn the_overview_accounts_wide_name_rows_desktop_replace_the_pre_s9_clip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = s9_overview_app();
+    let out = dump(&app, 80, 40);
+    let rows: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
+    let got: Vec<String> = rows
+        .iter()
+        .filter(|r| r.starts_with("│   ●"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            "│   ● cjk-日 本 語 ア カ …       —                  [█████░░░░░]  49%       30%     │",
+        ],
+        "accounts cjk wide-name row at 80 cols"
+    );
+}
+
+/// Desktop pin: the emoji account name column renders whole before and after —
+/// pre-S9 sized it by char count, not cells. Whole before, re-measured by cells
+/// now, not a clip replaced.
+#[test]
+fn the_overview_accounts_emoji_row_desktop_rows_measure_by_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = s9_overview_app();
+    let out = dump(&app, 80, 40);
+    let rows: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
+    let got: Vec<String> = rows
+        .iter()
+        .filter(|r| r.starts_with("│     emoji"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        got,
+        vec!["│     emoji-🧭 ⚠️ -acco…      —                  [██████░░░░]  63%       40%     │",],
+        "accounts emoji wide-name row at 80 cols"
+    );
+}
+
+/// Desktop pin: the chain member rows (CJK + ASCII names) and the `[ stay ]`
+/// caption render byte-identical to the pre-S9 render at 80/160.
+#[test]
+fn the_fallback_chain_rows_desktop_match_the_pre_s9_render() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = s9_overview_app();
+    let want: &[(u16, &[&str])] = &[
+        (
+            80,
+            &[
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▰▱▱▱▱▱   49 / 80%                     │",
+                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱▱▱   12 / 80%                     │",
+                "│   [ stay ] on the active account when all spent                              │",
+            ],
+        ),
+        (
+            160,
+            &[
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▰▱▱▱▱▱   49 / 80%                                                                                                     │",
+                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱▱▱   12 / 80%                                                                                                     │",
+                "│   [ stay ] on the active account when all spent                                                                                                              │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let rows: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
+        let start = rows
+            .iter()
+            .position(|r| r.contains("FALLBACK CHAIN"))
+            .unwrap_or_else(|| panic!("fallback chain panel missing at {w} cols"));
+        let end = rows[start + 1..]
+            .iter()
+            .position(|r| r.starts_with("╰─"))
+            .map(|i| start + 1 + i)
+            .unwrap_or_else(|| panic!("fallback chain panel bottom missing at {w} cols"));
+        let got: Vec<String> = rows[start + 1..end]
+            .iter()
+            .filter(|r| !r.trim().is_empty() && !r.contains("emoji-"))
+            .cloned()
+            .collect();
+        assert_eq!(got, *expected, "chain match rows at {w} cols");
+    }
+}
+
+/// Desktop pin: the emoji chain member row renders whole before and after —
+/// pre-S9 sized its name column by char count, so the gauge and figure sat 7
+/// cells left of where the cell-sized column now opens. Whole before,
+/// re-measured by cells now, not a clip replaced.
+#[test]
+fn the_fallback_chain_emoji_row_desktop_rows_measure_by_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = s9_overview_app();
+    let want: &[(u16, &str)] = &[
+        (
+            80,
+            "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▰▱▱▱   63 / 80%                     │",
+        ),
+        (
+            160,
+            "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▰▱▱▱   63 / 80%                                                                                                     │",
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let rows: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
+        let got = rows
+            .iter()
+            .find(|r| r.contains("2 emoji-🧭"))
+            .expect("emoji chain row renders")
+            .clone();
+        assert_eq!(got, *expected, "chain emoji row at {w} cols");
+    }
+}
 /// frame test covered it — which is how a first cut shipped that DELETED the
 /// countdown (and the 7d bar with it) at widths between the old and new tiers.
 /// Opting into a clock must never render less than `relative` did at the same
@@ -5150,4 +5503,640 @@ fn page_never_skips_content() {
     }
 
     assert!(fails.is_empty(), "content skips:\n{}", fails.join("\n"));
+}
+
+/// At narrow widths the status timeline stacks its fixed columns: the
+/// timestamp renders on its own lone line instead of clipping the body off the
+/// pane edge.
+#[test]
+fn the_status_timeline_stacks_at_narrow_widths() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = narrow_app();
+    app.tab = Tab::Status;
+    let stamp = crate::format::local_stamp(1_780_741_000)
+        .expect("the demo stamp resolves to a local wall clock");
+    for (w, expected) in [
+        (27u16, format!("│ {stamp}     │")),
+        (28u16, format!("│ {stamp}      │")),
+    ] {
+        let out = dump(&app, w, 60);
+        let got: Vec<String> = out
+            .lines()
+            .filter(|l| l.contains(&stamp))
+            .map(|l| l.trim_end().to_string())
+            .collect();
+        assert_eq!(got, vec![expected], "timeline stacks a lone stamp at {w}");
+    }
+}
+
+// ── narrow chain-name clamp: full width when the row has room ─────────────
+
+/// Narrow chain rows clamp a member name only once the gauge floor + figure
+/// need the room: at 58–60 cols every name that rendered whole pre-S9
+/// renders whole again, and 45 still clamps because the row genuinely lacks
+/// the space. Pinned whole-row at 45/58/59/60.
+#[test]
+fn narrow_chain_names_keep_their_full_width_when_the_row_has_room() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let names = [
+        "cjk-日本語アカウント",
+        "emoji-🧭⚠️-account",
+        "abcdefghijklmnopqrstuvwxyz",
+    ];
+    let profiles = vec![
+        oauth(names[0], 49.0, 30.0, true),
+        oauth(names[1], 63.0, 40.0, false),
+        oauth(names[2], 12.0, 8.0, false),
+    ];
+    let profile_names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(names[0].into()),
+            profiles: profile_names,
+            fallback_chain: names.iter().map(|n| (*n).into()).collect(),
+            ..AppState::default()
+        },
+        profiles,
+    });
+    app.tab = Tab::Overview;
+    for (w, members, caption) in [
+        (
+            45u16,
+            &[
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン …  ▰▰▱▱   49 / 80% │",
+                "│  │ 2 emoji-🧭 ⚠️ -account   ▰▰▰▱   63 / 80% │",
+                "│  ╰ 3 abcdefghijklmnopqr…  ▰▱▱▱   12 / 80% │",
+            ],
+            "│   [ stay ] on the active account when all │",
+        ),
+        (
+            58u16,
+            &[
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▱▱▱▱   49 / 80% │",
+                "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▱▱   63 / 80% │",
+                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱   12 / 80% │",
+            ],
+            "│   [ stay ] on the active account when all spent        │",
+        ),
+        (
+            59u16,
+            &[
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▰▱▱▱▱   49 / 80% │",
+                "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▰▱▱   63 / 80% │",
+                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱▱   12 / 80% │",
+            ],
+            "│   [ stay ] on the active account when all spent         │",
+        ),
+        (
+            60u16,
+            &[
+                "│  ╭ 1 cjk-日 本 語 ア カ ウ ン ト         ▰▰▰▰▰▰▰▱▱▱▱▱   49 / 80% │",
+                "│  │ 2 emoji-🧭 ⚠️ -account          ▰▰▰▰▰▰▰▰▰▱▱▱   63 / 80% │",
+                "│  ╰ 3 abcdefghijklmnopqrstuvwxyz  ▰▰▱▱▱▱▱▱▱▱▱▱   12 / 80% │",
+            ],
+            "│   [ stay ] on the active account when all spent          │",
+        ),
+    ] {
+        let out = dump(&app, w, 40);
+        let rows: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
+        let got_members: Vec<&String> = rows
+            .iter()
+            .filter(|r| r.contains("╭ 1 ") || r.contains("│ 2 ") || r.contains("╰ 3 "))
+            .collect();
+        let got_caption = rows
+            .iter()
+            .find(|r| r.contains("[ stay ]"))
+            .map(String::as_str)
+            .unwrap_or_else(|| panic!("caption missing at {w} cols"));
+        assert_eq!(
+            got_members.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            members,
+            "chain member rows at {w} cols"
+        );
+        assert_eq!(got_caption, caption, "stay caption at {w} cols");
+    }
+}
+
+/// The full fixture app for the surface frame pins: ASCII + CJK + emoji
+/// profiles, a fallback chain over them, and a CJK model in the token table.
+fn s9_fixture_app() -> App {
+    use crate::tokens::{ModelTokens, TokenStats};
+    let names = [
+        "cjk-日本語アカウント",
+        "emoji-🧭⚠️-account",
+        "abcdefghijklmnopqrstuvwxyz",
+    ];
+    let profiles = vec![
+        oauth(names[2], 12.0, 8.0, false),
+        oauth(names[0], 49.0, 30.0, true),
+        oauth(names[1], 63.0, 40.0, false),
+    ];
+    let profile_names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(names[0].into()),
+            profiles: profile_names,
+            fallback_chain: names.iter().map(|n| (*n).into()).collect(),
+            ..AppState::default()
+        },
+        profiles,
+    });
+    app.token_stats = Some(TokenStats {
+        models: vec![
+            ModelTokens {
+                model: "claude-opus-4-8".to_string(),
+                input: 10_000_000,
+                output: 800_000,
+                ..Default::default()
+            },
+            ModelTokens {
+                model: "日本語モデル".to_string(),
+                input: 4_000_000,
+                output: 300_000,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    });
+    app
+}
+
+/// Rows of the current frame that match one of `needles` (substring OR).
+fn rows_with(out: &str, needles: &[&str]) -> Vec<String> {
+    out.lines()
+        .filter(|l| needles.iter().any(|n| l.contains(n)))
+        .map(|l| l.trim_end().to_string())
+        .collect()
+}
+
+/// The Usage selector's profile rows, whole, at a stacked (narrow) width: the
+/// ACCOUNTS panel body, blank rows dropped.
+fn usage_accounts_rows(app: &App, w: u16) -> Vec<String> {
+    let out = dump(app, w, 40);
+    let rows: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
+    let start = rows
+        .iter()
+        .position(|r| r.contains("ACCOUNTS"))
+        .unwrap_or_else(|| panic!("accounts panel missing at {w}"));
+    let end = rows[start + 1..]
+        .iter()
+        .position(|r| r.starts_with("╰─"))
+        .map(|i| start + 1 + i)
+        .unwrap_or_else(|| panic!("accounts panel bottom missing at {w}"));
+    rows[start + 1..end]
+        .iter()
+        .filter(|r| !r.trim_matches(['│', ' ']).is_empty())
+        .cloned()
+        .collect()
+}
+
+/// The Usage selector's profile rows, whole, at a side-by-side (desktop) width:
+/// the selector column up to and including its right border.
+fn usage_selector_cols(app: &App, w: u16) -> Vec<String> {
+    let out = dump(app, w, 40);
+    out.lines()
+        .map(|l| l.trim_end().to_string())
+        .filter(|r| r.contains("││"))
+        .map(|r| {
+            let (left, _) = r.split_once("││").unwrap();
+            format!("{left}│")
+        })
+        .filter(|r| !r.trim_matches(['│', ' ']).is_empty())
+        .collect()
+}
+
+/// The Usage profile selector clamps an over-long name with `…` instead of the
+/// pre-S9 hard cut: a name longer than the selector keeps every cell that fits
+/// and ends in `…`, a CJK/emoji name stays whole when it fits. Pinned
+/// whole-row at 27/28/34/45.
+#[test]
+fn the_usage_selector_rows_render_whole_at_narrow_widths() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Usage;
+    let want: &[(u16, &[&str])] = &[
+        (
+            27,
+            &[
+                "│ ❯ abcdefghijklmnopqrst… │",
+                "│   cjk-日 本 語 ア カ ウ ン ト   │",
+                "│   emoji-🧭 ⚠️ -account    │",
+            ],
+        ),
+        (
+            28,
+            &[
+                "│ ❯ abcdefghijklmnopqrstu… │",
+                "│   cjk-日 本 語 ア カ ウ ン ト    │",
+                "│   emoji-🧭 ⚠️ -account     │",
+            ],
+        ),
+        (
+            34,
+            &[
+                "│ ❯ abcdefghijklmnopqrstuvwxyz   │",
+                "│   cjk-日 本 語 ア カ ウ ン ト          │",
+                "│   emoji-🧭 ⚠️ -account           │",
+            ],
+        ),
+        (
+            45,
+            &[
+                "│ ❯ abcdefghijklmnopqrstuvwxyz              │",
+                "│   cjk-日 本 語 ア カ ウ ン ト                     │",
+                "│   emoji-🧭 ⚠️ -account                      │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let got = usage_accounts_rows(&app, *w);
+        assert_eq!(got, *expected, "usage selector at {w} cols");
+    }
+}
+
+/// Desktop pin: the Usage selector replaces the pre-S9 hard cut — a long ASCII
+/// name and the CJK name were cut at the pane edge with no `…` at 80.
+#[test]
+fn the_usage_selector_rows_desktop_replace_the_pre_s9_clip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Usage;
+    let got = usage_selector_cols(&app, 80);
+    assert_eq!(
+        got[..2],
+        ["│ ❯ abcdefghijklmnopq… │", "│   cjk-日 本 語 ア カ ウ …  │",],
+        "usage selector ascii + cjk rows at 80 cols"
+    );
+}
+
+/// Desktop pin: the Usage selector rows that fit before S9 render as they did.
+#[test]
+fn the_usage_selector_rows_desktop_match_the_pre_s9_render() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Usage;
+    let at_80 = usage_selector_cols(&app, 80);
+    assert_eq!(
+        at_80[2], "│   emoji-🧭 ⚠️ -account │",
+        "usage selector emoji row at 80 cols"
+    );
+    assert_eq!(
+        usage_selector_cols(&app, 160),
+        [
+            "│ ❯ abcdefghijklmnopqrstuvwxyz         │",
+            "│   cjk-日 本 語 ア カ ウ ン ト                │",
+            "│   emoji-🧭 ⚠️ -account                 │",
+        ],
+        "usage selector at 160 cols"
+    );
+}
+
+/// The tokens TOTAL cache-hit badge and the CJK TOP MODELS row keep their
+/// figures whole at every width — the char-derived label column used to push
+/// the bar/count/cost off the card even at 160. Pinned whole-row.
+#[test]
+fn the_tokens_total_badge_and_top_models_render_whole_at_narrow_widths() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Tokens;
+    let want: &[(u16, &[&str])] = &[
+        (
+            27,
+            &[
+                "│   0% cache hit         │┃",
+                "│ 日 本 語 … ███░░░░░ 4.30M │┃",
+            ],
+        ),
+        (
+            28,
+            &[
+                "│   0% cache hit          │┃",
+                "│ 日 本 語 …  ███░░░░░ 4.30M │┃",
+            ],
+        ),
+        (
+            34,
+            &[
+                "│ tokens    0      0% cache hit │┃",
+                "│ 日 本 語 モ デ ル  ████░░░░░░ 4.30M │┃",
+            ],
+        ),
+        (
+            45,
+            &[
+                "│ tokens    0                 0% cache hit │┃",
+                "│ 日 本 語 モ デ ル  ████████░░░░░░░░░░░░░ 4.30M │┃",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let got = rows_with(&out, &["cache hit", "4.30M"]);
+        assert_eq!(got, *expected, "tokens badge + top models at {w} cols");
+    }
+}
+
+/// The usage eyebrow figures (5h/7d) and the `notes:` hint stay whole at every
+/// width — a narrow pane drops the trailing figure to its own line rather than
+/// clipping it. Pinned whole-row.
+#[test]
+fn the_usage_eyebrow_and_notes_render_whole_at_narrow_widths() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Usage;
+    let want: &[(u16, &[&str])] = &[
+        (
+            27,
+            &[
+                "│ 5h                  12% │",
+                "│ 7d                   8% │",
+                "│ notes:    press n to    │",
+                "│           add notes     │",
+            ],
+        ),
+        (
+            28,
+            &[
+                "│ 5h                   12% │",
+                "│ 7d                    8% │",
+                "│ notes:    press n to add │",
+                "│           notes          │",
+            ],
+        ),
+        (
+            34,
+            &[
+                "│ 5h                         12% │",
+                "│ 7d                          8% │",
+                "│ notes:    press n to add notes │",
+            ],
+        ),
+        (
+            45,
+            &[
+                "│ 5h                                    12% │",
+                "│ 7d                                     8% │",
+                "│ notes:    press n to add notes            │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let got = rows_with(&out, &["5h", "7d", "notes"]);
+        assert_eq!(got, *expected, "usage eyebrow + notes at {w} cols");
+    }
+}
+
+/// The config `clock` value chip stays whole at the narrow widths the floor
+/// covers — `24h` renders whole from 28 cols up. Pinned whole-row.
+#[test]
+fn the_config_clock_chip_renders_whole_at_narrow_widths() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Config;
+    let want: &[(u16, &[&str])] = &[
+        (
+            27,
+            &["│   relative  clock      ┃│", "│   clock                ┃│"],
+        ),
+        (
+            28,
+            &[
+                "│   relative  clock       ┃│",
+                "│   clock              24h┃│",
+            ],
+        ),
+        (
+            34,
+            &[
+                "│   relative  clock  both       ┃│",
+                "│   clock              24h      ┃│",
+            ],
+        ),
+        (45, &["│   clock              24h                 ┃│"]),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let got = rows_with(&out, &["clock"])
+            .into_iter()
+            .filter(|r| !r.contains("reset display"))
+            .collect::<Vec<_>>();
+        assert_eq!(got, *expected, "config clock at {w} cols");
+    }
+}
+
+/// The fallback card's `5h usage`, rotate and weekly reminder rows keep their
+/// figures whole at every width — a reminder drops to its own line rather than
+/// gluing onto the figure. Pinned whole-row.
+#[test]
+fn the_fallback_card_rows_render_whole_at_narrow_widths() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Fallback;
+    let want: &[(u16, &[&str])] = &[
+        (
+            27,
+            &[
+                "│ 5h usage        ███░░░│ │",
+                "│   rotate at       80%   │",
+                "│   weekly at       98%   │",
+            ],
+        ),
+        (
+            28,
+            &[
+                "│ 5h usage        ████░░│░ │",
+                "│                 49% used │",
+                "│   rotate at       80%    │",
+                "│   weekly at       98%    │",
+            ],
+        ),
+        (
+            34,
+            &[
+                "│ 5h usage        ██░│  49% used │",
+                "│   rotate at       80%          │",
+                "│                   default: 95% │",
+                "│   weekly at       98%          │",
+            ],
+        ),
+        (
+            45,
+            &[
+                "│ 5h usage        ███████░░░░░│░░  49% used │",
+                "│   rotate at       80%   default: 95%      │",
+                "│   weekly at       98%                     │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let got = rows_with(
+            &out,
+            &[
+                "5h usage",
+                "49% used",
+                "rotate at",
+                "weekly at",
+                "default: 95%",
+            ],
+        );
+        assert_eq!(got, *expected, "fallback card at {w} cols");
+    }
+}
+
+/// Desktop pin: the TOP MODELS CJK row replaces the pre-S9 clip — the char-sized
+/// label column pushed the bar/count/cost off the card at 80.
+#[test]
+fn the_tokens_total_badge_and_top_models_desktop_rows_replace_the_pre_s9_clip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Tokens;
+    let out = dump(&app, 80, 40);
+    let got = rows_with(&out, &["cache hit", "4.30M"]);
+    assert_eq!(
+        got,
+        vec![
+            "│ idle so far today              ││ tokens    0                   0% cache hit │",
+            "│ 日 本 語 モ デ ル  ████████░░░░░░░░░░░░░ 4.30M ││ output      ░░░░░░░░░░░░░░    0% │",
+        ],
+        "tokens badge + top models at 80 cols"
+    );
+}
+
+/// Desktop pin: the TOP MODELS CJK row renders whole before and after at 160 —
+/// pre-S9 mis-spaced its char-sized label column. Whole before, re-measured by
+/// cells now, not a clip replaced.
+#[test]
+fn the_tokens_total_badge_and_top_models_desktop_rows_measure_by_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Tokens;
+    let out = dump(&app, 160, 40);
+    let got = rows_with(&out, &["cache hit", "4.30M"]);
+    assert_eq!(
+        got,
+        vec![
+            "│ tokens    0                             0% cache hit ││                                                                                                      │",
+            "│ 日 本 語 モ デ ル  ████████████░░░░░░░░░░░░░░░░░░ 4.30M    ││                                                                                                      │",
+        ],
+        "tokens badge + top models at 160 cols"
+    );
+}
+
+/// Desktop pin: the usage eyebrow figures and `notes:` hint render byte-identical
+/// to the pre-S9 render at 80/160.
+#[test]
+fn the_usage_eyebrow_and_notes_desktop_rows_match_the_pre_s9_render() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Usage;
+    let want: &[(u16, &[&str])] = &[
+        (
+            80,
+            &[
+                "│                      ││ 5h                                               12% │",
+                "│                      ││ 7d                                                8% │",
+                "│                      ││ notes:    press n to add notes                       │",
+            ],
+        ),
+        (
+            160,
+            &[
+                "│                                      ││ 5h                                                                                                               12% │",
+                "│                                      ││ 7d                                                                                                                8% │",
+                "│                                      ││ notes:    press n to add notes                                                                                       │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let got = rows_with(&out, &["5h", "7d", "notes"]);
+        assert_eq!(got, *expected, "usage eyebrow + notes at {w} cols");
+    }
+}
+
+/// Desktop pin: the config `clock` chip renders byte-identical to the pre-S9
+/// render at 80/160.
+#[test]
+fn the_config_clock_chip_desktop_rows_match_the_pre_s9_render() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Config;
+    let want: &[(u16, &[&str])] = &[
+        (
+            80,
+            &["│   clock              24h                                                     │"],
+        ),
+        (
+            160,
+            &[
+                "│   clock              24h                                                                                                                                     │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let got = rows_with(&out, &["clock"])
+            .into_iter()
+            .filter(|r| !r.contains("reset display"))
+            .collect::<Vec<_>>();
+        assert_eq!(got, *expected, "config clock at {w} cols");
+    }
+}
+
+/// Desktop pin: the fallback card's rotate/weekly rows at 80 and every card row
+/// at 160 render byte-identical to the pre-S9 render.
+#[test]
+fn the_fallback_card_rows_desktop_match_the_pre_s9_render() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Fallback;
+    let want: &[(u16, &[&str])] = &[
+        (
+            80,
+            &[
+                "│                      ││   rotate at       80%   default: 95%                 │",
+                "│                      ││   weekly at       98%                                │",
+            ],
+        ),
+        (
+            160,
+            &[
+                "│ ❯  #1 cjk-日 本 語 ア カ ウ ン ト            ││ 5h usage        ███████████░░░░░░░│░░░  49% used                                                                     │",
+                "│                                      ││   rotate at       80%   default: 95%                                                                                 │",
+                "│                                      ││   weekly at       98%                                                                                                │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let out = dump(&app, *w, 40);
+        let got = if *w == 80 {
+            rows_with(&out, &["rotate at", "weekly at"])
+        } else {
+            rows_with(
+                &out,
+                &["5h usage", "rotate at", "weekly at", "default: 95%"],
+            )
+        };
+        assert_eq!(got, *expected, "fallback card match rows at {w} cols");
+    }
+}
+
+/// Desktop pin: the fallback selector's CJK chain name replaces the pre-S9 clip
+/// — the name hard-cut to `cjk-日 本 語 ア カ` with no `…` at 80.
+#[test]
+fn the_fallback_selector_row_desktop_replaces_the_pre_s9_clip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = s9_fixture_app();
+    app.tab = Tab::Fallback;
+    let out = dump(&app, 80, 40);
+    let got = rows_with(&out, &["5h usage"]);
+    assert_eq!(
+        got,
+        vec![
+            "│ ❯  #1 cjk-日 本 語 ア …  ││ 5h usage        ███████████░░░░░░░│░░░  49% used     │"
+        ],
+        "fallback selector + 5h usage row at 80 cols"
+    );
 }

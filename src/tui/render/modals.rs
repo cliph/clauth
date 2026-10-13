@@ -397,9 +397,11 @@ fn draw_modal_scrolled(
     }
 }
 
-/// Split one styled line into `w`-column rows by character, preserving span
-/// styles and the line's alignment/style. A line that already fits returns
-/// itself (owned) untouched. Modal copy is ASCII, so chars ≈ display cells.
+/// Split one styled line into `w`-column rows between graphemes, measured in
+/// display cells, preserving span styles and the line's alignment/style: modal
+/// bodies can carry a failed check's real stderr, and a CJK or emoji grapheme
+/// counted as one char would overrun its row, which ratatui cuts with no `…`.
+/// A grapheme wider than `w` takes a row of its own, whole.
 fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
     let own = |l: &Line<'_>| -> Line<'static> {
         let mut out = Line::from(
@@ -426,19 +428,23 @@ fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
     };
     for span in &line.spans {
         let mut buf = String::new();
-        for ch in span.content.chars() {
-            if used == w {
+        let mut buf_w = 0usize;
+        for grapheme in Span::raw(span.content.as_ref()).styled_graphemes(Style::default()) {
+            let gw = Span::raw(grapheme.symbol).width();
+            if used + buf_w > 0 && used + buf_w + gw > w {
                 if !buf.is_empty() {
                     cur.push(Span::styled(std::mem::take(&mut buf), span.style));
+                    buf_w = 0;
                 }
                 flush(&mut cur);
                 used = 0;
             }
-            buf.push(ch);
-            used += 1;
+            buf.push_str(grapheme.symbol);
+            buf_w += gw;
         }
         if !buf.is_empty() {
             cur.push(Span::styled(buf, span.style));
+            used += buf_w;
         }
     }
     if !cur.is_empty() {
@@ -1546,7 +1552,7 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
         + state
             .context
             .as_ref()
-            .map_or(0, |c| c.chars().count() as u16 + 2);
+            .map_or(0, |c| Span::raw(c).width() as u16 + 2);
     let w = (content_w + 6)
         .max(title_w + 3)
         .min(area.width.saturating_sub(4));

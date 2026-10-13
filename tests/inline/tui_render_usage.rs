@@ -3322,6 +3322,49 @@ fn usage_prose_styles_its_commands_and_the_notes_key() {
     );
 }
 
+/// The eyebrow `%` figure drops to its own line, whole, carrying the amount
+/// with it, once the label + rate + amount no longer leave it room — never a
+/// clipped `24.5`, and never a dropped amount.
+#[test]
+fn the_eyebrow_percent_drops_to_its_own_line_when_narrow() {
+    let stat = Stat {
+        label: "7d".to_string(),
+        pct: 24.5,
+        amount: "12.2".to_string(),
+        color: theme::body(),
+        burn_rate: Some(12.2),
+        rate_unit: "d",
+        pace_pct: None,
+        reset_secs: None,
+        trailing: String::new(),
+    };
+    let max_rate_w = stat.rate_section_width();
+    let lines = stat.render(8, 20, max_rate_w, 5);
+    let texts: Vec<String> = lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "7d · 12.2 %/d · 6d 4h left",
+            "         12.2  24.5%",
+            "██░░░░░░"
+        ]
+    );
+}
+
+/// The `notes:` add-hint wraps on a narrow pane instead of clipping its tail.
+#[test]
+fn the_notes_hint_wraps_on_a_narrow_pane() {
+    let lines = notes_lines(None, 24);
+    let texts: Vec<String> = lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    assert_eq!(texts, ["notes:    press n to add", "          notes"]);
+}
+
 /// The kick pill's right pad is `avail − cells`, not `avail − chars`, so a wide
 /// (non-ASCII) text still lands flush against the pane edge. Today's `kick_text`
 /// is ASCII, so this is the one surface where the cell switch is invisible.

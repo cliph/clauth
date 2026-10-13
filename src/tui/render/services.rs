@@ -225,7 +225,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let focused = app.services.focus == ServicesFocus::Detail;
 
     let Some(check) = app.services.selected_check() else {
-        let block = section_box("services", focused, false);
+        let block = section_box("services", focused, false, area.width);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let hint = Paragraph::new(Line::from(Span::styled("no row selected", theme::dim())))
@@ -234,7 +234,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
-    let block = section_box(check.label, focused, false);
+    let block = section_box(check.label, focused, false, area.width);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

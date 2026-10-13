@@ -8552,7 +8552,7 @@ fn divergence_default_never_captures_a_sibling_owned_login() {
 fn compact_entry_sets_flag_no_toast() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
-    app.update_compact(13);
+    app.update_compact(13, 80);
     assert!(app.compact);
     assert!(app.toasts.is_empty(), "compact must not fire a toast");
 }
@@ -8562,7 +8562,7 @@ fn compact_yields_warning_banner() {
     let _home = crate::testutil::HomeSandbox::new();
     use super::{BannerSeverity, update_banner};
     let mut app = bare_app();
-    app.update_compact(13);
+    app.update_compact(13, 80);
     update_banner(&mut app);
     let banner = app.banner.as_ref().expect("compact banner present");
     assert_eq!(banner.severity, BannerSeverity::Warning);
@@ -8577,10 +8577,10 @@ fn compact_exit_clears_banner() {
     let _home = crate::testutil::HomeSandbox::new();
     use super::update_banner;
     let mut app = bare_app();
-    app.update_compact(13);
+    app.update_compact(13, 80);
     update_banner(&mut app);
     assert!(app.banner.is_some());
-    app.update_compact(14);
+    app.update_compact(14, 80);
     update_banner(&mut app);
     assert!(!app.compact);
     assert!(app.banner.is_none(), "banner self-clears on resize");
@@ -8591,13 +8591,68 @@ fn compact_rearm_after_exit() {
     let _home = crate::testutil::HomeSandbox::new();
     use super::update_banner;
     let mut app = bare_app();
-    app.update_compact(13);
-    app.update_compact(14);
-    app.update_compact(13);
+    app.update_compact(13, 80);
+    app.update_compact(14, 80);
+    app.update_compact(13, 80);
     update_banner(&mut app);
     assert!(app.compact);
     assert!(app.toasts.is_empty(), "compact must not fire a toast");
     assert!(app.banner.is_some());
+}
+
+#[test]
+fn width_floor_trips_the_banner_below_the_floor_only() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use super::{BannerSeverity, update_banner};
+    let mut app = bare_app();
+    // Below the floor on width alone (height is roomy): the banner still
+    // fires, with the same copy as the height-only compact banner.
+    app.update_compact(20, 33);
+    assert!(app.below_width_floor);
+    assert!(!app.compact, "height 20 is not compact");
+    update_banner(&mut app);
+    let banner = app.banner.as_ref().expect("width-floor banner present");
+    assert_eq!(banner.severity, BannerSeverity::Warning);
+    assert_eq!(
+        banner.message,
+        "terminal too small · enlarge for full layout"
+    );
+
+    // At the floor it clears; the layout still draws, no banner.
+    app.update_compact(20, 34);
+    assert!(!app.below_width_floor);
+    update_banner(&mut app);
+    assert!(app.banner.is_none(), "banner self-clears at the floor");
+}
+
+#[test]
+fn height_and_width_below_floor_render_one_banner() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use super::{BannerSeverity, update_banner};
+    let mut app = bare_app();
+    app.update_compact(13, 33); // both height < 14 and width < 34
+    assert!(app.compact && app.below_width_floor);
+    update_banner(&mut app);
+    let banner = app.banner.as_ref().expect("one banner");
+    assert_eq!(banner.severity, BannerSeverity::Warning);
+    assert_eq!(
+        banner.message,
+        "terminal too small · enlarge for full layout"
+    );
+
+    // A real frame, not just state: the banner row renders once, ` ! ` kept,
+    // the message fitted (ending in `…`) instead of clipping without a mark.
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut term = Terminal::new(TestBackend::new(33, 13)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let banner_rows: Vec<&str> = rows
+        .iter()
+        .map(String::as_str)
+        .filter(|r| r.contains("terminal too small"))
+        .collect();
+    assert_eq!(banner_rows.len(), 1, "exactly one banner row: {rows:?}");
+    assert_eq!(banner_rows[0], " ! terminal too small · enlarge …");
 }
 
 // ── global config tab ────────────────────────────────────────────────────

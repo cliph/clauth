@@ -315,13 +315,13 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if !left_spans.is_empty() {
         prefix.push(Span::styled(" · ", theme::dim()));
     }
-    let prefix_w: usize = prefix.iter().map(|s| s.content.chars().count()).sum();
-    let gauge_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+    let prefix_w: usize = prefix.iter().map(|s| s.width()).sum();
+    let gauge_w: usize = left_spans.iter().map(|s| s.width()).sum();
     if prefix_w + gauge_w + status_w + CONTENT_GAP <= row1_width {
         prefix.append(&mut left_spans);
         left_spans = prefix;
     }
-    let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+    let left_w: usize = left_spans.iter().map(|s| s.width()).sum();
     let mut row1_spans = left_spans;
     if row1_width >= left_w + status_w + CONTENT_GAP {
         let gap = row1_width - left_w - status_w;

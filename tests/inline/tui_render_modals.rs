@@ -2440,3 +2440,183 @@ fn the_action_menu_sizes_its_width_by_cells() {
         "a CJK action label must not be needlessly cut: {rows:?}"
     );
 }
+
+/// The action menu's title budget measures the scope name by cells, so a CJK
+/// account name fits whole in the border break instead of being cut by a
+/// char-derived width (F16). Pinned whole-row at every width.
+#[test]
+fn the_action_menu_sizes_its_title_by_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = app_on(
+        Tab::Overview,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("cjk-日本語アカウント"),
+        )],
+    );
+    let want: &[(u16, &str)] = &[
+        (27, "╭jk-日 本 語 ア カ ウ ン ト  ─╮"),
+        (28, "╭cjk-日 本 語 ア カ ウ ン ト  ─╮"),
+        (34, "╭─ ACT cjk-日 本 語 ア カ ウ ン ト  ─╮"),
+        (45, "╭─ ACTIONS cjk-日 本 語 ア カ ウ ン ト  ─╮"),
+    ];
+    for (w, expected) in want {
+        let (rows, left, right) = render_action_menu(&app, *w, 20);
+        let top = rows
+            .iter()
+            .position(|r| r.contains('\u{256d}'))
+            .expect("the action menu's top border");
+        let title: String = rows[top]
+            .chars()
+            .skip(left)
+            .take(right - left + 1)
+            .collect();
+        assert_eq!(title, *expected, "action-menu title at {w} cols");
+    }
+}
+
+/// Desktop pin: the action-menu title sizes by cells, so the CJK name does not
+/// clip the `ACTIONS` scope to `ACTIO` — the pre-S9 clip.
+#[test]
+fn the_action_menu_title_desktop_rows_replace_the_pre_s9_clip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = app_on(
+        Tab::Overview,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("cjk-日本語アカウント"),
+        )],
+    );
+    for w in [80u16, 160] {
+        let (rows, left, right) = render_action_menu(&app, w, 20);
+        let top = rows
+            .iter()
+            .position(|r| r.contains('\u{256d}'))
+            .expect("the action menu's top border");
+        let title: String = rows[top]
+            .chars()
+            .skip(left)
+            .take(right - left + 1)
+            .collect();
+        assert_eq!(
+            title, "╭─ ACTIONS cjk-日 本 語 ア カ ウ ン ト  ─╮",
+            "action-menu title at {w} cols"
+        );
+    }
+}
+
+fn check_output_body_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
+    let buf = term.backend().buffer();
+    let area = *buf.area();
+    let top = (0..area.height)
+        .find(|&y| {
+            let row: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
+            row.contains("CHECK OUTPUT")
+        })
+        .expect("modal top border");
+    let x = (0..area.width)
+        .find(|&xx| buf[(xx, top)].symbol() == "C")
+        .map(|c| c - 3)
+        .expect("modal left corner");
+    let width = (x..area.width)
+        .find(|&xx| buf[(xx, top)].symbol() == "╮")
+        .map(|xx| xx - x + 1)
+        .expect("modal right corner");
+    let bottom = (top + 1..area.height)
+        .find(|&y| buf[(x, y)].symbol() == "╰")
+        .expect("modal bottom border");
+    (top + 1..bottom)
+        .map(|y| (x..x + width).map(|xx| buf[(xx, y)].symbol()).collect())
+        .collect()
+}
+
+/// The shunt card's `check output` modal splits a body line between graphemes
+/// measured in display cells, so a wide CJK line chunks to rows that keep every
+/// character (never a row ratatui then cuts past the inner width) and an emoji
+/// grapheme stays whole. Pinned whole-row at 34/45/80.
+#[test]
+fn the_check_output_modal_chunks_body_lines_by_cells() {
+    use crate::tui::app::{Modal, Tab};
+    let _home = crate::testutil::HomeSandbox::new();
+    let body = "日本語サービスの障害を調査中です\n⚠️ 🧭 emoji-line tail\nplain ascii line\n";
+    let want: &[(u16, &[&str])] = &[
+        (
+            34,
+            &[
+                "│                            │",
+                "│  日 本 語 サ ー ビ ス の 障 害 を 調   │",
+                "│  査 中 で す                   │",
+                "│  ⚠️  🧭  emoji-line tail     │",
+                "│  plain ascii line          │",
+                "│                            │",
+            ],
+        ),
+        (
+            45,
+            &[
+                "│                                    │",
+                "│  日 本 語 サ ー ビ ス の 障 害 を 調 査 中 で す   │",
+                "│  ⚠️  🧭  emoji-line tail             │",
+                "│  plain ascii line                  │",
+                "│                                    │",
+            ],
+        ),
+        (
+            80,
+            &[
+                "│                                    │",
+                "│  日 本 語 サ ー ビ ス の 障 害 を 調 査 中 で す   │",
+                "│  ⚠️  🧭  emoji-line tail             │",
+                "│  plain ascii line                  │",
+                "│                                    │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let mut app = empty_app(Tab::Services);
+        app.open_modal(Modal::CheckOutput(body.to_string()));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(*w, 12)).unwrap();
+        term.draw(|fr| crate::tui::render::draw(fr, &app)).unwrap();
+        let got = check_output_body_rows(&term);
+        assert_eq!(got, *expected, "check output modal body at {w} cols");
+    }
+}
+
+/// An ASCII-only body chunks byte-identically to the old char budgeting: the
+/// split happens at the same cell boundary (each ASCII char is one cell).
+/// Pinned whole-row at 45/80 as the regression guard.
+#[test]
+fn the_check_output_modal_ascii_body_renders_unchanged() {
+    use crate::tui::app::{Modal, Tab};
+    let _home = crate::testutil::HomeSandbox::new();
+    let body = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\nshort\n";
+    let want: &[(u16, &[&str])] = &[
+        (
+            45,
+            &[
+                "│                                       │",
+                "│  abcdefghijklmnopqrstuvwxyzABCDEFGHI  │",
+                "│  JKLMNOPQRSTUVWXYZ0123456789          │",
+                "│  short                                │",
+                "│                                       │",
+            ],
+        ),
+        (
+            80,
+            &[
+                "│                                                                  │",
+                "│  abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789  │",
+                "│  short                                                           │",
+                "│                                                                  │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let mut app = empty_app(Tab::Services);
+        app.open_modal(Modal::CheckOutput(body.to_string()));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(*w, 12)).unwrap();
+        term.draw(|fr| crate::tui::render::draw(fr, &app)).unwrap();
+        let got = check_output_body_rows(&term);
+        assert_eq!(got, *expected, "check output ascii body at {w} cols");
+    }
+}

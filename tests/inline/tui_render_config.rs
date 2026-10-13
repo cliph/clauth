@@ -1557,3 +1557,251 @@ fn a_control_character_value_renders_escaped_in_the_setup_editor() {
         "the caret column counts the escaped body"
     );
 }
+
+/// A non-editing form value clamps to the value column by cells: a CJK name
+/// that would overrun ends in `…` inside the pane.
+#[test]
+fn the_name_value_clamps_to_the_value_column_by_cells() {
+    let input = InputState::new("cjk-日本語アカウント");
+    let lines = kv_field(
+        ratatui::text::Span::raw("  "),
+        "name",
+        &input,
+        false,
+        false,
+        false,
+        false,
+        24,
+    );
+    let text = line_text(&lines[0]);
+    assert_eq!(text, "  name            cjk-…");
+    assert_eq!(
+        ratatui::text::Span::raw(&text).width(),
+        23,
+        "the whole line stays inside the pane, measured in cells: {text}"
+    );
+}
+
+/// A long env-key label widens the key cell past DETAIL_KEY_W, so the value
+/// column opens after the RENDERED key — a value clamped against the constant
+/// overruns the pane. The whole line stays inside the pane by cells, pinned
+/// whole-row at every width.
+#[test]
+fn a_long_env_key_measures_the_rendered_lead_not_the_constant() {
+    let input = InputState::new("claude-haiku-4-5-20251001-fast");
+    let want: &[(usize, &[&str])] = &[
+        (
+            27,
+            &["  ANTHROPIC_DEFAULT_HAIK…  ", "  claude-haiku-4-5-2025100…"],
+        ),
+        (
+            28,
+            &[
+                "  ANTHROPIC_DEFAULT_HAIKU…  ",
+                "  claude-haiku-4-5-20251001…",
+            ],
+        ),
+        (
+            34,
+            &[
+                "  ANTHROPIC_DEFAULT_HAIKU_MODEL  ",
+                "  claude-haiku-4-5-20251001-fast",
+            ],
+        ),
+        (45, &["  ANTHROPIC_DEFAULT_HAIKU_MODEL  claude-haik…"]),
+    ];
+    for (w, expected) in want {
+        let lines = kv_field(
+            ratatui::text::Span::raw("  "),
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            &input,
+            false,
+            false,
+            false,
+            false,
+            *w,
+        );
+        let got: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(got, *expected, "env-key row at {w} cols");
+    }
+}
+
+/// A `base url` value middle-ellipsizes, so both the scheme head and the path
+/// tail survive around the `…` — a CJK host in the middle is what used to push
+/// the tail past the value column.
+#[test]
+fn a_base_url_value_middle_ellipsizes_with_both_ends_surviving() {
+    let input = InputState::new("https://api.日本語アカウント.example.com/v1/chat");
+    let want: &[(usize, &[&str])] = &[
+        (27, &["  base url        http…chat"]),
+        (28, &["  base url        https…chat"]),
+        (34, &["  base url        https://…v1/chat"]),
+        (45, &["  base url        https://api.…e.com/v1/chat"]),
+    ];
+    for (w, expected) in want {
+        let lines = kv_field(
+            ratatui::text::Span::raw("  "),
+            "base url",
+            &input,
+            false,
+            false,
+            false,
+            true,
+            *w,
+        );
+        let got: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(got, *expected, "base-url row at {w} cols");
+    }
+}
+
+/// Desktop pin: the env-key lead opens after the rendered key, so the value
+/// renders whole at 80/160 — byte-identical to the pre-S9 render.
+#[test]
+fn a_long_env_key_desktop_row_matches_the_pre_s9_render() {
+    let input = InputState::new("claude-haiku-4-5-20251001-fast");
+    for w in [80usize, 160] {
+        let lines = kv_field(
+            ratatui::text::Span::raw("  "),
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            &input,
+            false,
+            false,
+            false,
+            false,
+            w,
+        );
+        let got: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(
+            got,
+            vec!["  ANTHROPIC_DEFAULT_HAIKU_MODEL  claude-haiku-4-5-20251001-fast"],
+            "env-key row at {w} cols"
+        );
+    }
+}
+
+/// Desktop pin: the `base url` value renders whole at 80/160 — byte-identical to
+/// the pre-S9 render.
+#[test]
+fn a_base_url_value_desktop_row_matches_the_pre_s9_render() {
+    let input = InputState::new("https://api.日本語アカウント.example.com/v1/chat");
+    for w in [80usize, 160] {
+        let lines = kv_field(
+            ratatui::text::Span::raw("  "),
+            "base url",
+            &input,
+            false,
+            false,
+            false,
+            true,
+            w,
+        );
+        let got: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(
+            got,
+            vec!["  base url        https://api.日本語アカウント.example.com/v1/chat"],
+            "base-url row at {w} cols"
+        );
+    }
+}
+
+/// A `+ new account` form seeded by the `+ new profile` picker: the base url
+/// names the adopted gateway's bind, so the api key row renders the read-only
+/// `minted on save` state (the same draft the Services flow builds).
+fn mint_armed_app(home: &crate::testutil::HomeSandbox) -> App {
+    use crate::profile::{AppConfig, AppState};
+    use crate::tui::app::Tab;
+    let config = home.home().join("shunt.toml");
+    std::fs::write(&config, "[server]\nbind = \"127.0.0.1:3001\"\n").unwrap();
+    let record = crate::gateway::GatewayRecord::new(config).unwrap();
+    let bind = crate::gateway::resolve_bind("[server]\nbind = \"127.0.0.1:3001\"\n", None).unwrap();
+    let url = format!("http://{}", bind.probe);
+    let mut draft = crate::tui::app::build_draft_new();
+    draft.base_url = InputState::new(&url);
+    draft.mint_for = Some(crate::tui::app::TokenMint {
+        record,
+        bind,
+        require: false,
+    });
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![],
+            ..AppState::default()
+        },
+        profiles: vec![],
+    });
+    app.tab = Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    app.config_draft = Some(draft);
+    app.config_focus = ConfigFocus::Actions;
+    app
+}
+
+/// The mint-armed api key row(s) in the frame, whole, at `w` cols.
+fn mint_key_rows(app: &App, w: u16) -> Vec<String> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 40)).unwrap();
+    term.draw(|fr| crate::tui::render::draw(fr, app)).unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer())
+        .into_iter()
+        .map(|r| r.trim_end().to_string())
+        .filter(|r| r.contains("api key") || r.contains("minted on save"))
+        .collect()
+}
+
+/// The mint-seeded key row keeps its label inline while it fits and drops the
+/// label to its own line under the key once it would clip — `minted on save`
+/// reads whole at every width from the floor up instead of cutting to
+/// `minted on sa`. Pinned whole-row at 27/28/34/45.
+#[test]
+fn the_mint_armed_key_row_drops_its_label_below_the_floor() {
+    let home = crate::testutil::HomeSandbox::new();
+    let app = mint_armed_app(&home);
+    let want: &[(u16, &[&str])] = &[
+        (
+            27,
+            &["│   api key               │", "│   minted on save        │"],
+        ),
+        (
+            28,
+            &[
+                "│   api key                │",
+                "│   minted on save         │",
+            ],
+        ),
+        (
+            34,
+            &[
+                "│   api key                      │",
+                "│   minted on save               │",
+            ],
+        ),
+        (45, &["│   api key         minted on save          │"]),
+    ];
+    for (w, expected) in want {
+        let got = mint_key_rows(&app, *w);
+        assert_eq!(got, *expected, "mint key row at {w} cols");
+    }
+}
+
+/// Desktop pin: the mint-seeded key row renders byte-identical to the pre-S9
+/// render at 80/160 (it always fit on one line there).
+#[test]
+fn the_mint_armed_key_row_desktop_rows_match_the_pre_s9_render() {
+    let home = crate::testutil::HomeSandbox::new();
+    let app = mint_armed_app(&home);
+    let want: &[(u16, &[&str])] = &[
+        (
+            80,
+            &["│                      ││   api key         minted on save                     │"],
+        ),
+        (
+            160,
+            &[
+                "│                                      ││   api key         minted on save                                                                                     │",
+            ],
+        ),
+    ];
+    for (w, expected) in want {
+        let got = mint_key_rows(&app, *w);
+        assert_eq!(got, *expected, "mint key row at {w} cols");
+    }
+}

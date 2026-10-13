@@ -103,6 +103,52 @@ fn row_content(app: &App, width: u16, row: usize) -> String {
         .collect()
 }
 
+/// A wide-glyph active name sizes the row-1 gauge and the right-edge gap by
+/// cells, not chars, so `● status.claude.ai` stays whole at every width — the
+/// char sum left it mid-word off the edge. Pinned whole-row for an ASCII, a
+/// CJK and an emoji active name at every width.
+#[test]
+fn a_wide_glyph_active_name_keeps_the_status_indicator_whole() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let want: &[(&str, &[(u16, &str)])] = &[
+        (
+            "abcdefghijklmnopqrstuvwxyz",
+            &[
+                (27, "▝▜█████"),
+                (28, "▝▜█████▛"),
+                (34, "▝▜█████▛▘       ● status.claude.ai"),
+                (45, "▝▜█████▛▘ abcdefgh… 49%    ● status.claude.ai"),
+            ],
+        ),
+        (
+            "cjk-日本語アカウント",
+            &[
+                (27, "▝▜█████"),
+                (28, "▝▜█████▛"),
+                (34, "▝▜█████▛▘       ● status.claude.ai"),
+                (45, "▝▜█████▛▘ cjk-日 本 … 49%    ● status.claude.ai"),
+            ],
+        ),
+        (
+            "emoji-🧭⚠️-account",
+            &[
+                (27, "▝▜█████"),
+                (28, "▝▜█████▛"),
+                (34, "▝▜█████▛▘       ● status.claude.ai"),
+                (45, "▝▜█████▛▘ emoji-🧭 … 49%    ● status.claude.ai"),
+            ],
+        ),
+    ];
+    for (name, cases) in want {
+        let mut app = app_with(vec![oauth_profile(name, 49.0)], Some(name));
+        app.tab = Tab::Usage;
+        for &(w, expected) in *cases {
+            let rows = render_header_rows(&app, w);
+            assert_eq!(rows[1].trim_end(), expected, "row 1 for {name} at {w} cols");
+        }
+    }
+}
+
 // ── `gauge_fit` — collapse ladder: bar before name ──────────────────────
 
 #[test]
@@ -1098,4 +1144,87 @@ fn the_header_gauge_keeps_a_wide_active_name_whole() {
     let chars: Vec<char> = row_content(&app, 120, 1).chars().collect();
     let left: String = chars[..36].iter().collect();
     assert_eq!(left, "[ 0 live ] · 日 本 語  42% [████░░░░░░]");
+}
+
+/// Desktop pin: the ASCII active name renders byte-identical to the pre-S9
+/// render at 80/160 (no wide glyphs, so no char-count mis-sizing).
+#[test]
+fn the_ascii_active_name_desktop_rows_match_the_pre_s9_render() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(
+        vec![oauth_profile("abcdefghijklmnopqrstuvwxyz", 49.0)],
+        Some("abcdefghijklmnopqrstuvwxyz"),
+    );
+    app.tab = Tab::Usage;
+    for (w, expected) in [
+        (
+            80u16,
+            "▝▜█████▛▘ [ 0 live ] · abcdefghijklmno… 49% [█████░░░░░]      ● status.claude.ai",
+        ),
+        (
+            160u16,
+            "▝▜█████▛▘ [ 0 live ] · abcdefghijklmno… 49% [█████░░░░░]                                                                                      ● status.claude.ai",
+        ),
+    ] {
+        let rows = render_header_rows(&app, w);
+        assert_eq!(rows[1].trim_end(), expected, "row 1 for ascii at {w} cols");
+    }
+}
+
+/// Desktop pin: the wide CJK active name replaces the pre-S9 clip — the name
+/// was measured by char count, so it pushed the status indicator to
+/// `● status.c` at 80 and at 160.
+#[test]
+fn the_wide_glyph_active_names_desktop_rows_replace_the_pre_s9_clip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(
+        vec![oauth_profile("cjk-日本語アカウント", 49.0)],
+        Some("cjk-日本語アカウント"),
+    );
+    app.tab = Tab::Usage;
+    for (w, expected) in [
+        (
+            80u16,
+            "▝▜█████▛▘ [ 0 live ] · cjk-日 本 語 ア カ … 49% [█████░░░░░]       ● status.claude.ai",
+        ),
+        (
+            160u16,
+            "▝▜█████▛▘ [ 0 live ] · cjk-日 本 語 ア カ … 49% [█████░░░░░]                                                                                       ● status.claude.ai",
+        ),
+    ] {
+        let rows = render_header_rows(&app, w);
+        assert_eq!(
+            rows[1].trim_end(),
+            expected,
+            "row 1 for the cjk name at {w} cols"
+        );
+    }
+}
+
+/// Desktop pin: the emoji active name renders whole before and after at 80
+/// and 160 — pre-S9 sized it by char count, only shifting the column.
+#[test]
+fn the_wide_glyph_active_names_desktop_rows_measure_by_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let want: &[(&str, &[(u16, &str)])] = &[(
+        "emoji-🧭⚠️-account",
+        &[
+            (
+                80,
+                "▝▜█████▛▘ [ 0 live ] · emoji-🧭 ⚠-acco… 49% [█████░░░░░]       ● status.claude.ai",
+            ),
+            (
+                160,
+                "▝▜█████▛▘ [ 0 live ] · emoji-🧭 ⚠-acco… 49% [█████░░░░░]                                                                                       ● status.claude.ai",
+            ),
+        ],
+    )];
+    for (name, cases) in want {
+        let mut app = app_with(vec![oauth_profile(name, 49.0)], Some(name));
+        app.tab = Tab::Usage;
+        for &(w, expected) in *cases {
+            let rows = render_header_rows(&app, w);
+            assert_eq!(rows[1].trim_end(), expected, "row 1 for {name} at {w} cols");
+        }
+    }
 }

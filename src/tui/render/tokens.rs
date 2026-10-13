@@ -876,7 +876,7 @@ fn stack_vertical(area: Rect, heights: &[u16]) -> Vec<Rect> {
 fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(stats) = app.token_stats.as_ref() else {
         let area = clamp_width(area, DASH_MAX_W);
-        let block = section_box("tokens", false, true);
+        let block = section_box("tokens", false, true, area.width);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let line = if app.tokens_failed {
@@ -1220,8 +1220,8 @@ fn card(
     lines: Vec<Line<'static>>,
 ) {
     let mut block = match spinner {
-        Some(f) => section_box_loading(title, focused, first, f),
-        None => section_box(title, focused, first),
+        Some(f) => section_box_loading(title, focused, first, f, area.width),
+        None => section_box(title, focused, first, area.width),
     };
     if let Some(m) = meta {
         // The badge closes with a border cell of its own (`… badge ─╮`), the
@@ -1287,34 +1287,37 @@ fn total_lines(
     } else {
         stats.total_in_out()
     };
-    let lines = vec![
-        lr(
-            vec![
-                key("tokens"),
-                Span::styled(
-                    fmt_count(total),
-                    theme::accent().add_modifier(Modifier::BOLD),
-                ),
-            ],
-            vec![Span::styled(
-                format!("{:.0}% cache hit", stats.cache_hit_ratio() * 100.0),
-                Style::default().fg(theme::info_color()),
-            )],
-            w,
+    let cache_badge = Span::styled(
+        format!("{:.0}% cache hit", stats.cache_hit_ratio() * 100.0),
+        Style::default().fg(theme::info_color()),
+    );
+    let tokens_left = vec![
+        key("tokens"),
+        Span::styled(
+            fmt_count(total),
+            theme::accent().add_modifier(Modifier::BOLD),
         ),
-        cost_line("cost", lifetime_cost(prices, &stats.models)),
-        Line::from(vec![
-            key("sessions"),
-            Span::styled(
-                group_thousands(stats.total_sessions as f64, 0),
-                theme::body(),
-            ),
-        ]),
-        Line::from(vec![
-            key("msgs"),
-            Span::styled(fmt_count(stats.total_messages), theme::body()),
-        ]),
     ];
+    let mut lines = Vec::new();
+    if span_w(&tokens_left) + cache_badge.width() < w {
+        lines.push(lr(tokens_left, vec![cache_badge], w));
+    } else {
+        // The badge drops to its own line rather than clipping its tail.
+        lines.push(Line::from(tokens_left));
+        lines.push(Line::from(vec![Span::raw("  "), cache_badge]));
+    }
+    lines.push(cost_line("cost", lifetime_cost(prices, &stats.models)));
+    lines.push(Line::from(vec![
+        key("sessions"),
+        Span::styled(
+            group_thousands(stats.total_sessions as f64, 0),
+            theme::body(),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        key("msgs"),
+        Span::styled(fmt_count(stats.total_messages), theme::body()),
+    ]));
     let meta = match (stats.first_session_date.as_deref(), last) {
         (Some(first), Some(latest)) => {
             Some(format!("{} → {}", short_date(first), short_date(latest)))
@@ -1713,7 +1716,7 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
         app.models_selector.total.set(0);
         app.model_detail_max_scroll.set(0);
         app.model_detail_viewport.set(0);
-        let block = section_box(&title, true, true);
+        let block = section_box(&title, true, true, cols[0].width);
         let inner = block.inner(cols[0]);
         frame.render_widget(block, cols[0]);
         frame.render_widget(
@@ -1813,6 +1816,7 @@ fn draw_model_detail(
         &title,
         app.is_some_and(|app| app.model_detail_focus == StatusFocus::Detail),
         false,
+        area.width,
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);

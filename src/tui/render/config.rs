@@ -16,7 +16,7 @@ use super::super::app::{
     escape_control,
 };
 use super::super::theme;
-use super::format::middle_truncate;
+use super::format::{middle_truncate, truncate};
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_DISABLED, bold_when, cycle_row_lines,
     draw_scrolled_lines, draw_selector_list, head_cols, help_tooltip_lines, highlight_row,
@@ -352,9 +352,9 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Profile names render verbatim; structural titles ("+ new account", "settings") stay uppercased.
     let is_profile_name = app.profile_cursor < app.config().profiles.len();
     let block = if is_profile_name {
-        section_box_verbatim(&snap.title, actions_focused, false)
+        section_box_verbatim(&snap.title, actions_focused, false, area.width)
     } else {
-        section_box(&snap.title, actions_focused, false)
+        section_box(&snap.title, actions_focused, false, area.width)
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -829,8 +829,14 @@ fn detail_row(
         Span::raw("  ")
     };
     let line = match row {
-        ConfigRow::Name => kv_field(arrow, "name", input, editing, selected, false),
-        ConfigRow::BaseUrl => kv_field(arrow, "base url", input, editing, selected, false),
+        ConfigRow::Name => {
+            return kv_field(arrow, "name", input, editing, selected, false, false, width);
+        }
+        ConfigRow::BaseUrl => {
+            return kv_field(
+                arrow, "base url", input, editing, selected, false, true, width,
+            );
+        }
         // The mint-seeded key row is a Disabled row: whole line faint,
         // focusable but inert, the tooltip (below) naming what happens on save.
         ConfigRow::ApiKey if snap.mint_armed => {
@@ -839,35 +845,69 @@ fn detail_row(
             } else {
                 Span::raw("  ")
             };
-            Line::from(vec![
-                row_arrow,
-                Span::styled(
-                    key_cell("api key", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
-                    theme::faint(),
-                ),
-                Span::styled("minted on save", theme::faint()),
-            ])
+            let key = key_cell("api key", DETAIL_KEY_W, DETAIL_KEY_GUTTER);
+            let label = Span::styled("minted on save", theme::faint());
+            // Inline while the label fits beside the key; past that the label
+            // drops to its own line under the key (the `kv_field` drop arm's
+            // shape) instead of clipping mid-word, measured in cells.
+            let lead = 2 + Span::raw(&key).width();
+            if lead + Span::raw("minted on save").width() <= width {
+                Line::from(vec![row_arrow, Span::styled(key, theme::faint()), label])
+            } else {
+                return vec![
+                    Line::from(vec![row_arrow, Span::styled(key, theme::faint())]),
+                    Line::from(vec![Span::raw("  "), label]),
+                ];
+            }
         }
-        ConfigRow::ApiKey => kv_field(arrow, "api key", input, editing, selected, true),
+        ConfigRow::ApiKey => {
+            return kv_field(
+                arrow, "api key", input, editing, selected, true, false, width,
+            );
+        }
         // Hybrid: the alias cycle at rest, a plain text field while typing a custom id.
         ConfigRow::Model if !editing => {
             return model_cycle_lines(arrow, &input.value, selected, width);
         }
-        ConfigRow::Model => kv_field(arrow, "model", input, editing, selected, false),
-        ConfigRow::OpusModel => kv_field(arrow, "opus", input, editing, selected, false),
-        ConfigRow::SonnetModel => kv_field(arrow, "sonnet", input, editing, selected, false),
-        ConfigRow::HaikuModel => kv_field(arrow, "haiku", input, editing, selected, false),
-        ConfigRow::FableModel => kv_field(arrow, "fable", input, editing, selected, false),
-        ConfigRow::SubagentModel => kv_field(arrow, "subagent", input, editing, selected, false),
+        ConfigRow::Model => {
+            return kv_field(
+                arrow, "model", input, editing, selected, false, false, width,
+            );
+        }
+        ConfigRow::OpusModel => {
+            return kv_field(arrow, "opus", input, editing, selected, false, false, width);
+        }
+        ConfigRow::SonnetModel => {
+            return kv_field(
+                arrow, "sonnet", input, editing, selected, false, false, width,
+            );
+        }
+        ConfigRow::HaikuModel => {
+            return kv_field(
+                arrow, "haiku", input, editing, selected, false, false, width,
+            );
+        }
+        ConfigRow::FableModel => {
+            return kv_field(
+                arrow, "fable", input, editing, selected, false, false, width,
+            );
+        }
+        ConfigRow::SubagentModel => {
+            return kv_field(
+                arrow, "subagent", input, editing, selected, false, false, width,
+            );
+        }
         // A custom env entry: its key is the label; mask the value when the key
         // looks like a credential (mirrors the api-key row).
         ConfigRow::EnvEntry(i) => {
             let key = snap.env.get(i).map(|(k, _)| k.clone()).unwrap_or_default();
             let mask = env_key_is_secret(&key);
-            kv_field(arrow, &key, input, editing, selected, mask)
+            return kv_field(arrow, &key, input, editing, selected, mask, false, width);
         }
         // While editing, the typed text is the new key; at rest, the add chip.
-        ConfigRow::EnvAdd if editing => kv_field(arrow, "key", input, editing, selected, false),
+        ConfigRow::EnvAdd if editing => {
+            return kv_field(arrow, "key", input, editing, selected, false, false, width);
+        }
         ConfigRow::EnvAdd => Line::from(vec![
             arrow,
             Span::styled("+ add env", bold_when(theme::accent(), selected)),
@@ -1031,6 +1071,12 @@ fn detail_row(
     vec![line]
 }
 
+/// One form row's key + value line(s). `middle` picks middle-ellipsis for the
+/// value (a URL row) instead of the trailing-ellipsis default.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call per row carries its whole chrome: key, value, edit/mask/ellipsis flags"
+)]
 fn kv_field(
     arrow: Span<'static>,
     key: &str,
@@ -1038,16 +1084,48 @@ fn kv_field(
     editing: bool,
     focused: bool,
     mask_value: bool,
-) -> Line<'static> {
-    let mut spans = vec![
-        arrow,
-        Span::styled(
-            key_cell(key, DETAIL_KEY_W, DETAIL_KEY_GUTTER),
-            label_style(focused),
-        ),
-    ];
-    spans.extend(value_spans(input, editing, mask_value));
-    Line::from(spans)
+    middle: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    // A long env-key label widens the key cell past DETAIL_KEY_W (`key_cell`
+    // pads to the key's own width), so the value column opens after the
+    // RENDERED key — measured, never the constant. A key wider than the pane
+    // clamps with `…` like any value, never a mid-word cut.
+    let full_key = key_cell(key, DETAIL_KEY_W, DETAIL_KEY_GUTTER);
+    let key_cell_span = if Span::raw(&full_key).width() > width.saturating_sub(2) {
+        let budget = width.saturating_sub(2 + DETAIL_KEY_GUTTER);
+        format!("{}{}", truncate(key, budget), " ".repeat(DETAIL_KEY_GUTTER))
+    } else {
+        full_key
+    };
+    let lead = 2 + Span::raw(&key_cell_span).width();
+    let value_w = width.saturating_sub(lead);
+    let mut spans = vec![arrow, Span::styled(key_cell_span, label_style(focused))];
+    if editing || mask_value || input.value.is_empty() {
+        spans.extend(value_spans(input, editing, mask_value));
+        return vec![Line::from(spans)];
+    }
+    if value_w >= 4 {
+        let value = if middle {
+            middle_truncate(&input.value, value_w)
+        } else {
+            truncate(&input.value, value_w)
+        };
+        spans.push(Span::styled(value, theme::accent()));
+        return vec![Line::from(spans)];
+    }
+    // The value column can't hold a clamped value: drop it below the key,
+    // indented past the caret gutter, at the full pane width.
+    vec![
+        Line::from(spans),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                truncate(&input.value, width.saturating_sub(2)),
+                theme::accent(),
+            ),
+        ]),
+    ]
 }
 
 fn kv_static(

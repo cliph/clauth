@@ -2126,6 +2126,44 @@ fn the_member_card_places_the_session_block_above_the_five_hour_gauge() {
     );
 }
 
+/// A narrow card reflows the `5h usage` figure to its own line once the gauge
+/// floor leaves no room, instead of clipping `% used` off the pane edge.
+#[test]
+fn the_five_hour_figure_drops_to_its_own_line_when_the_gauge_leaves_no_room() {
+    let cfg = config_with(vec![profile("a", 95.0, 49.0, 3600)], None, vec!["a"]);
+    let (lines, _, _) = member_detail(
+        &cfg,
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            width: 24,
+            ..Default::default()
+        },
+        &HashSet::new(),
+    );
+    let texts = card_texts(&lines);
+    assert_eq!(
+        texts,
+        [
+            "5h usage        ████░░░│",
+            "                49% used",
+            "                46% unt…",
+            "",
+            "  rotate at       95%",
+            "  weekly at       98%",
+            "  weekly gate     ─●",
+            "  scoped gate     ─●",
+            "  last resort     ○─",
+            "  preferred       ○─",
+            "  preferred days",
+            "  never  weekdays",
+            "  weekends  every day",
+            "  max spend       off",
+            "  remove",
+            "  remove from chain",
+        ]
+    );
+}
+
 /// A leg nothing calls is a leg that passes every unit test and ships nothing:
 /// the member card has to read the app's own tally, not a default. The selector
 /// pane is asserted alongside it so the tally's absence there is pinned on the
@@ -2230,15 +2268,15 @@ fn the_blocked_reason_marker_holds_the_rows_last_content_column() {
 #[test]
 fn a_narrow_pane_clamps_a_marked_members_name_rather_than_dropping_its_marker() {
     let _home = crate::testutil::HomeSandbox::new();
-    // 16 content cells: the rail eats 6, the marker and its gap 2, leaving 8 for
-    // the name — so `blockedname` truncates with `…` and keeps its `⊖`, while
-    // `hot` fits with room to spare.
+    // 16 content cells: the rail eats 6, the marker and its 3-cell gap 4,
+    // leaving 6 for the name — so `blockedname` truncates with `…` and keeps
+    // its `⊖`, while `hot` fits with room to spare.
     assert_eq!(
         chain_selector_pane(&marker_app(), 60, 8),
         vec![
             "╭─ CHAIN ──────────╮".to_string(),
             "│ ❯  #1 ok         │".to_string(),
-            "│    #2 blocked… ⊖ │".to_string(),
+            "│    #2 block…   ⊖ │".to_string(),
             "│    #3 hot      ◔ │".to_string(),
             "│                  │".to_string(),
             "│                  │".to_string(),
@@ -2727,4 +2765,134 @@ fn chain_prose_styles_the_relogin_command_and_the_day_picker_keys() {
     ] {
         assert_prose_part(&picking, phrase, part, true);
     }
+}
+
+/// A narrow card reflows the `remove` value to its own line past the caret
+/// gutter once the value column leaves no room, instead of clipping the tail.
+#[test]
+fn the_remove_value_drops_to_its_own_line_when_narrow() {
+    let a = profile("a", 95.0, 20.0, 3600);
+    let cfg = config_with(vec![a], None, vec!["a"]);
+    let lines = member_detail(
+        &cfg,
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            width: 24,
+            ..Default::default()
+        },
+        &HashSet::new(),
+    )
+    .0;
+    let texts: Vec<String> = lines.iter().map(line_text).collect();
+    assert_eq!(
+        texts,
+        [
+            "5h usage        ██░░░░░│",
+            "                20% used",
+            "                75% unt…",
+            "",
+            "  rotate at       95%",
+            "  weekly at       98%",
+            "  weekly gate     ─●",
+            "  scoped gate     ─●",
+            "  last resort     ○─",
+            "  preferred       ○─",
+            "  preferred days  ",
+            "  never  weekdays",
+            "  weekends  every day",
+            "  max spend       off",
+            "  remove          ",
+            "  remove from chain",
+        ]
+    );
+}
+
+/// The `+ add` heading wraps on a narrow pane instead of clipping its tail.
+#[test]
+fn the_add_blurb_wraps_on_a_narrow_pane() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = profile("a", 95.0, 20.0, 3600);
+    let cfg = config_with(vec![a], None, vec!["a"]);
+    let app = App::new(cfg);
+    let detail = add_detail(&app, true, 24, &HashSet::new());
+    let texts: Vec<String> = detail.lines.iter().map(line_text).collect();
+    assert_eq!(
+        texts,
+        [
+            "add an account to the",
+            "rotation",
+            "",
+            "when an account runs",
+            "out, clauth points",
+            "claude code at the next",
+            "one.",
+            "",
+            "every account is already in the chain",
+        ]
+    );
+}
+
+/// The `default: 95%` reminder on a `rotate at` row drops to its own line
+/// under the value column once the value column leaves no room, instead of
+/// clipping the reminder mid-word.
+#[test]
+fn the_rotate_reminder_drops_to_its_own_line_when_narrow() {
+    let a = profile("a", 80.0, 20.0, 3600);
+    let cfg = config_with(vec![a], None, vec!["a"]);
+    let lines = member_detail(
+        &cfg,
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            width: 30,
+            ..Default::default()
+        },
+        &HashSet::new(),
+    )
+    .0;
+    let texts: Vec<String> = lines.iter().map(line_text).collect();
+    assert_eq!(
+        texts,
+        [
+            "5h usage        █░░│  20% used",
+            "                60% until rot…",
+            "",
+            "  rotate at       80%",
+            "                  default: 95%",
+            "  weekly at       98%",
+            "  weekly gate     ─●",
+            "  scoped gate     ─●",
+            "  last resort     ○─",
+            "  preferred       ○─",
+            "  preferred days  never",
+            "                  weekdays",
+            "                  weekends",
+            "                  every day",
+            "  max spend       off",
+            "  remove          ",
+            "  remove from chain",
+        ]
+    );
+}
+
+/// An unmarked selector name clamps to the pane edge (with `…`) instead of
+/// running raw into the border — the marked arm's clamp minus the marker.
+#[test]
+fn an_unmarked_selector_name_clamps_to_the_pane_edge() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let a = profile("first.last@company.example", 95.0, 20.0, 3600);
+    let cfg = config_with(vec![a], None, vec!["first.last@company.example"]);
+    let app = App::new(cfg);
+    assert_eq!(
+        chain_selector_pane(&app, 60, 8),
+        vec![
+            "╭─ CHAIN ──────────╮".to_string(),
+            "│ ❯  #1 first.las… │".to_string(),
+            "│                  │".to_string(),
+            "│                  │".to_string(),
+            "│                  │".to_string(),
+            "│                  │".to_string(),
+            "│                  │".to_string(),
+            "╰──────────────────╯".to_string(),
+        ],
+    );
 }

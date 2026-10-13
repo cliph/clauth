@@ -692,6 +692,17 @@ pub(crate) enum GlobalConfigRow {
     AutoStartQueue,
 }
 
+/// The gateway a `+ new profile` form will mint a client token for on save:
+/// the picker's row 0 seeded the form with the gateway's base url, and this
+/// marker names the record it mints against. The bind is read once at open
+/// (with the base url), so the render's read-only key-row predicate and the
+/// save check the same bind without I/O.
+#[derive(Debug, Clone)]
+pub(crate) struct TokenMint {
+    pub(crate) record: crate::gateway::GatewayRecord,
+    pub(crate) bind: crate::gateway::GatewayBind,
+}
+
 /// Inline editor state for the Config detail pane. Built on entry, torn down
 /// when focus returns to the account list.
 #[derive(Debug, Clone)]
@@ -745,6 +756,10 @@ pub(crate) struct ConfigDraft {
     /// editable until then. Dropped with the draft; never set on an existing
     /// account's draft.
     pub(crate) captured_login: Option<DraftLogin>,
+    /// The `+ new profile` picker's marker: set while this draft mints a
+    /// client token on `create account` (only while the base url still names
+    /// the gateway). Dropped with the draft, so a cancelled form mints nothing.
+    pub(crate) mint_for: Option<TokenMint>,
 }
 
 impl ConfigDraft {
@@ -805,6 +820,20 @@ impl ConfigDraft {
             | ConfigRow::Delete
             | ConfigRow::Create => return None,
         })
+    }
+
+    /// Whether this draft will mint a client token on `create account`: the
+    /// `+ new profile` picker seeded a gateway marker, the base-url buffer
+    /// still names that gateway's bind ([`crate::gateway::url_names_bind`]),
+    /// and no live login is captured — capturing one disarms the mint exactly
+    /// as editing the url away does, so `create account` commits the capture
+    /// instead. The one predicate the render's read-only key row, the footer
+    /// and the save share, so they can never disagree.
+    pub(crate) fn mint_armed(&self) -> bool {
+        !matches!(self.captured_login, Some(DraftLogin::LiveLogin(_)))
+            && self.mint_for.as_ref().is_some_and(|mint| {
+                crate::gateway::url_names_bind(self.base_url.value.trim(), &mint.bind)
+            })
     }
 }
 
@@ -1132,12 +1161,10 @@ pub(crate) struct DivergenceTargetForm {
     pub(crate) total: std::cell::Cell<usize>,
 }
 
-/// The `+ add token` profile picker: one row per claude profile, in roster
-/// order, each carrying its `(name, has_token)` — whether the profile already
-/// holds a token, so the row reads `alice  has a token`. C1 has no synthetic
-/// `+ new profile` row, so the cursor is the profile's own index
-/// (`0..targets.len()`); C2 adds `+ new profile` as row 0 and shifts every
-/// profile down one.
+/// The `+ add token` profile picker: row 0 is `+ new profile`, then one row
+/// per claude profile in roster order, each carrying its `(name, has_token)` —
+/// whether the profile already holds a token, so the row reads
+/// `alice  has a token`. The cursor runs `0..=targets.len()` (row 0 included).
 #[derive(Debug, Clone)]
 pub(crate) struct TokenPickerForm {
     pub(crate) targets: Vec<(String, bool)>,
@@ -9511,10 +9538,9 @@ fn confirm_shunt_remove_token(app: &mut App, profile: &str) {
     }));
 }
 
-/// `↵`/`space` on `+ add token`: open the profile picker, one row per claude
-/// profile in roster order (the Overview's roster; codex profiles live in their
-/// own store, never here). An empty roster opens nothing: the `n` hint names
-/// the way to make one.
+/// `↵`/`space` on `+ add token`: open the profile picker — row 0 is
+/// `+ new profile`, then one row per claude profile in roster order (the
+/// Overview's roster; codex profiles live in their own store, never here).
 fn open_token_picker(app: &mut App) {
     if app.services.saving(&ShuntSaveKey::AddToken) {
         return;
@@ -9531,13 +9557,8 @@ fn open_token_picker(app: &mut App) {
             })
             .collect()
     };
-    if targets.is_empty() {
-        app.toast(
-            ToastKind::Info,
-            "no claude profile to give a token\npress n to create one",
-        );
-        return;
-    }
+    // Row 0 is always `+ new profile`, so an empty roster opens the picker
+    // with that row alone instead of the old `no claude profile` toast.
     app.disarm_quit();
     app.open_modal(Modal::TokenPicker(TokenPickerForm {
         targets,
@@ -9548,6 +9569,44 @@ fn open_token_picker(app: &mut App) {
         block_ends: std::cell::RefCell::new(Vec::new()),
         total: std::cell::Cell::new(0),
     }));
+}
+
+/// The `+ new profile` row: close the picker and open the new-account form
+/// through [`start_new_account`], seeded with the gateway's base url and the
+/// marker naming the record it mints for. A bind read failure opens no form.
+fn open_new_profile_form(app: &mut App) {
+    let Some(record) = app.services.shunt_record.clone() else {
+        app.toast(
+            ToastKind::Danger,
+            format!("add failed\n{NO_ADOPTED_CONFIG}"),
+        );
+        return;
+    };
+    let url = match crate::gateway::gateway_base_url(&record) {
+        Ok(url) => url,
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("add failed\n{}", escape_control(&error_toast_detail(&e))),
+            );
+            return;
+        }
+    };
+    let bind = match crate::gateway::displayed_gateway_bind(&record) {
+        Ok(bind) => bind,
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("add failed\n{}", escape_control(&error_toast_detail(&e))),
+            );
+            return;
+        }
+    };
+    start_new_account(app);
+    if let Some(d) = app.config_draft.as_mut() {
+        d.base_url = InputState::new(&url);
+        d.mint_for = Some(TokenMint { record, bind });
+    }
 }
 
 /// A picker pick: open the overwrite confirm naming what it replaces. The
@@ -15507,6 +15566,7 @@ pub(crate) fn build_draft_new() -> ConfigDraft {
         overrides_expanded: false,
         overrides_shown: Vec::new(),
         captured_login: None,
+        mint_for: None,
     }
 }
 
@@ -15539,6 +15599,7 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
         overrides_expanded: false,
         overrides_shown: Vec::new(),
         captured_login: None,
+        mint_for: None,
     };
     draft.overrides_shown = OVERRIDE_ROWS
         .into_iter()
@@ -15574,6 +15635,16 @@ fn disarm_armed_action(app: &mut App) {
 
 /// ⏎/space on a detail row: text → capture, toggle → flip, delete → arm/confirm, create → commit.
 fn run_config_row(app: &mut App, row: ConfigRow) {
+    // The mint-seeded api key row is a Disabled row: focusable but inert, so
+    // ⏎/space open no editor while the base url still names the gateway.
+    if row == ConfigRow::ApiKey
+        && app
+            .config_draft
+            .as_ref()
+            .is_some_and(ConfigDraft::mint_armed)
+    {
+        return;
+    }
     // Env rows seed their buffer before editing, so they're driven out of band.
     match row {
         ConfigRow::EnvEntry(i) => {
@@ -17242,6 +17313,25 @@ fn commit_endpoint(app: &mut App) {
     }
 }
 
+/// The shared tail after a create leaves the profile on disk: the success path
+/// and each failure branch whose profile landed both run it, then keep their
+/// own toast. Closes the form onto the new profile so the pane shows it as an
+/// ordinary account instead of a dead `+ new` draft.
+fn finish_created_profile(app: &mut App, name: &str) {
+    app.refresh_tokens();
+    app.last_reload_fp = reload_fingerprint();
+    app.refresh_unsaved_live_login();
+    let new_idx = app
+        .config()
+        .profiles
+        .iter()
+        .position(|p| p.name == name)
+        .unwrap_or(0);
+    app.profile_cursor = new_idx;
+    app.config_focus = ConfigFocus::Profiles;
+    app.config_draft = None;
+}
+
 fn commit_new_account(app: &mut App) {
     let Some(d) = app.config_draft.as_ref() else {
         return;
@@ -17250,6 +17340,12 @@ fn commit_new_account(app: &mut App) {
     let base_url = d.base_url.trimmed_some();
     let api_key = d.api_key.trimmed_some();
     let model = d.model.trimmed_some();
+    // The `+ new profile` marker, armed only while the base url still names
+    // the gateway and no live login is captured; editing the url away or
+    // capturing a login disarms it, so `create account` is then an ordinary
+    // create or the captured-login commit. The mint happens here, at the
+    // form's `create` row, never at open.
+    let mint = d.mint_for.clone().filter(|_| d.mint_armed());
     // A draft-held mint only makes sense for an OAuth create; a typed base url
     // flipped the form to API mode (login row hidden), so the mint is dropped.
     // The live-login stash commits in BOTH modes — a live setup can be an
@@ -17268,7 +17364,35 @@ fn commit_new_account(app: &mut App) {
         app.toast(ToastKind::Danger, format!("{e}"));
         return;
     }
-    let api_key = if base_url.is_some() { api_key } else { None };
+    // Mint before the create, under C1's one-save guard; a refusal keeps the
+    // form open. The token never reaches a toast, a buffer or a log line.
+    let minted = match mint {
+        Some(mint) => {
+            if app.services.shunt_save_worker.running {
+                app.toast(
+                    ToastKind::Info,
+                    "a save is still checking\nwait for it, then save again",
+                );
+                return;
+            }
+            match crate::gateway_tokens::add_client_token(&mint.record, &name) {
+                Ok(token) => Some((mint, token)),
+                Err(e) => {
+                    app.toast(ToastKind::Danger, escape_control(&token_error_message(&e)));
+                    return;
+                }
+            }
+        }
+        None => None,
+    };
+    let api_key = if base_url.is_some() {
+        minted
+            .as_ref()
+            .map(|(_, token)| token.expose().to_string())
+            .or(api_key)
+    } else {
+        None
+    };
     let result = {
         let mut cfg = app.config();
         match captured {
@@ -17303,21 +17427,62 @@ fn commit_new_account(app: &mut App) {
                     "created from the captured current login\nthe typed endpoint fields were not used",
                 );
             }
-            app.refresh_tokens();
-            app.last_reload_fp = reload_fingerprint();
-            app.refresh_unsaved_live_login();
-            let new_idx = app
-                .config()
-                .profiles
-                .iter()
-                .position(|p| p.name == name)
-                .unwrap_or(0);
-            app.profile_cursor = new_idx;
-            app.config_focus = ConfigFocus::Profiles;
-            app.config_draft = None;
+            finish_created_profile(app, &name);
             app.toast(ToastKind::Success, format!("created '{name}'"));
         }
-        Err(e) => app.toast(ToastKind::Danger, format!("create failed\n{e}")),
+        Err(e) => {
+            let Some((mint, token)) = minted else {
+                // `config.add` is the event that makes the profile exist in this
+                // session, and every create helper runs it only after its
+                // `save_profile` succeeded — so the roster, never a disk read,
+                // answers "did the profile land" (`load_profile` returns a
+                // default-valued profile for one that was never written). A
+                // failed `save_profile` (nothing on disk, nothing in memory, or
+                // a rolled-back first-account link) keeps the form open with its
+                // draft and any captured login; a failure after the save (state
+                // write) closes onto the created profile, else `create failed`
+                // leaves the pane editing a profile that already exists.
+                if app
+                    .config()
+                    .find(&crate::profile::ProfileName::from(name.as_str()))
+                    .is_some()
+                {
+                    finish_created_profile(app, &name);
+                }
+                app.toast(ToastKind::Danger, format!("create failed\n{e}"));
+                return;
+            };
+            // Decide the rollback from the profile as saved on disk after the
+            // error (C1's `run_add_client_token` shape): the profile save
+            // landed and only the state write failed -> it holds the minted
+            // key, keep the token; the save itself failed -> remove it. The
+            // token takes part in the comparison, never in a message.
+            let kept =
+                crate::profile::load_profile(&crate::profile::ProfileName::from(name.as_str()))
+                    .ok()
+                    .is_some_and(|saved| saved.api_key.as_deref() == Some(token.expose()));
+            if kept {
+                finish_created_profile(app, &name);
+                app.toast(
+                    ToastKind::Danger,
+                    format!(
+                        "create failed\n{} was created, but {e:#}",
+                        escape_control(&name)
+                    ),
+                );
+                return;
+            }
+            match crate::gateway_tokens::remove_client_token(&mint.record, &name) {
+                Ok(_) => app.toast(ToastKind::Danger, format!("create failed\n{e:#}")),
+                Err(removal) => app.toast(
+                    ToastKind::Danger,
+                    format!(
+                        "create failed\nthe token for {} is stored but no profile was created: {removal:#}",
+                        escape_control(&name),
+                    ),
+                ),
+            }
+        }
     }
 }
 
@@ -18579,14 +18744,14 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
 }
 
 /// Keys on the `+ add token` profile picker: Up/Down wrap, PageUp/PageDown
-/// page, `esc`/`q` close, `↵`/`space` pick (a pick opens the overwrite
-/// confirm). No synthetic `+ new profile` row in C1, so the cursor is the
-/// profile's own index.
+/// page, `esc`/`q` close, `↵`/`space` pick. Row 0 is `+ new profile` (opens
+/// the new-account form); the profiles sit below it, so the cursor runs
+/// `0..=targets.len()`.
 fn handle_token_picker_key(app: &mut App, key: KeyEvent) {
     let Some(Modal::TokenPicker(form)) = app.modals.last_mut() else {
         return;
     };
-    let last = form.targets.len() - 1;
+    let last = form.targets.len();
     match key.code {
         KeyCode::Up => {
             form.cursor = if form.cursor == 0 {
@@ -18641,7 +18806,11 @@ fn handle_token_picker_key(app: &mut App, key: KeyEvent) {
             let Some(Modal::TokenPicker(form)) = app.modals.pop() else {
                 return;
             };
-            let Some((profile, _)) = form.targets.get(cursor).cloned() else {
+            if cursor == 0 {
+                open_new_profile_form(app);
+                return;
+            }
+            let Some((profile, _)) = form.targets.get(cursor - 1).cloned() else {
                 return;
             };
             open_token_overwrite_confirm(app, profile);

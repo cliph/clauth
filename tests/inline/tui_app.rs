@@ -27716,7 +27716,8 @@ fn the_token_picker_lists_every_profile_and_marks_a_holder() {
         "the holder reads `  has a token`:\n{}",
         rows.join("\n")
     );
-    // Pick bob: the overwrite confirm names what it replaces.
+    // Pick bob: row 0 is `+ new profile`, so two Downs reach bob.
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     let confirm = top_confirm(&app);
@@ -27726,9 +27727,10 @@ fn the_token_picker_lists_every_profile_and_marks_a_holder() {
     );
 }
 
-/// An empty claude roster opens no picker; it toasts the `n` hint instead.
+/// An empty claude roster still opens the picker: row 0 is always
+/// `+ new profile`, so there is always a row.
 #[test]
-fn an_empty_roster_toasts_no_profile_instead_of_opening_the_picker() {
+fn an_empty_roster_opens_the_picker_with_new_profile_alone() {
     use ratatui::crossterm::event::KeyCode;
     let home = crate::testutil::HomeSandbox::new();
     let _env = crate::testutil::no_shunt_env(&home);
@@ -27738,15 +27740,15 @@ fn an_empty_roster_toasts_no_profile_instead_of_opening_the_picker() {
     app.services
         .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
-    assert!(app.modals.is_empty(), "an empty roster opens no modal");
+    let Some(super::Modal::TokenPicker(form)) = app.modals.last() else {
+        panic!("an empty roster still opens the picker");
+    };
     assert_eq!(
-        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
-        Some((
-            super::ToastKind::Info,
-            "no claude profile to give a token\npress n to create one"
-        )),
-        "the empty-roster toast by equality"
+        form.targets,
+        Vec::<(String, bool)>::new(),
+        "no profile rows"
     );
+    assert_eq!(form.cursor, 0, "row 0 (`+ new profile`) is focused");
 }
 
 /// Open the picker on a one-profile roster and confirm the pick; the
@@ -27757,6 +27759,7 @@ fn overwrite_replace_line(app: &mut super::App) -> Option<String> {
     app.services
         .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
     super::handle_key(app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(app, crate::testutil::key(KeyCode::Down));
     super::handle_key(app, crate::testutil::key(KeyCode::Enter));
     let confirm = top_confirm(app);
     assert_eq!(
@@ -27849,6 +27852,7 @@ fn a_token_add_mints_and_points_the_profile_and_leaks_the_token_nowhere() {
     app.services
         .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
@@ -27936,6 +27940,7 @@ fn a_cancelled_add_writes_nothing() {
     app.services
         .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     // `cancel` is the confirm's default button.
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
@@ -27975,6 +27980,7 @@ fn a_profile_save_failure_after_the_mint_reports_the_profile_unchanged() {
     app.services
         .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
@@ -28036,6 +28042,7 @@ fn a_remint_of_a_gateway_pointed_profile_whose_save_fails_reports_unchanged() {
     app.services
         .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
@@ -28076,6 +28083,7 @@ fn an_active_profile_settings_write_failure_reports_the_profile_points_at_the_ga
     app.services
         .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
     super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
@@ -28116,6 +28124,7 @@ fn a_profile_that_vanished_refuses_before_any_mint() {
             let mut cfg = app.config();
             cfg.profiles.clear();
         }
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
         assert!(app.modals.is_empty(), "no confirm opens");
         assert_eq!(
@@ -28144,6 +28153,7 @@ fn a_profile_that_vanished_refuses_before_any_mint() {
         app.services
             .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
         {
             let mut cfg = app.config();
@@ -28321,6 +28331,7 @@ fn one_save_at_a_time_across_a_field_save_a_token_add_and_a_token_remove() {
         app.services
             .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Right));
         super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
@@ -28335,6 +28346,1037 @@ fn one_save_at_a_time_across_a_field_save_a_token_add_and_a_token_remove() {
         assert_eq!(token_names(), vec!["alice"], "nothing was added");
         drain_shunt_action(&mut app);
     }
+}
+
+// ── E5 C2: the picker's `+ new profile` row (mint at the form's save) ────────
+
+/// Open the picker, then `↵` on row 0 (`+ new profile`) into the seeded form.
+fn open_minted_form(app: &mut super::App) {
+    use ratatui::crossterm::event::KeyCode;
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
+    super::handle_key(app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(app, crate::testutil::key(KeyCode::Enter));
+}
+
+/// The whole TUI rendered at 100×60 as trimmed rows.
+fn render_rows(app: &super::App) -> Vec<String> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer())
+        .into_iter()
+        .map(|r| r.trim().to_string())
+        .collect()
+}
+
+/// Whether the whole TUI renders the text on some row.
+fn renders(app: &super::App, needle: &str) -> bool {
+    render_rows(app).iter().any(|r| r.contains(needle))
+}
+
+/// Row 0 is a first-class `+ new profile` row: `ACCENT`, bold while selected,
+/// above the profiles. The cursor walks `0..=targets.len()` with wrap, by
+/// equality, and the focused row's text follows it.
+#[test]
+fn the_token_picker_row_zero_is_new_profile_and_walks_by_equality() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(vec![
+        Profile::new(
+            "alice".into(),
+            Some("https://api.example.com".into()),
+            Some("k".into()),
+        ),
+        Profile::new("bob".into(), None, None),
+    ]);
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let Some(super::Modal::TokenPicker(form)) = app.modals.last() else {
+        panic!("the picker opened");
+    };
+    assert_eq!(
+        form.targets,
+        vec![("alice".to_string(), false), ("bob".to_string(), false)],
+        "the picker still lists each profile with whether it holds a token"
+    );
+    assert_eq!(form.cursor, 0, "row 0 (`+ new profile`) starts focused");
+    assert!(
+        renders(&app, "❯ + new profile"),
+        "row 0 renders focused by equality"
+    );
+    // Walk down: 0 → 1 (alice) → 2 (bob) → 0 (wrap).
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let Some(super::Modal::TokenPicker(form)) = app.modals.last() else {
+        panic!("picker")
+    };
+    assert_eq!(form.cursor, 1, "Down lands on alice");
+    assert!(
+        renders(&app, "❯ alice"),
+        "alice renders focused by equality"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let Some(super::Modal::TokenPicker(form)) = app.modals.last() else {
+        panic!("picker")
+    };
+    assert_eq!(form.cursor, 2, "Down lands on bob");
+    assert!(renders(&app, "❯ bob"), "bob renders focused by equality");
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let Some(super::Modal::TokenPicker(form)) = app.modals.last() else {
+        panic!("picker")
+    };
+    assert_eq!(form.cursor, 0, "Down from the last row wraps to row 0");
+    // Walk up from row 0 wraps to the last row (bob).
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    let Some(super::Modal::TokenPicker(form)) = app.modals.last() else {
+        panic!("picker")
+    };
+    assert_eq!(form.cursor, 2, "Up from row 0 wraps to the last profile");
+}
+
+/// `↵` on `+ new profile` opens the new-account form seeded with the gateway's
+/// base url, and the api key row reads `minted on save` (read-only).
+#[test]
+fn the_new_profile_row_seeds_the_form_and_marks_the_key_row() {
+    use crate::profile::Profile;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    open_minted_form(&mut app);
+    assert!(app.modals.is_empty(), "the picker closed");
+    assert_eq!(app.tab, super::Tab::Setup, "the form opened on Setup");
+    let draft = app.config_draft.as_ref().expect("the new-account draft");
+    assert_eq!(
+        draft.base_url.value, "http://127.0.0.1:3001",
+        "the base url is the gateway's, by equality"
+    );
+    assert!(
+        renders(&app, "minted on save"),
+        "the key row reads `minted on save`"
+    );
+}
+
+/// The mint-seeded key row is a Disabled row: `↵` and `space` open no editor,
+/// and the buffer stays empty.
+#[test]
+fn the_mint_seeded_key_row_ignores_editing() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    open_minted_form(&mut app);
+    // Navigate: Name (0) → BaseUrl (1) → ApiKey (2).
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let rows = super::config_rows(&app);
+    assert_eq!(
+        rows[app.config_action_cursor],
+        super::ConfigRow::ApiKey,
+        "the cursor sits on the api key row"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.active),
+        None,
+        "`↵` opens no editor on the read-only key row"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.config_draft.as_ref().and_then(|d| d.active),
+        None,
+        "`space` opens no editor either"
+    );
+    assert_eq!(
+        app.config_draft.as_ref().unwrap().api_key.value,
+        "",
+        "the key buffer stays empty"
+    );
+}
+
+/// Editing the base url away from the gateway flips the key row to an ordinary
+/// empty input (nothing will be minted); editing it back restores the
+/// read-only row.
+#[test]
+fn editing_the_base_url_away_and_back_toggles_the_key_row() {
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(Vec::new());
+    open_minted_form(&mut app);
+    assert!(
+        renders(&app, "minted on save"),
+        "the key row starts read-only"
+    );
+    app.config_draft.as_mut().unwrap().base_url = super::InputState::new("https://api.example.com");
+    assert!(
+        !renders(&app, "minted on save"),
+        "editing the url away drops the read-only row"
+    );
+    app.config_draft.as_mut().unwrap().base_url = super::InputState::new("http://127.0.0.1:3001");
+    assert!(
+        renders(&app, "minted on save"),
+        "editing the url back restores the read-only row"
+    );
+}
+
+/// A save mints the client token under the typed name, creates the profile with
+/// that token as its api key (store and profile read back by equality), and the
+/// token never reaches a toast, a log line or a rendered buffer.
+#[test]
+fn a_new_profile_save_mints_and_creates_and_leaks_the_token_nowhere() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    open_minted_form(&mut app);
+    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        token_names(),
+        vec!["alice"],
+        "the store holds the minted profile"
+    );
+    let pairs = crate::gateway_tokens::ClientTokens::load()
+        .unwrap()
+        .spawn_value(None, "SHUNT_CLIENT_TOKENS", true)
+        .unwrap();
+    let token = pairs.strip_prefix("alice:").unwrap().to_string();
+    {
+        let cfg = app.config();
+        let profile = cfg
+            .profiles
+            .iter()
+            .find(|p| p.name.as_str() == "alice")
+            .unwrap();
+        assert_eq!(
+            profile.base_url.as_deref(),
+            Some("http://127.0.0.1:3001"),
+            "the profile's base url is the gateway's, by equality"
+        );
+        assert_eq!(
+            profile.api_key.as_deref(),
+            Some(token.as_str()),
+            "the profile's api key is the stored token, by equality"
+        );
+    }
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((super::ToastKind::Success, "created 'alice'")),
+        "the create success toast by equality"
+    );
+    assert!(
+        !app.toasts.iter().any(|t| t.body.contains(&token)),
+        "the token never reaches a toast"
+    );
+    assert!(
+        !lines.snapshot().iter().any(|l| l.contains(&token)),
+        "the token never reaches a captured log line"
+    );
+    assert!(
+        !render_rows(&app).iter().any(|r| r.contains(&token)),
+        "the token never reaches a rendered buffer"
+    );
+}
+
+/// A name the gateway's base already holds refuses the mint: the form stays
+/// open, the refusal shows where the form shows its validation errors, and
+/// nothing is minted or created.
+#[test]
+fn a_refused_mint_shows_the_refusal_and_creates_nothing() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    // The env file already holds a client named `alice`, so the mint refuses.
+    adopt_token_record(&home, TOKEN_CONFIG, "SHUNT_CLIENT_TOKENS=alice:tok1\n");
+    let mut app = token_app(Vec::new());
+    open_minted_form(&mut app);
+    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let env_path = home.home().join("tokens.env");
+    let expected = format!(
+        "cannot add a client token for profile \"alice\": the gateway's env file {} already names a client \"alice\" in SHUNT_CLIENT_TOKENS, and shunt refuses a duplicate name; remove that entry from the env file first",
+        env_path.display()
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((super::ToastKind::Danger, expected.as_str())),
+        "the refusal by equality"
+    );
+    assert!(app.config_draft.is_some(), "the form stays open");
+    assert_eq!(token_names(), Vec::<String>::new(), "nothing minted");
+    assert!(app.config().profiles.is_empty(), "no profile created");
+}
+
+/// A create failure after the mint removes the token again (the store is
+/// byte-identical to before) and toasts `create failed` + the error.
+#[cfg(unix)]
+#[test]
+fn a_create_failure_after_the_mint_removes_the_token() {
+    use ratatui::crossterm::event::KeyCode;
+    use std::os::unix::fs::PermissionsExt;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let record = adopt_token_record(&home, TOKEN_CONFIG, "");
+    crate::gateway_tokens::add_client_token(&record, "bob").unwrap();
+    let before = token_store_text().unwrap();
+    // A read-only profile dir makes the create's config.toml write fail after
+    // the mint already landed.
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alice")).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let mut app = token_app(Vec::new());
+    open_minted_form(&mut app);
+    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Danger,
+            "create failed\nfailed to write config.toml: Permission denied (os error 13)"
+        )),
+        "the create-failure toast by equality"
+    );
+    assert_eq!(
+        token_store_text(),
+        Some(before),
+        "the mint was rolled back: the store is byte-identical to before"
+    );
+}
+
+/// `esc` out of the minted form mints nothing and leaves the store absent.
+#[test]
+fn cancelling_the_minted_form_mints_nothing() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(Vec::new());
+    open_minted_form(&mut app);
+    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+    assert!(app.config_draft.is_some(), "the form opened");
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(token_names(), Vec::<String>::new(), "nothing minted");
+    assert_eq!(token_store_text(), None, "the store stays absent");
+    assert!(app.config_draft.is_none(), "the form dropped");
+}
+
+/// A mint save under an in-flight shunt save toasts the one-save guard and
+/// mints nothing.
+#[test]
+fn the_mint_save_guards_while_a_shunt_save_is_in_flight() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    const RIG: &str = "[server]\nbind = \"127.0.0.1:3001\"\n\n[[upstreams]]\nname = \"a\"\nauth = \"claude_oauth\"\n";
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let etc = home.home().join("etc");
+    std::fs::create_dir_all(&etc).unwrap();
+    let config = etc.join("shunt.toml");
+    std::fs::write(&config, RIG).unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config.clone()).unwrap();
+    record.binary = Some(home.home().join("no-such-shunt"));
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .shunt_expanded
+        .insert(super::ShuntEntryKey::Upstream {
+            name: "a".into(),
+            occurrence: 0,
+        });
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::Field(
+            super::ShuntFieldKey::Upstream {
+                name: "a".into(),
+                occurrence: 0,
+                field: super::UpstreamFieldKind::Effort,
+            },
+        )));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    for c in "high".chars() {
+        super::handle_key(&mut app, crate::testutil::key(KeyCode::Char(c)));
+    }
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if app.services.shunt_save_worker.running {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the field save never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Step off the locked editor, then open the minted form and commit.
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    open_minted_form(&mut app);
+    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Info,
+            "a save is still checking\nwait for it, then save again"
+        )),
+        "the mint save toasts the one-save guard"
+    );
+    assert_eq!(token_names(), Vec::<String>::new(), "nothing minted");
+    assert!(
+        app.config()
+            .profiles
+            .iter()
+            .all(|p| p.name.as_str() != "alice"),
+        "no profile created"
+    );
+    drain_shunt_action(&mut app);
+}
+
+// ── E5 C2 round 2: the review findings' binding tests ────────────────────────
+
+/// Capturing the current login in a form armed to mint disarms the mint —
+/// exactly as editing the base url away does: the api key row turns ordinary,
+/// nothing mints, and `create account` commits the captured login.
+#[test]
+fn capturing_a_login_in_the_minted_form_disarms_the_mint() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    plain_live_login("live-refresh");
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    app.refresh_unsaved_live_login();
+    open_minted_form(&mut app);
+    assert!(renders(&app, "minted on save"), "the form starts armed");
+    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+    super::run_config_row(&mut app, super::ConfigRow::CaptureLogin);
+    assert!(
+        !renders(&app, "minted on save"),
+        "capturing a login disarms the key row"
+    );
+    let before = token_store_text();
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(token_store_text(), before, "nothing minted");
+    assert_eq!(token_names(), Vec::<String>::new(), "the store stays empty");
+    {
+        let cfg = app.config();
+        let profile = cfg
+            .profiles
+            .iter()
+            .find(|p| p.name.as_str() == "alice")
+            .expect("the profile was created");
+        assert_eq!(
+            profile.refresh_token(),
+            Some("live-refresh"),
+            "the profile is the captured-login profile"
+        );
+    }
+    assert!(
+        app.toasts.iter().any(|t| t.body
+            == "created from the captured current login\nthe typed endpoint fields were not used"),
+        "the captured-login toast fires"
+    );
+}
+
+/// Editing the base url to a non-gateway endpoint on an armed form disarms the
+/// mint: `create account` writes the typed endpoint and key, mints nothing, and
+/// the store stays byte-identical.
+#[test]
+fn a_save_after_editing_the_base_url_away_mints_nothing() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let before = token_store_text();
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    open_minted_form(&mut app);
+    {
+        let d = app.config_draft.as_mut().unwrap();
+        d.name = super::InputState::new("alice");
+        d.base_url = super::InputState::new("https://api.example.com");
+        d.api_key = super::InputState::new("k");
+    }
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(token_names(), Vec::<String>::new(), "nothing minted");
+    assert_eq!(token_store_text(), before, "the store is byte-identical");
+    {
+        let cfg = app.config();
+        let profile = cfg
+            .profiles
+            .iter()
+            .find(|p| p.name.as_str() == "alice")
+            .expect("the profile was created");
+        assert_eq!(
+            profile.base_url.as_deref(),
+            Some("https://api.example.com"),
+            "the profile's base url is the typed endpoint"
+        );
+        assert_eq!(
+            profile.api_key.as_deref(),
+            Some("k"),
+            "the profile's api key is the typed key, not a minted token"
+        );
+    }
+}
+
+/// A create failure whose rollback removal refuses (the last-token guard) pins
+/// the stored-token copy by equality, without the false `remove it on the
+/// shunt card` remedy, and leaves the minted token stored.
+#[cfg(unix)]
+#[test]
+fn a_refused_rollback_after_the_mint_toasts_the_stored_token_copy() {
+    use ratatui::crossterm::event::KeyCode;
+    use std::os::unix::fs::PermissionsExt;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(
+        &home,
+        "[server]\nbind = \"127.0.0.1:3001\"\n[server.auth]\n",
+        "",
+    );
+    // The create's config.toml write fails after the mint; the store then
+    // holds the gateway's only token, so the rollback removal refuses.
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alice")).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let mut app = token_app(Vec::new());
+    open_minted_form(&mut app);
+    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Danger,
+            "create failed\nthe token for alice is stored but no profile was created: cannot remove the last client token while the gateway requires tokens; add another token or remove [server.auth] from the config first"
+        )),
+        "the refused-removal copy by equality"
+    );
+    assert_eq!(
+        token_names(),
+        vec!["alice"],
+        "the refused removal leaves the minted token stored"
+    );
+}
+
+/// The armed save-failure seam is an RAII guard: dropping it unconsumed clears
+/// the arm, so a test that never reached its `save_app_state` cannot leak the
+/// fault into a sibling test (the process-global flag stays set otherwise).
+#[test]
+fn dropping_the_armed_save_failure_guard_unconsumed_then_saving_succeeds() {
+    let home = crate::testutil::HomeSandbox::new();
+    {
+        let _fail = crate::profile::FailAppStateSave::new(&home);
+        // Dropped without any `save_app_state` call consuming the arm.
+    }
+    let saved = crate::profile::save_app_state(&crate::profile::AppState::default());
+    assert!(
+        saved.is_ok(),
+        "the dropped guard cleared the armed failure, got {saved:?}"
+    );
+}
+
+/// A create failure after the profile save landed (only the state write
+/// failed) keeps the minted token and reports the profile as created-but-errored.
+#[test]
+fn a_state_write_failure_after_the_profile_save_keeps_the_token() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(Vec::new());
+    open_minted_form(&mut app);
+    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    let _fail = crate::profile::FailAppStateSave::new(&home);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(token_names(), vec!["alice"], "the minted token is kept");
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Danger,
+            "create failed\nalice was created, but failed to write profiles.toml: Permission denied (os error 13)"
+        )),
+        "the kept-token copy by equality"
+    );
+    let saved = crate::profile::load_profile(&crate::profile::ProfileName::from("alice")).unwrap();
+    let token = crate::gateway_tokens::ClientTokens::load()
+        .unwrap()
+        .spawn_value(None, "SHUNT_CLIENT_TOKENS", true)
+        .unwrap()
+        .strip_prefix("alice:")
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        saved.api_key.as_deref(),
+        Some(token.as_str()),
+        "the profile on disk holds the minted key"
+    );
+    assert!(
+        app.config_draft.is_none(),
+        "the form closes onto the created profile"
+    );
+    assert_eq!(
+        app.config_focus,
+        super::ConfigFocus::Profiles,
+        "the pane shows the profile, not the actions list"
+    );
+    assert_eq!(app.profile_cursor, 0, "the cursor lands on alice");
+    assert_eq!(
+        super::config_rows(&app),
+        vec![
+            super::ConfigRow::Name,
+            super::ConfigRow::BellThreshold,
+            super::ConfigRow::BaseUrl,
+            super::ConfigRow::ApiKey,
+            super::ConfigRow::Model,
+            super::ConfigRow::ModelOverrideAdd,
+            super::ConfigRow::EnvAdd,
+            super::ConfigRow::Login,
+            super::ConfigRow::DeleteCreds,
+            super::ConfigRow::Disabled,
+            super::ConfigRow::Delete,
+        ],
+        "the pane shows alice's ordinary existing-account rows"
+    );
+    assert!(
+        !renders(&app, "minted on save"),
+        "the mint marker is gone with the draft"
+    );
+}
+
+/// The plain create's state-write failure (profile saved, `profiles.toml`
+/// write failed) also runs the shared success tail: the form closes onto the
+/// created profile instead of leaving the pane editing a profile that exists.
+#[test]
+fn a_plain_create_state_write_failure_closes_the_form_onto_the_profile() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    // The plain `+ new` form: no picker, no mint marker.
+    app.tab = super::Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    app.config_draft = Some(super::build_draft_new());
+    app.config_focus = super::ConfigFocus::Actions;
+    {
+        let d = app.config_draft.as_mut().unwrap();
+        d.name = super::InputState::new("alice");
+        d.base_url = super::InputState::new("https://api.example.com");
+        d.api_key = super::InputState::new("k");
+    }
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    let _fail = crate::profile::FailAppStateSave::new(&home);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Danger,
+            "create failed\nfailed to write profiles.toml: Permission denied (os error 13)"
+        )),
+        "the plain create-failure toast by equality"
+    );
+    assert!(
+        app.config_draft.is_none(),
+        "the form closes onto the created profile"
+    );
+    assert_eq!(app.profile_cursor, 1, "the cursor lands on alice, not bob");
+    assert_eq!(
+        super::config_rows(&app),
+        vec![
+            super::ConfigRow::Name,
+            super::ConfigRow::BellThreshold,
+            super::ConfigRow::BaseUrl,
+            super::ConfigRow::ApiKey,
+            super::ConfigRow::Model,
+            super::ConfigRow::ModelOverrideAdd,
+            super::ConfigRow::EnvAdd,
+            super::ConfigRow::Login,
+            super::ConfigRow::DeleteCreds,
+            super::ConfigRow::Disabled,
+            super::ConfigRow::Delete,
+        ],
+        "the pane shows alice's ordinary existing-account rows"
+    );
+}
+
+/// A plain create whose `save_profile` fails (the profile dir is read-only)
+/// never landed the profile, so the form must stay open with the draft intact:
+/// the shared success tail runs only when the roster holds the profile, and a
+/// disk read (`load_profile`) would report a default-valued profile for a name
+/// that was never written. `profile_cursor == profile_count()` is the `+ new`
+/// row, which stays put.
+#[cfg(unix)]
+#[test]
+fn a_failed_plain_create_keeps_the_form_open_with_its_typed_draft() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    use std::os::unix::fs::PermissionsExt;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    app.tab = super::Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    app.config_draft = Some(super::build_draft_new());
+    app.config_focus = super::ConfigFocus::Actions;
+    {
+        let d = app.config_draft.as_mut().unwrap();
+        d.name = super::InputState::new("alice");
+        d.base_url = super::InputState::new("https://api.example.com");
+        d.api_key = super::InputState::new("k");
+        d.model = super::InputState::new("opus");
+    }
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    // A read-only profile dir makes `save_profile` fail before `config.add`,
+    // so the profile is on neither disk nor the roster.
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alice")).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Danger,
+            "create failed\nfailed to write config.toml"
+        )),
+        "the plain create-failure toast by equality"
+    );
+    let d = app.config_draft.as_ref().expect("the form stays open");
+    assert_eq!(d.name.value, "alice", "the draft name survives");
+    assert_eq!(
+        d.base_url.value, "https://api.example.com",
+        "the draft base url survives"
+    );
+    assert_eq!(d.api_key.value, "k", "the draft api key survives");
+    assert_eq!(d.model.value, "opus", "the draft model survives");
+    assert_eq!(
+        app.profile_cursor,
+        app.profile_count(),
+        "the cursor stays on the `+ new` row"
+    );
+}
+
+/// A plain create over a captured login (`capture_into_profile`'s arm) whose
+/// `save_profile` fails must keep the captured login on the form — the pre-fix
+/// predicate closed the form and dropped the just-captured login with no
+/// warning, exactly the loss `leave_config_detail` toasts about.
+#[cfg(unix)]
+#[test]
+fn a_failed_plain_create_keeps_a_captured_login_on_the_form() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    use std::os::unix::fs::PermissionsExt;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    app.tab = super::Tab::Setup;
+    app.profile_cursor = app.profile_count();
+    let mut draft = super::build_draft_new();
+    draft.name = super::InputState::new("alice");
+    draft.captured_login = Some(super::DraftLogin::LiveLogin(Box::new(
+        crate::actions::CaptureSnapshot {
+            credentials: None,
+            base_url: None,
+            api_key: None,
+            anchor: crate::actions::AnchorAction::Unproven,
+        },
+    )));
+    app.config_draft = Some(draft);
+    app.config_focus = super::ConfigFocus::Actions;
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alice")).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            super::ToastKind::Danger,
+            "create failed\nfailed to write config.toml"
+        )),
+        "the plain create-failure toast by equality"
+    );
+    assert!(
+        matches!(
+            app.config_draft
+                .as_ref()
+                .and_then(|d| d.captured_login.as_ref()),
+            Some(super::DraftLogin::LiveLogin(_))
+        ),
+        "the captured login survives on the open form"
+    );
+    assert_eq!(
+        app.profile_cursor,
+        app.profile_count(),
+        "the cursor stays on the `+ new` row"
+    );
+}
+
+/// The minted token never reaches a rendered buffer, a toast, a captured log
+/// line, or the `Debug` of the draft, its marker, or the picker form. Driven
+/// through the refused-removal path (the profile write fails, the last-token
+/// guard refuses the rollback) so the form stays open with its draft + marker
+/// beside the still-stored token — the surfaces a Debug leak shows in.
+#[cfg(unix)]
+#[test]
+fn the_minted_token_reaches_no_debug_or_rendered_surface() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    use std::os::unix::fs::PermissionsExt;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(
+        &home,
+        "[server]\nbind = \"127.0.0.1:3001\"\n[server.auth]\n",
+        "",
+    );
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    // Open the picker and pin its Debug before it closes.
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let picker_debug = format!("{:?}", app.modals.last());
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    app.config_draft.as_mut().unwrap().name = super::InputState::new("alice");
+    let create = super::config_rows(&app)
+        .iter()
+        .position(|r| *r == super::ConfigRow::Create)
+        .expect("create row");
+    app.config_action_cursor = create;
+    // Fail the profile's config.toml write (not the state write) so the
+    // rollback removal refuses on the last-token guard and the form stays open.
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alice")).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let token = crate::gateway_tokens::ClientTokens::load()
+        .unwrap()
+        .spawn_value(None, "SHUNT_CLIENT_TOKENS", true)
+        .unwrap()
+        .strip_prefix("alice:")
+        .unwrap()
+        .to_string();
+    let draft = app.config_draft.as_ref().expect("the form stays open");
+    assert!(
+        !format!("{draft:?}").contains(&token),
+        "the draft Debug never holds the token"
+    );
+    assert!(
+        !format!("{:?}", draft.mint_for).contains(&token),
+        "the marker Debug never holds the token"
+    );
+    assert!(
+        !picker_debug.contains(&token),
+        "the picker form Debug never holds the token"
+    );
+    assert!(
+        !app.toasts.iter().any(|t| t.body.contains(&token)),
+        "the token never reaches a toast"
+    );
+    assert!(
+        !lines.snapshot().iter().any(|l| l.contains(&token)),
+        "the token never reaches a captured log line"
+    );
+    assert!(
+        !render_rows(&app).iter().any(|r| r.contains(&token)),
+        "the token never reaches a rendered buffer"
+    );
+}
+
+/// Row 0's `+ new profile` label is `ACCENT` at rest and `ACCENT + bold` while
+/// selected, pinned from the buffer's cells.
+#[test]
+fn the_new_profile_row_renders_accent_and_bold_when_selected() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    use ratatui::style::Modifier;
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(super::ShuntFocusLine::AddToken));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    // Selected: row 0 is focused, so `+ new profile` is ACCENT + bold.
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let cells = crate::testutil::needle_cells(term.backend().buffer(), "+ new profile")
+        .expect("the row renders");
+    assert!(
+        cells
+            .iter()
+            .all(|c| c.fg == crate::tui::theme::accent_color()
+                && c.modifier.contains(Modifier::BOLD)),
+        "selected `+ new profile` is ACCENT + bold"
+    );
+    // At rest: move the cursor onto the profile row.
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let cells = crate::testutil::needle_cells(term.backend().buffer(), "+ new profile")
+        .expect("the row still renders at rest");
+    assert!(
+        cells
+            .iter()
+            .all(|c| c.fg == crate::tui::theme::accent_color()
+                && !c.modifier.contains(Modifier::BOLD)),
+        "at rest `+ new profile` is ACCENT, not bold"
+    );
+}
+
+/// The armed api key row's footer drops the `↵ edit / toggle` hint, pinned by
+/// equality.
+#[test]
+fn the_armed_key_row_footer_omits_the_edit_hint() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    open_minted_form(&mut app);
+    // Focus the api key row: Name (0) → BaseUrl (1) → ApiKey (2).
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let footer = footer_row(&app, 120, 40);
+    assert_eq!(
+        footer.trim(),
+        "←→ tabs   ↑↓ row   a actions   ? help   q back",
+        "the armed key row's footer drops the edit hint"
+    );
+}
+
+/// The armed api key row and its tooltip render whole, pinned by equality, with
+/// the row's cells faint (the Disabled-row treatment) — not a presence check.
+#[test]
+fn the_armed_key_row_tooltip_reads_minted_by_equality() {
+    use crate::profile::Profile;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    adopt_token_record(&home, TOKEN_CONFIG, "");
+    let mut app = token_app(vec![Profile::new("bob".into(), None, None)]);
+    open_minted_form(&mut app);
+    // Focus the api key row: Name (0) → BaseUrl (1) → ApiKey (2).
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 60)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    // The detail pane's inner rows, borders stripped (the `shunt_config_rows`
+    // extraction; the Setup tab is the same master-detail `││` split).
+    let detail: Vec<String> = crate::testutil::buffer_rows(term.backend().buffer())
+        .iter()
+        .filter_map(|r| r.split("││").nth(1))
+        .map(|r| {
+            let r = r.trim_matches('│');
+            let r = r.strip_prefix(' ').unwrap_or(r);
+            r.trim_end().to_string()
+        })
+        .collect();
+    let armed = detail
+        .iter()
+        .find(|r| r.contains("minted on save"))
+        .expect("the armed key row renders");
+    assert_eq!(
+        armed, "❯ api key         minted on save",
+        "the focused armed row by equality (whole line, house key-cell spacing)"
+    );
+    let tip = detail
+        .iter()
+        .find(|r| r.contains("clauth mints a client token for this profile"))
+        .expect("the tooltip renders");
+    assert_eq!(
+        tip, " └ clauth mints a client token for this profile",
+        "the tooltip line by equality (whole line)"
+    );
+    let cells = crate::testutil::needle_cells(term.backend().buffer(), "minted on save")
+        .expect("the armed value renders");
+    assert!(
+        cells
+            .iter()
+            .all(|c| c.fg == crate::tui::theme::text_faint_color()),
+        "the armed row's cells render faint"
+    );
 }
 
 // ── Tokens dashboard: card focus + whole-card scroll (tui-fix S3) ────────────

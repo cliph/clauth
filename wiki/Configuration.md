@@ -94,7 +94,15 @@ A preset is a named `base_url` + `[models]` pair you can stamp onto any account 
 | `Qwen-CodingPlan-Intl` | `https://coding-intl.dashscope.aliyuncs.com/apps/anthropic` |
 | `Qwen-CodingPlan-CN` | `https://coding.dashscope.aliyuncs.com/apps/anthropic` |
 
-`DeepSeek`, `Z.ai`, `OpenRouter` and `MiniMax` set the endpoint plus a base model, leaving the tier rows yours to pin afterwards. The four Alibaba ones fill every row instead, because those endpoints reject a Claude model id outright rather than serving something for it, so any alias left unpinned fails on use. All eight leave the api key alone; pick the region your plan was bought in, since a key issued for one is not accepted by the other. Once a preset is stamped on, `open provider console` in the same menu opens that endpoint's own key page ([above](Configuration#where-the-keys-come-from)).
+`DeepSeek`, `Z.ai` and `MiniMax` bind the provider's strongest current model to `opus` and `fable` and its fast one to `sonnet` and `haiku`, and set `default` to `opus`, so the main model follows the `opus` row:
+
+| Preset | `opus`, `fable` | `sonnet`, `haiku` |
+|---|---|---|
+| `DeepSeek` | `deepseek-v4-pro[1m]` | `deepseek-flash[1m]` |
+| `Z.ai` | `glm-5.3[1m]` | `glm-5.3-flash[1m]` |
+| `MiniMax` | `MiniMax-M3[1m]` | `MiniMax-M3.1-Flash-Preview[1m]` |
+
+MiniMax sells its fast model on the M Plan only, so on a pay-as-you-go key re-point `sonnet` and `haiku`. `OpenRouter` serves the real Claude models, so each row takes its own family's moving alias: `~anthropic/claude-opus-latest[1m]`, `~anthropic/claude-sonnet-latest[1m]`, `~anthropic/claude-haiku-latest` and `~anthropic/claude-fable-latest[1m]`, with `default` on `opus` too. The `[1m]` suffix tells Claude Code the model takes a 1M-token context. The four Alibaba ones put their one model on every row, the subagent row included, because those endpoints reject a Claude model id outright rather than serving something for it, so any row left unpinned fails on use. All eight leave the api key alone; pick the region your plan was bought in, since a key issued for one is not accepted by the other. Once a preset is stamped on, `open provider console` in the same menu opens that endpoint's own key page ([above](Configuration#where-the-keys-come-from)).
 
 `save as preset` stores the focused account's own endpoint and models under a name you type, in `~/.clauth/presets/<name>.json`:
 

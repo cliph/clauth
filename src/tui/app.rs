@@ -11769,9 +11769,10 @@ fn run_add_client_token(
 ) -> ShuntActionOutcome {
     let profile_name = ProfileName::from(profile);
     // A profile that vanished between the picker and the job refuses before
-    // any mint: the config lock is taken and dropped ahead of the state flock
-    // `add_client_token` takes (config → flock is the ranked order), so nothing
-    // is minted and the gateway never restarts for a deleted profile.
+    // any mint. The config lock is dropped before `add_client_token` takes the
+    // state flock (config → flock is the ranked order), so a profile deleted
+    // between the two still gets a token; the add's own hold does not check
+    // the roster.
     {
         let cfg = App::lock_config(&config.0);
         if cfg.find(&profile_name).is_none() {

@@ -36,7 +36,7 @@ use super::super::app::{
     parse_herdr_tag_secs, pending_require_line, removable, shunt_field_value, written_display,
 };
 use super::super::theme;
-use super::format::{fixed, middle_truncate, spinner_frame, truncate};
+use super::format::{fixed, grapheme_cells, middle_truncate, spinner_frame, truncate};
 use super::header::pulse_name_spans;
 use super::modals::danger_button;
 use super::panes::{
@@ -821,12 +821,15 @@ fn push_add(
 }
 
 /// The `CLIENT TOKENS` group's rows: one action-chip row per stored token (the
-/// profile's name, chip `remove`), the unmanaged token names after them (faint,
-/// never a walk stop) or the `tokens  not read` / `other clients  not read` /
-/// `<variable>  not parsed` faint line (a read failure's sentence wrapped on a
-/// `└` line under the first two), then `+ add token` (a walk stop). The stored
-/// rows and `+ add token` derive from [`config_field_stops`] — the same row
-/// model the focus walk builds its stops from.
+/// profile's name budgeted in display cells so its chip `remove` stays whole),
+/// the unmanaged token names after them (faint, never a walk stop) or the
+/// `tokens  not read` / `other clients  not read` / `<variable>  not parsed`
+/// faint line (a read failure's sentence wrapped on a `└` line under the first
+/// two), then `+ add token` (a walk stop). A name whose budget beside its
+/// chip / source word / `not parsed` falls under 4 cells drops that trailer to
+/// its own line under the caret gutter. The stored rows and `+ add token`
+/// derive from [`config_field_stops`] — the same row model the focus walk
+/// builds its stops from.
 fn push_token_rows(rows: &mut ConfigRows<'_>, app: &App, width: usize) {
     let tokens = &app.services.shunt_tokens;
     if let Some(reason) = &tokens.error {
@@ -859,21 +862,26 @@ fn push_token_rows(rows: &mut ConfigRows<'_>, app: &App, width: usize) {
             ));
         } else {
             for (name, source) in &tokens.unmanaged {
-                rows.lines.push(Line::from(vec![
+                let word = source.word();
+                rows.lines.extend(name_trailer_lines(
                     Span::styled("  ", Style::default()),
-                    Span::styled(escape_control(name).to_string(), theme::faint()),
-                    Span::styled("  ", Style::default()),
-                    Span::styled(source.word(), theme::dim()),
-                ]));
+                    &escape_control(name),
+                    theme::faint(),
+                    Span::styled(word, theme::dim()),
+                    Span::raw(word).width(),
+                    width,
+                ));
             }
             if let Some((variable, _)) = &tokens.unparsed {
-                rows.lines.push(Line::from(vec![
+                let not_parsed_label = "not parsed";
+                rows.lines.extend(name_trailer_lines(
                     Span::raw("  "),
-                    Span::styled(
-                        format!("{}  not parsed", escape_control(variable)),
-                        theme::faint(),
-                    ),
-                ]));
+                    &escape_control(variable),
+                    theme::faint(),
+                    Span::styled(not_parsed_label, theme::faint()),
+                    Span::raw(not_parsed_label).width(),
+                    width,
+                ));
             }
         }
     }
@@ -882,12 +890,53 @@ fn push_token_rows(rows: &mut ConfigRows<'_>, app: &App, width: usize) {
     rows.stop_rendered.push(add_start);
 }
 
+/// One `name` + trailer row with the name budgeted in display cells so the
+/// trailer stays whole: the name truncates to `width - CARET_GUTTER - 2 -
+/// trailer_cells` cells, and when that budget falls under 4 cells the trailer
+/// drops to its own line under the caret gutter (the Fallback `remove` arm's
+/// shape). A row drops when its own trailer leaves its name under 4 cells, so
+/// at one width a narrow-trailer row can stay inline while a wider-trailer row
+/// drops. `lead` is the 2-cell caret slot (`❯ ` / spinner / `✓ ` / blank),
+/// `trailer` the styled trailer; the caller passes its budget width so a state
+/// swap between two same-width trailers never reflows the row.
+fn name_trailer_lines(
+    lead: Span<'static>,
+    name: &str,
+    name_style: Style,
+    trailer: Span<'static>,
+    trailer_cells: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let budget = width.saturating_sub(CARET_GUTTER + 2 + trailer_cells);
+    if budget >= 4 {
+        return vec![Line::from(vec![
+            lead,
+            Span::styled(truncate(name, budget), name_style),
+            Span::raw("  "),
+            trailer,
+        ])];
+    }
+    vec![
+        Line::from(vec![
+            lead,
+            Span::styled(
+                truncate(name, width.saturating_sub(CARET_GUTTER)),
+                name_style,
+            ),
+        ]),
+        Line::from(vec![Span::raw("  "), trailer]),
+    ]
+}
+
 /// One stored token's action-chip row: the caret gutter, the profile name (the
-/// label), then the `remove` chip — `DANGER` blurred, a `DANGER` inverse block
-/// focused, the spinner in the caret slot and a dim `checking` trail while its
-/// remove checks. A refusal (the last-token guard) renders on the `└` line
-/// under it. The label stays `TEXT_DIM` even focused; the caret and the chip
-/// carry focus alone (no `BG_HOVER` row tint).
+/// label, budgeted in display cells), then the `remove` chip — `DANGER` blurred,
+/// a `DANGER` inverse block focused, the spinner in the caret slot and a dim
+/// `checking` trail while its remove checks. A name whose budget beside the
+/// chip falls under 4 cells drops the chip to its own line under the caret
+/// gutter (the focused render keeps the same two lines, replacing by index). A
+/// refusal (the last-token guard) renders on the `└` line under it. The label
+/// stays `TEXT_DIM` even focused; the caret and the chip carry focus alone (no
+/// `BG_HOVER` row tint).
 fn token_row_lines(name: &str, selected: bool, app: &App, width: usize) -> Vec<Line<'static>> {
     let saving = app.services.saving(&ShuntSaveKey::Token(name.to_string()));
     let ok = app.services.shunt_ok.as_ref().is_some_and(|(k, at)| {
@@ -906,17 +955,26 @@ fn token_row_lines(name: &str, selected: bool, app: &App, width: usize) -> Vec<L
     } else {
         Span::styled("  ", Style::default())
     };
-    let mut spans = vec![
-        caret,
-        Span::styled(escape_control(name).to_string(), theme::dim()),
-        Span::raw("  "),
-    ];
-    if saving {
-        spans.push(Span::styled("checking", theme::dim()));
+    let remove_label = " remove ";
+    let checking_label = "checking";
+    let trailer = if saving {
+        Span::styled(checking_label, theme::dim())
     } else {
-        spans.push(danger_button(" remove ", selected));
-    }
-    let mut rows = vec![Line::from(spans)];
+        danger_button(remove_label, selected)
+    };
+    // The chip and the `checking` trail are both 8 cells today; budget the name
+    // on the wider so a save starting never reflows the row.
+    let trailer_cells = Span::raw(remove_label)
+        .width()
+        .max(Span::raw(checking_label).width());
+    let mut rows = name_trailer_lines(
+        caret,
+        &escape_control(name),
+        theme::dim(),
+        trailer,
+        trailer_cells,
+        width,
+    );
     if let Some((profile, sentence)) = app.services.shunt_token_refusal.borrow().as_ref()
         && profile == name
     {
@@ -1535,16 +1593,19 @@ fn field_row_lines(
 
     // A typed field at rest. The bind row's read-only suffix trails the value.
     let mut spans = lead();
-    spans.extend(field_text_spans(value.as_deref(), room, None));
+    let value_spans = field_text_spans(value.as_deref(), room, None);
+    let value_width = value_spans
+        .iter()
+        .map(|s| grapheme_cells(&s.content))
+        .sum::<usize>();
+    spans.extend(value_spans);
     if key == &ShuntFieldKey::Bind
         && let Some(suffix) = bind_suffix(&view.server)
     {
-        let value_width = value
-            .as_deref()
-            .map(|v| v.chars().count().min(room))
-            .unwrap_or(1);
         let suffix_room = room.saturating_sub(value_width + 2);
-        if suffix_room > 0 {
+        // Under 4 cells the suffix would show at most two letters and `…`,
+        // which names nothing; hide it instead.
+        if suffix_room >= 4 {
             spans.push(Span::styled("  ", theme::dim()));
             spans.push(Span::styled(truncate(&suffix, suffix_room), theme::dim()));
         }

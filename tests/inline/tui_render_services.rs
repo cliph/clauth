@@ -4878,18 +4878,26 @@ fn base_view() -> ConfigView {
 
 /// An app whose shunt card is the full slot plus `view` as its config section.
 fn config_view_app(view: ConfigView, expanded: std::collections::HashSet<ShuntEntryKey>) -> App {
+    config_view_app_with_tokens(view, expanded, crate::tui::app::ShuntTokens::default())
+}
+
+/// [`config_view_app`] whose `CLIENT TOKENS` group holds `tokens`, its stops
+/// built from the same tokens the render reads.
+fn config_view_app_with_tokens(
+    view: ConfigView,
+    expanded: std::collections::HashSet<ShuntEntryKey>,
+    tokens: crate::tui::app::ShuntTokens,
+) -> App {
     let mut card = crate::tui::app::shunt_check(&shunt_slot_full(), true, None);
     let drafts = crate::tui::app::ShuntDrafts::default();
     card.shunt_focus.extend(crate::tui::app::config_field_stops(
-        &view,
-        &expanded,
-        &drafts,
-        &crate::tui::app::ShuntTokens::default(),
+        &view, &expanded, &drafts, &tokens,
     ));
     let mut app = app_with(card);
     app.services.shunt_config = Some(ShuntConfigRead::Ok(Box::new(view)));
     app.services.shunt_expanded = expanded;
     app.services.shunt_drafts = drafts;
+    app.services.shunt_tokens = tokens;
     app
 }
 
@@ -7950,4 +7958,343 @@ fn a_delegate_with_a_wide_name_keeps_it_whole() {
 fn a_stays_action_keeps_a_cjk_reason_whole() {
     let spans = super::shunt_action_spans("stays  /home/u/repos/app  日本語", 30);
     assert_eq!(spans[3].content, "日本語");
+}
+
+// ── E5 width: the token rows budget their names in display cells ───────────
+
+/// The `CLIENT TOKENS` group's content rows on the single-pane (stacked)
+/// layout at terminal `width`: from the eyebrow through `+ add token`, each
+/// row's border and one-cell pane padding dropped, trailing blanks trimmed.
+/// The content width is `width - 4` (two borders, two padding cells).
+fn stacked_token_rows(app: &App, width: u16) -> Vec<String> {
+    let mut term = Terminal::new(TestBackend::new(width, 60)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+    let rows: Vec<String> = crate::testutil::buffer_rows(term.backend().buffer())
+        .into_iter()
+        .map(|r| {
+            let r = r.strip_prefix('│').unwrap_or(&r);
+            let r = r.strip_suffix('│').unwrap_or(r);
+            let r = r.strip_prefix(' ').unwrap_or(r);
+            r.trim_end().to_string()
+        })
+        .collect();
+    let start = rows
+        .iter()
+        .position(|r| r == "CLIENT TOKENS")
+        .unwrap_or_else(|| panic!("the CLIENT TOKENS group:\n{}", rows.join("\n")));
+    let end = rows[start..]
+        .iter()
+        .position(|r| r.contains("+ add token"))
+        .unwrap_or_else(|| panic!("the + add token row:\n{}", rows.join("\n")));
+    rows[start..=start + end].to_vec()
+}
+
+fn tokens_app(tokens: crate::tui::app::ShuntTokens) -> App {
+    config_view_app_with_tokens(base_view(), std::collections::HashSet::new(), tokens)
+}
+
+/// At the 34-column floor (content 30 cells) a stored token's name keeps 18
+/// cells (30 less the caret gutter, the two-space gap and the 8-cell chip) and
+/// ends in `…` past them, so the ` remove ` chip renders whole; a CJK name
+/// budgets two cells per glyph, never one per char.
+#[test]
+fn a_long_token_name_clamps_by_cells_and_keeps_the_remove_chip_whole() {
+    use crate::tui::app::ShuntTokens;
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = tokens_app(ShuntTokens {
+        stored: vec![
+            "first.last@company.example".into(),
+            "日本語のプロファイル名前".into(),
+            "bob".into(),
+        ],
+        ..ShuntTokens::default()
+    });
+    assert_eq!(
+        stacked_token_rows(&app, 34),
+        vec![
+            "CLIENT TOKENS",
+            "  first.last@compan…   remove",
+            "  日 本 語 の プ ロ フ ァ …   remove",
+            "  bob   remove",
+            "  + add token",
+        ]
+    );
+}
+
+/// The env file's and the daemon env's client names clamp the same way, each
+/// keeping room for its source word (`env file` 8 cells, `daemon env` 10).
+#[test]
+fn a_long_unmanaged_client_name_clamps_by_cells_and_keeps_its_source_word() {
+    use crate::tui::app::{ShuntTokenSource, ShuntTokens};
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = tokens_app(ShuntTokens {
+        unmanaged: vec![
+            (
+                "another.client@company.example".into(),
+                ShuntTokenSource::EnvFile,
+            ),
+            (
+                "daemon-client-with-a-long-name".into(),
+                ShuntTokenSource::DaemonEnv,
+            ),
+        ],
+        ..ShuntTokens::default()
+    });
+    assert_eq!(
+        stacked_token_rows(&app, 34),
+        vec![
+            "CLIENT TOKENS",
+            "  another.client@co…  env file",
+            "  daemon-client-w…  daemon env",
+            "  + add token",
+        ]
+    );
+}
+
+/// An unparsed variable's name clamps so `not parsed` stays whole.
+#[test]
+fn a_long_unparsed_variable_clamps_by_cells_and_keeps_not_parsed() {
+    use crate::tui::app::{ShuntTokenSource, ShuntTokens};
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = tokens_app(ShuntTokens {
+        unparsed: Some((
+            "SHUNT_CLIENT_TOKENS_FOR_A_LONG_VARIABLE".into(),
+            ShuntTokenSource::EnvFile,
+        )),
+        ..ShuntTokens::default()
+    });
+    assert_eq!(
+        stacked_token_rows(&app, 34),
+        vec![
+            "CLIENT TOKENS",
+            "  SHUNT_CLIENT_TO…  not parsed",
+            "  + add token",
+        ]
+    );
+}
+
+/// Below the floor, at 18 columns (content 14 cells), the name budget beside
+/// the chip falls under 4 cells: the name takes the row past the caret gutter
+/// (12 cells, `…` past them) and the chip, source word or `not parsed` drops
+/// to its own line under the gutter, whatever the name's own length.
+#[test]
+fn a_name_budget_under_four_cells_drops_the_chip_to_its_own_line() {
+    use crate::tui::app::{ShuntTokenSource, ShuntTokens};
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = tokens_app(ShuntTokens {
+        stored: vec!["first.last@company.example".into(), "bob".into()],
+        unmanaged: vec![(
+            "another.client@company.example".into(),
+            ShuntTokenSource::EnvFile,
+        )],
+        ..ShuntTokens::default()
+    });
+    assert_eq!(
+        stacked_token_rows(&app, 18),
+        vec![
+            "CLIENT TOKENS",
+            "  first.last@…",
+            "   remove",
+            "  bob",
+            "   remove",
+            "  another.cli…",
+            "  env file",
+            "  + add token",
+        ]
+    );
+    let app = tokens_app(ShuntTokens {
+        unparsed: Some(("SHUNT_CLIENT_TOKENS".into(), ShuntTokenSource::EnvFile)),
+        ..ShuntTokens::default()
+    });
+    assert_eq!(
+        stacked_token_rows(&app, 18),
+        vec![
+            "CLIENT TOKENS",
+            "  SHUNT_CLIEN…",
+            "  not parsed",
+            "  + add token",
+        ]
+    );
+}
+
+/// The focused token row in the dropped shape keeps both its lines in place:
+/// the caret on the name line, the chip on the next, and the rows after it
+/// where the blurred render put them (the focused render replaces lines by
+/// index, so a line count that changed with focus would overwrite a neighbour).
+#[test]
+fn a_focused_dropped_token_row_keeps_its_line_count() {
+    use crate::tui::app::{ServicesFocus, ShuntFocusLine, ShuntTokens};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = tokens_app(ShuntTokens {
+        stored: vec!["first.last@company.example".into(), "bob".into()],
+        ..ShuntTokens::default()
+    });
+    stacked_token_rows(&app, 18);
+    app.services.focus = ServicesFocus::Detail;
+    app.services.set_shunt_focus(Some(ShuntFocusLine::Token(
+        "first.last@company.example".into(),
+    )));
+    assert_eq!(
+        stacked_token_rows(&app, 18),
+        vec![
+            "CLIENT TOKENS",
+            "❯ first.last@…",
+            "   remove",
+            "  bob",
+            "   remove",
+            "  + add token",
+        ]
+    );
+}
+
+/// The read-only bind row budgets its trailing `set by …` suffix against the
+/// value's display cells: a CJK value (8 two-cell glyphs + `:3001`, 21 cells,
+/// 13 chars) leaves the suffix 9 cells of the 32-cell value room, so it ends
+/// in `…` inside the pane instead of running off its edge.
+#[test]
+fn the_bind_suffix_budgets_a_wide_value_by_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.server.bind = Some(w("日本語のホスト名:3001"));
+    view.server.bind_override = BindOverride::Set("SHUNT_SERVER__BIND".to_string());
+    let rows = render_config_section(view, std::collections::HashSet::new(), 80);
+    assert_eq!(
+        rows[1],
+        "  bind              日 本 語 の ホ ス ト 名 :3001  set by S…",
+        "the bind row:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// The drop threshold itself: at 20 columns (content 16) a token's budget is
+/// exactly 4 cells and stays inline, as does an `env file` name (budget 4),
+/// while a `daemon env` name (budget 2) drops; at 19 columns (content 15)
+/// every budget is under 4 and every trailer drops. Each row drops on its own
+/// trailer's width.
+#[test]
+fn the_drop_threshold_is_a_budget_of_four_cells() {
+    use crate::tui::app::{ShuntTokenSource, ShuntTokens};
+    let _home = crate::testutil::HomeSandbox::new();
+    let tokens = || ShuntTokens {
+        stored: vec!["bob".into()],
+        unmanaged: vec![
+            ("ef".into(), ShuntTokenSource::EnvFile),
+            ("dc".into(), ShuntTokenSource::DaemonEnv),
+        ],
+        ..ShuntTokens::default()
+    };
+    assert_eq!(
+        stacked_token_rows(&tokens_app(tokens()), 20),
+        vec![
+            "CLIENT TOKENS",
+            "  bob   remove",
+            "  ef  env file",
+            "  dc",
+            "  daemon env",
+            "  + add token",
+        ]
+    );
+    assert_eq!(
+        stacked_token_rows(&tokens_app(tokens()), 19),
+        vec![
+            "CLIENT TOKENS",
+            "  bob",
+            "   remove",
+            "  ef",
+            "  env file",
+            "  dc",
+            "  daemon env",
+            "  + add token",
+        ]
+    );
+}
+
+/// The focused token row's dropped chip line carries the focused chip: its
+/// `remove` cells sit on the `DANGER` inverse fill, while a blurred token's
+/// dropped chip does not.
+#[test]
+fn a_focused_dropped_chip_renders_as_the_focused_inverse_block() {
+    use crate::tui::app::{ServicesFocus, ShuntFocusLine, ShuntTokens};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = tokens_app(ShuntTokens {
+        stored: vec!["alice".into(), "bob".into()],
+        ..ShuntTokens::default()
+    });
+    stacked_token_rows(&app, 18);
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Token("alice".into())));
+    let mut term = Terminal::new(TestBackend::new(18, 60)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let buffer = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buffer);
+    let caret = rows
+        .iter()
+        .position(|r| r.contains("❯ alice"))
+        .unwrap_or_else(|| panic!("the focused alice row:\n{}", rows.join("\n")));
+    let bob = rows
+        .iter()
+        .position(|r| r.contains("  bob"))
+        .unwrap_or_else(|| panic!("the bob row:\n{}", rows.join("\n")));
+    // The chip's `remove` letters on the line under each name.
+    let chip_bgs = |y: usize| -> Vec<ratatui::style::Color> {
+        let text = &rows[y];
+        let start = text.find("remove").expect("a remove chip");
+        let x0 = text[..start].chars().count() as u16;
+        (x0..x0 + 6).map(|x| buffer[(x, y as u16)].bg).collect()
+    };
+    assert!(
+        chip_bgs(caret + 1)
+            .iter()
+            .all(|bg| *bg == crate::tui::theme::danger_color()),
+        "the focused token's dropped chip is the DANGER inverse block:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        chip_bgs(bob + 1)
+            .iter()
+            .all(|bg| *bg != crate::tui::theme::danger_color()),
+        "a blurred token's dropped chip is not filled:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// The read-only bind row shows its `set by …` suffix only while at least 4
+/// cells are left for it: with 1 or 3 cells left (an ASCII value 29 or 27
+/// cells wide in the 32-cell value room at 80 columns) the row ends at the
+/// value, never on a lone `…`; with 4 left it reads `set…`.
+#[test]
+fn the_bind_suffix_shows_only_with_four_cells_left() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for (value_w, suffix) in [(29usize, ""), (27, ""), (26, "  set…")] {
+        let value = format!("{}:1", "h".repeat(value_w - 2));
+        let mut view = base_view();
+        view.server.bind = Some(w(&value));
+        view.server.bind_override = BindOverride::Set("SHUNT_SERVER__BIND".to_string());
+        let rows = render_config_section(view, std::collections::HashSet::new(), 80);
+        assert_eq!(
+            rows[1],
+            format!("  bind              {value}{suffix}"),
+            "a {value_w}-cell value"
+        );
+    }
+}
+
+/// The bind suffix budget counts what the buffer draws: a lam-alef pair is
+/// one glyph to a whole-string width but two cells in the buffer, so a value of
+/// four pairs + `:1` (10 cells) leaves the suffix 20 of the 32-cell room and it
+/// ends in `…` inside the pane.
+#[test]
+fn the_bind_suffix_budgets_a_lam_alef_value_by_drawn_cells() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut view = base_view();
+    view.server.bind = Some(w(&format!("{}:1", "لا".repeat(4))));
+    view.server.bind_override = BindOverride::Set("SHUNT_SERVER__BIND".to_string());
+    let rows = render_config_section(view, std::collections::HashSet::new(), 80);
+    assert_eq!(
+        rows[1],
+        "  bind              لالالالا:1  set by SHUNT_SERVER…",
+        "the bind row:\n{}",
+        rows.join("\n")
+    );
 }

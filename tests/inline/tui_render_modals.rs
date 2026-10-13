@@ -2441,9 +2441,10 @@ fn the_action_menu_sizes_its_width_by_cells() {
     );
 }
 
-/// The action menu's title budget measures the scope name by cells, so a CJK
-/// account name fits whole in the border break instead of being cut by a
-/// char-derived width (F16). Pinned whole-row at every width.
+/// The action menu's title measures the scope name by cells and follows the
+/// panel meta rule: the name shows only while it leaves a 3-dash rule after
+/// ` ACTIONS `, else it drops whole, and a modal narrower than its own title
+/// ends the title in `…` inside the border.
 #[test]
 fn the_action_menu_sizes_its_title_by_cells() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -2455,10 +2456,13 @@ fn the_action_menu_sizes_its_title_by_cells() {
         )],
     );
     let want: &[(u16, &str)] = &[
-        (27, "╭jk-日 本 語 ア カ ウ ン ト  ─╮"),
-        (28, "╭cjk-日 本 語 ア カ ウ ン ト  ─╮"),
-        (34, "╭─ ACT cjk-日 本 語 ア カ ウ ン ト  ─╮"),
-        (45, "╭─ ACTIONS cjk-日 本 語 ア カ ウ ン ト  ─╮"),
+        (14, "╭─ ACTI… ╮"),
+        (27, "╭─ ACTIONS ───────────╮"),
+        (28, "╭─ ACTIONS ────────────╮"),
+        (34, "╭─ ACTIONS ──────────────────╮"),
+        (41, "╭─ ACTIONS ─────────────────────────╮"),
+        (42, "╭─ ACTIONS ─── cjk-日 本 語 ア カ ウ ン ト  ─╮"),
+        (45, "╭─ ACTIONS ─── cjk-日 本 語 ア カ ウ ン ト  ─╮"),
     ];
     for (w, expected) in want {
         let (rows, left, right) = render_action_menu(&app, *w, 20);
@@ -2499,9 +2503,44 @@ fn the_action_menu_title_desktop_rows_replace_the_pre_s9_clip() {
             .take(right - left + 1)
             .collect();
         assert_eq!(
-            title, "╭─ ACTIONS cjk-日 本 語 ア カ ウ ン ト  ─╮",
+            title, "╭─ ACTIONS ─── cjk-日 本 語 ア カ ウ ン ト  ─╮",
             "action-menu title at {w} cols"
         );
+    }
+}
+
+/// A 30-char ASCII account name (an email passes `validate_name_chars`) drops
+/// from the action menu's title rather than cutting ` ACTIONS `, through the
+/// width that would leave it a 2-dash rule, and shows whole behind a 3-dash
+/// rule once the terminal has room.
+#[test]
+fn the_action_menu_drops_a_name_that_leaves_no_rule() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = app_on(
+        Tab::Overview,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("a.thirty.char.name@example.org"),
+        )],
+    );
+    let want: &[(u16, &str)] = &[
+        (34, "╭─ ACTIONS ──────────────────╮"),
+        (51, "╭─ ACTIONS ───────────────────────────────────╮"),
+        (52, "╭─ ACTIONS ─── a.thirty.char.name@example.org ─╮"),
+        (80, "╭─ ACTIONS ─── a.thirty.char.name@example.org ─╮"),
+    ];
+    for (w, expected) in want {
+        let (rows, left, right) = render_action_menu(&app, *w, 20);
+        let top = rows
+            .iter()
+            .position(|r| r.contains('\u{256d}'))
+            .expect("the action menu's top border");
+        let title: String = rows[top]
+            .chars()
+            .skip(left)
+            .take(right - left + 1)
+            .collect();
+        assert_eq!(title, *expected, "action-menu title at {w} cols");
     }
 }
 
@@ -2618,5 +2657,36 @@ fn the_check_output_modal_ascii_body_renders_unchanged() {
         term.draw(|fr| crate::tui::render::draw(fr, &app)).unwrap();
         let got = check_output_body_rows(&term);
         assert_eq!(got, *expected, "check output ascii body at {w} cols");
+    }
+}
+
+/// A scrolled modal fits its title like a panel does: a short body leaves the
+/// modal sized by its title, which renders whole with both insets, and a modal
+/// narrower than its title ends the title in `…` inside the border.
+#[test]
+fn a_scrolled_modal_fits_its_title_by_cells() {
+    use crate::tui::app::{Modal, Tab};
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    for (w, expected) in [(80u16, "╭─ CHECK OUTPUT ╮"), (14, "╭─ CHEC… ╮")] {
+        let mut app = empty_app(Tab::Services);
+        app.open_modal(Modal::CheckOutput("exit 1".to_string()));
+        let mut term = Terminal::new(TestBackend::new(w, 12)).unwrap();
+        term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        let top = rows
+            .iter()
+            .find(|r| r.contains('\u{256d}') && r.contains("CHEC"))
+            .expect("the check output modal's top border");
+        let start = top.find("\u{256d}─ CHEC").expect("the modal's left corner");
+        let end = start
+            + top[start..]
+                .find('\u{256e}')
+                .expect("the modal's right corner");
+        assert_eq!(
+            &top[start..end + '\u{256e}'.len_utf8()],
+            expected,
+            "check output title at {w} cols"
+        );
     }
 }

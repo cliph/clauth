@@ -21,8 +21,9 @@ use super::format::{spinner_frame, truncate};
 use super::overview::switch_mark;
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KEY_REJECTED,
-    DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, bold_when, draw_scrollbar,
-    draw_scrolled_lines, follow_scroll_offset, head_cols, key_cell, meta_line,
+    DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, META_RULE_MIN, bold_when,
+    draw_scrollbar, draw_scrolled_lines, follow_scroll_offset, head_cols, key_cell, meta_line,
+    right_meta_fits, title_label,
 };
 use super::prose::{self, cmd_lit, key_lit};
 use crate::fallback::BlockedReason;
@@ -270,7 +271,7 @@ fn draw_modal_scrolled(
         _ => 0,
     };
     let w = (content_w.max(button_w) + 6)
-        .max(title.chars().count() as u16 + 4)
+        .max(modal_title_w(title))
         .min(area.width.saturating_sub(4));
     let inner_w = (w.saturating_sub(6) as usize).max(1);
     let line_count = lines.len();
@@ -315,7 +316,7 @@ fn draw_modal_scrolled(
 
     let rect = centered(area, w, h);
     frame.render_widget(Clear, rect);
-    let block = modal_block(title);
+    let block = modal_block(title, rect.width);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -455,15 +456,19 @@ fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
 
 /// Rounded `ACCENT_2` border, uppercase italic dim title, base `BG` fill.
 /// The title opens with the corner-adjacent border dash (`╭─ TITLE`), the
-/// same chrome rule the panel family follows.
-fn modal_block(title: impl Into<String>) -> Block<'static> {
+/// same chrome rule the panel family follows, and fits a `width`-cell modal
+/// the way a panel title does.
+fn modal_block(title: &str, width: u16) -> Block<'static> {
+    let label = title_label(title, true, width);
+    let text = label
+        .strip_prefix(' ')
+        .and_then(|label| label.strip_suffix(' '))
+        .unwrap_or(&label)
+        .to_string();
     let title_line = Line::from(vec![
         Span::styled("─", Style::default().fg(theme::accent_2_color())),
         Span::raw(" "),
-        Span::styled(
-            title.into().to_uppercase(),
-            Style::default().fg(theme::text_dim_color()).italic(),
-        ),
+        Span::styled(text, Style::default().fg(theme::text_dim_color()).italic()),
         Span::raw(" "),
     ]);
     Block::bordered()
@@ -474,13 +479,20 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
         .padding(Padding::new(2, 2, 1, 1))
 }
 
+/// The narrowest modal that draws `title` whole: the corners, the
+/// corner-adjacent dash and the ` TITLE ` break.
+fn modal_title_w(title: &str) -> u16 {
+    Line::from(title_label(title, true, u16::MAX)).width() as u16 + 3
+}
+
 /// [`modal_block`] plus the contract's title-right meta slot, for a modal whose
 /// contents are scoped to one named thing. The name keeps its own case (it is a
 /// proper noun, not a structural label) and stays `TEXT_DIM` — it is data about
-/// the modal, so it takes neither the title's italic nor any bold.
-fn modal_block_with_meta(title: &str, meta: Option<&str>) -> Block<'static> {
-    let block = modal_block(title);
-    match meta {
+/// the modal, so it takes neither the title's italic nor any bold. The name
+/// gives way, like a panel's meta slot, when it would leave no rule.
+fn modal_block_with_meta(title: &str, meta: Option<&str>, width: u16) -> Block<'static> {
+    let block = modal_block(title, width);
+    match meta.filter(|meta| right_meta_fits(title, 0, meta, width)) {
         // The name closes with a border cell of its own (`… name ─╮`), the
         // border token matching the modal's orange border.
         Some(meta) => block.title(meta_line(
@@ -951,7 +963,7 @@ fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, input: &InputState) {
     let title = "CAPTURE";
     let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
     let w = (content_w + 6)
-        .max(title.chars().count() as u16 + 4)
+        .max(modal_title_w(title))
         .min(area.width.saturating_sub(4));
     let h = (lines.len() as u16 + 4).min(area.height.saturating_sub(4));
     // Same geometry as draw_modal so the cursor lands inside the block it draws.
@@ -981,7 +993,7 @@ fn draw_name_prompt(frame: &mut Frame<'_>, area: Rect, form: &NamePromptForm) {
     let title = form.action.title();
     let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
     let w = (content_w + 6)
-        .max(title.chars().count() as u16 + 4)
+        .max(modal_title_w(title))
         .min(area.width.saturating_sub(4));
     let h = (lines.len() as u16 + 4).min(area.height.saturating_sub(4));
     let rect = centered(area, w, h);
@@ -1545,16 +1557,13 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
         .unwrap_or(0) as u16;
     let content_w = GUTTER + max_label_w + 3 + HOTKEY_W;
     let title = "actions";
-    // Both border breaks have to fit: ` ACTIONS ` on the left, ` <account> ` on
-    // the right, 2 corners and at least one dash of chrome between them.
-    let title_w = title.chars().count() as u16
-        + 2
-        + state
-            .context
-            .as_ref()
-            .map_or(0, |c| Span::raw(c).width() as u16 + 2);
+    // Grow to fit both border breaks, ` ACTIONS ` and ` <account> ─` with the
+    // meta rule between them; a terminal too narrow for that drops the name.
+    let meta_w = state.context.as_ref().map_or(0, |c| {
+        META_RULE_MIN + meta_line(c, Style::default()).width()
+    });
     let w = (content_w + 6)
-        .max(title_w + 3)
+        .max(modal_title_w(title) + meta_w as u16)
         .min(area.width.saturating_sub(4));
     // items rows + the rule + 4 chrome (border + padding)
     let h = (state.items.len() as u16 + u16::from(rule_at.is_some()) + 4)
@@ -1562,7 +1571,7 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
 
     let rect = centered(area, w, h);
     frame.render_widget(Clear, rect);
-    let block = modal_block_with_meta(title, state.context.as_deref());
+    let block = modal_block_with_meta(title, state.context.as_deref(), rect.width);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 

@@ -967,7 +967,21 @@ pub(super) fn section_box_verbatim(
 
 /// Border cells of rule a title must keep before the meta slot may render: a
 /// single dash between the two reads as part of the title's own rule run.
-const META_RULE_MIN: usize = 3;
+pub(super) const META_RULE_MIN: usize = 3;
+
+/// Whether a title-right `meta` fits a `width`-cell top border beside the
+/// title (and a `left_w`-cell left slot) with [`META_RULE_MIN`] cells of rule
+/// between them; the title names the box and the meta only describes it, so
+/// the meta is what gives way.
+pub(super) fn right_meta_fits(title: &str, left_w: usize, meta: &str, width: u16) -> bool {
+    // `╭─` + ` TITLE ` + left + rule + ` meta ─` + `╮`: the corner-adjacent dash
+    // is a border cell of its own.
+    let insets = 3
+        + Line::from(title_label(title, true, u16::MAX)).width()
+        + left_w
+        + meta_line(meta, Style::default()).width();
+    !meta.is_empty() && usize::from(width).saturating_sub(insets) >= META_RULE_MIN
+}
 
 /// [`section_box`] with two meta slots: `left` as a title of its own one
 /// border cell after the title (`╭─ TITLE ─ left ───`), `meta` in the border
@@ -994,18 +1008,12 @@ pub(super) fn section_box_meta(
     width: u16,
 ) -> Block<'static> {
     let left = left.map(|name| Line::from(Span::styled(format!(" {name} "), theme::dim())));
-    // `╭─` + ` TITLE ` + (the bare border cell + ` left `) + rule + ` meta ─` + `╮`:
-    // the corner-adjacent dash is a border cell of its own, counted here so the
-    // right slot keeps its ≥[`META_RULE_MIN`] rule cells at the compliant shape.
     // This builder keeps the title un-ellipsized: its left slot never gives way,
     // so a too-narrow row clips from the right (the left slot first) — the
-    // documented shape, not a title `…`.
-    let insets = 3
-        + Line::from(title_label(title, true, u16::MAX)).width()
-        + left.as_ref().map_or(0, |left| 1 + left.width())
-        + meta_line(meta, Style::default()).width();
-    let rule = usize::from(width).saturating_sub(insets);
-    let meta = (!meta.is_empty() && rule >= META_RULE_MIN).then_some(meta);
+    // documented shape, not a title `…`. The bare border cell before ` left `
+    // counts toward the left slot.
+    let left_w = left.as_ref().map_or(0, |left| 1 + left.width());
+    let meta = right_meta_fits(title, left_w, meta, width).then_some(meta);
     let block = section_box_impl(title, focused, first, true, Vec::new(), meta, u16::MAX);
     match left {
         Some(left) => block.title_top(left),
@@ -1111,7 +1119,7 @@ fn section_box_impl(
 /// `width - 2` area past the corner; `─` plus the two insets leave `width - 5`
 /// cells for the title itself, so a longer title ends in `…` inside the border
 /// instead of running into the corner. Byte-identical whenever the title fits.
-fn title_label(title: &str, uppercase: bool, width: u16) -> String {
+pub(super) fn title_label(title: &str, uppercase: bool, width: u16) -> String {
     let text = if uppercase {
         title.to_uppercase()
     } else {

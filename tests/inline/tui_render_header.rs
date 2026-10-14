@@ -6,90 +6,99 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use std::collections::BTreeMap;
 
-fn oauth_profile(name: &str, five_hour_pct: f64) -> Profile {
-    Profile {
-        name: name.into(),
-        base_url: None,
-        api_key: None,
-        auto_start: false,
-        env: BTreeMap::new(),
-        models: Default::default(),
-        fallback_threshold: None,
-        weekly_threshold: None,
-        last_resort: false,
-        preferred: false,
-        preferred_days: Vec::new(),
-        rolling_token: false,
-        max_auto_spend: None,
-        check_weekly: true,
-        check_scoped: true,
-        bell_threshold: None,
-        disabled: false,
-        console: None,
-        credentials: None,
-        usage: Some(UsageInfo {
+fn oauth_profile(name: &str, five_hour_pct: f64) -> (Profile, Option<UsageInfo>) {
+    (
+        Profile {
+            name: name.into(),
+            base_url: None,
+            api_key: None,
+            auto_start: false,
+            env: BTreeMap::new(),
+            models: Default::default(),
+            fallback_threshold: None,
+            weekly_threshold: None,
+            last_resort: false,
+            preferred: false,
+            preferred_days: Vec::new(),
+            rolling_token: false,
+            max_auto_spend: None,
+            check_weekly: true,
+            check_scoped: true,
+            bell_threshold: None,
+            disabled: false,
+            console: None,
+            credentials: None,
+            provider: None,
+        },
+        Some(UsageInfo {
             five_hour: Some(UsageWindow {
                 utilization: five_hour_pct,
                 resets_at: None,
             }),
             ..UsageInfo::default()
         }),
-        fetch_status: None,
-        provider: None,
-        third_party_usage: None,
-        usage_stale: false,
-    }
+    )
 }
 
-fn provider_profile(name: &str) -> Profile {
-    Profile {
-        name: name.into(),
-        base_url: Some("https://api.example.com".to_string()),
-        api_key: Some("key".to_string()),
-        auto_start: false,
-        env: BTreeMap::new(),
-        models: Default::default(),
-        fallback_threshold: None,
-        weekly_threshold: None,
-        last_resort: false,
-        preferred: false,
-        preferred_days: Vec::new(),
-        rolling_token: false,
-        max_auto_spend: None,
-        check_weekly: true,
-        check_scoped: true,
-        bell_threshold: None,
-        disabled: false,
-        console: None,
-        credentials: None,
-        usage: None,
-        fetch_status: None,
-        provider: None,
-        third_party_usage: None,
-        usage_stale: false,
-    }
+fn provider_profile(name: &str) -> (Profile, Option<UsageInfo>) {
+    (
+        Profile {
+            name: name.into(),
+            base_url: Some("https://api.example.com".to_string()),
+            api_key: Some("key".to_string()),
+            auto_start: false,
+            env: BTreeMap::new(),
+            models: Default::default(),
+            fallback_threshold: None,
+            weekly_threshold: None,
+            last_resort: false,
+            preferred: false,
+            preferred_days: Vec::new(),
+            rolling_token: false,
+            max_auto_spend: None,
+            check_weekly: true,
+            check_scoped: true,
+            bell_threshold: None,
+            disabled: false,
+            console: None,
+            credentials: None,
+            provider: None,
+        },
+        None,
+    )
 }
 
-fn app_with(profiles: Vec<Profile>, active: Option<&str>) -> App {
-    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+fn app_with(profiles: Vec<(Profile, Option<UsageInfo>)>, active: Option<&str>) -> App {
+    let names: Vec<ProfileName> = profiles.iter().map(|(p, _)| p.name.clone()).collect();
     let config = AppConfig {
         state: AppState {
             active_profile: active.map(Into::into),
             profiles: names,
             ..AppState::default()
         },
-        profiles,
+        profiles: profiles.iter().map(|(p, _)| p.clone()).collect(),
     };
-    App::new(config)
+    let app = App::new(config);
+    // Seed the OAuth store so the per-frame snapshot the header reads picks
+    // each profile's reading up.
+    let mut store = app.usage_store.lock().unwrap();
+    for (p, usage) in &profiles {
+        if let Some(info) = usage {
+            store.insert(p.name.to_string(), info.clone());
+        }
+    }
+    drop(store);
+    app
 }
 
 /// Renders only the header block (sized by `header_height`).
 fn render_header_rows(app: &App, width: u16) -> Vec<String> {
     let height = header_height(app);
     let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let readings = app.readings_snapshot();
     term.draw(|f| {
         let area = f.area();
-        super::draw(f, area, app);
+        super::draw(f, area, app, &readings);
     })
     .unwrap();
     crate::testutil::buffer_rows(term.backend().buffer())
@@ -562,7 +571,7 @@ fn the_live_chip_cells_carry_the_counter_chip_grammar() {
         let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            super::draw(f, area, &app);
+            super::draw(f, area, &app, &app.readings_snapshot());
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
@@ -690,7 +699,7 @@ fn an_unread_tally_renders_a_dash_not_a_zero() {
     let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
     term.draw(|f| {
         let area = f.area();
-        super::draw(f, area, &app);
+        super::draw(f, area, &app, &app.readings_snapshot());
     })
     .unwrap();
     let buf = term.backend().buffer().clone();
@@ -729,7 +738,7 @@ fn the_gauge_rung_cells_carry_the_chrome_and_util_roles() {
     let mut term = Terminal::new(TestBackend::new(120, height)).unwrap();
     term.draw(|f| {
         let area = f.area();
-        super::draw(f, area, &app);
+        super::draw(f, area, &app, &app.readings_snapshot());
     })
     .unwrap();
     let buf = term.backend().buffer().clone();
@@ -859,7 +868,7 @@ fn the_daemon_chip_cells_carry_the_pill_grammar() {
         let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            super::draw(f, area, &app);
+            super::draw(f, area, &app, &app.readings_snapshot());
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -965,7 +974,7 @@ fn the_shunt_chip_is_always_present_and_maps_every_state_to_its_color() {
         let mut term = Terminal::new(TestBackend::new(width, header_height(&app))).unwrap();
         term.draw(|f| {
             let area = f.area();
-            super::draw(f, area, &app);
+            super::draw(f, area, &app, &app.readings_snapshot());
         })
         .unwrap();
         let buf = term.backend().buffer();

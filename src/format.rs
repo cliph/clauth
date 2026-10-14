@@ -13,7 +13,7 @@ use chrono::{DateTime, Datelike, Local, Timelike};
 use crate::fallback::{StartBlock, StartCandidate};
 use crate::profile::Profile;
 use crate::profile_json::OauthAge;
-use crate::usage::{PlanTier, humanize_duration};
+use crate::usage::{PlanTier, UsageInfo, humanize_duration};
 
 // ── Cross-surface diagnostics ───────────────────────────────────────────────
 //
@@ -587,13 +587,11 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 /// token's `subscription_type` claim, else `None` when neither names one. A
 /// surface renders its own no-data form on `None` rather than a bare "Claude"
 /// that reads as a real plan.
-pub(crate) fn account_tier(profile: &Profile) -> Option<PlanTier> {
+pub(crate) fn account_tier(profile: &Profile, usage: Option<&UsageInfo>) -> Option<PlanTier> {
     // A fetched tier wins, but an UNCLASSIFIED one is not an answer: fall through
     // the way `profile_json::tier_label` does, or this surface reads "no data"
     // while that one shows the token's tier for the very same account.
-    let fetched = profile
-        .usage
-        .as_ref()
+    let fetched = usage
         .and_then(|u| u.plan.as_ref())
         .map(|p| p.tier.clone())
         .filter(|t| *t != PlanTier::Unknown);

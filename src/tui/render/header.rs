@@ -17,7 +17,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::{App, Health, Tab, gateway_health, live_count_text};
+use super::super::app::{App, Health, ReadingsSnapshot, Tab, gateway_health, live_count_text};
 use super::super::theme;
 use super::format::{bar_string_with_cells, fixed_split};
 use super::services::health_color;
@@ -68,14 +68,13 @@ struct ActiveGauge {
     pct: Option<f64>,
 }
 
-fn active_gauge(app: &App) -> Option<ActiveGauge> {
+fn active_gauge(app: &App, readings: &ReadingsSnapshot) -> Option<ActiveGauge> {
     let cfg = app.config();
     let name = cfg.state.active_profile.as_ref()?;
     let profile = cfg.find(name)?;
     let pct = if profile.is_oauth() {
-        profile
-            .usage
-            .as_ref()
+        readings
+            .usage_of(&profile.name)
             .and_then(|u| u.five_hour.as_ref())
             .map(|w| w.utilization.clamp(0.0, 100.0))
     } else {
@@ -214,7 +213,7 @@ pub(super) fn header_height(_app: &App) -> u16 {
 
 const CONTENT_GAP: usize = 3;
 
-pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &ReadingsSnapshot) {
     let cols: [Rect; 2] =
         Layout::horizontal([Constraint::Length(10), Constraint::Min(20)]).areas(area);
 
@@ -227,7 +226,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let gauge = if app.tab == Tab::Overview || app.compact {
         None
     } else {
-        active_gauge(app)
+        active_gauge(app, readings)
     };
 
     // ── Row 0: clauth [herdr tag] vX.Y.Z ....... [ shunt ]  [ daemon ] ─────

@@ -1411,33 +1411,6 @@ fn oauth_credentials() -> ClaudeCredentials {
     }
 }
 
-/// A third-party account's windows are its usage snapshot: `load_profile`
-/// seeds `usage` from the same derivation the walk reads, so an api-key chain
-/// member is judged without waiting for a fetch.
-#[test]
-fn load_profile_seeds_usage_from_the_third_party_cache() {
-    let _home = HomeSandbox::new();
-    let name = "zai-seed";
-    let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
-    p.base_url = Some("https://api.z.ai/api/anthropic".to_string());
-    p.api_key = Some("sk-fixture".to_string());
-    save_profile(&p).expect("save_profile");
-    crate::testutil::register_names(&[name]);
-    crate::profile_cache::write_profile_cache(
-        &crate::profile::ProfileName::from(name),
-        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-        &crate::testutil::stats_with_bars(vec![
-            crate::testutil::bar("5h", 62.0),
-            crate::testutil::bar("7d", 31.0),
-        ]),
-    );
-
-    let loaded = load_profile(&crate::profile::ProfileName::from(name)).expect("load_profile");
-    let usage = loaded.usage.expect("the derived windows seed usage");
-    assert_eq!(usage.five_hour.map(|w| w.utilization), Some(62.0));
-    assert_eq!(usage.seven_day.map(|w| w.utilization), Some(31.0));
-}
-
 /// Out-of-band per-profile thresholds are CLAMPED to the band at load, while the
 /// app-level weekly line RESETS TO DEFAULT (pinned separately by
 /// `weekly_switch_threshold_out_of_band_resets_to_default_at_load`). Two
@@ -1861,10 +1834,6 @@ fn an_env_token_profile_with_a_stored_pair_reads_usage_from_the_chain_cache() {
         !loaded.usage_cache_is_third_party(),
         "the chain feeds usage polling for an env-token account, so the \
          figures live in the OAuth cache"
-    );
-    assert!(
-        loaded.third_party_usage.is_none(),
-        "and the load seeds no third-party figures from a cache nothing writes"
     );
     assert!(
         !stored_usage_cache_is_third_party(&crate::profile::ProfileName::from(name)),
@@ -2392,11 +2361,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         disabled: false,
         console: None,
         credentials: Some(creds.clone()),
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     };
     // Goes through ConfigHandle-equivalent path: save_profile takes the state
     // flock (rank-ordered) and writes credentials.json before config.toml.

@@ -763,7 +763,7 @@ fn snap_email(
             .join(".credentials.json");
         crate::usage::mark_profile_read_stale(&store);
     }
-    profile.usage = Some(crate::usage::UsageInfo {
+    let email_usage = crate::usage::UsageInfo {
         plan: Some(crate::usage::PlanInfo {
             email: Some(crate::usage::AccountEmail {
                 address: "cloudy\u{1b}[2J@example.com".to_string(),
@@ -772,15 +772,21 @@ fn snap_email(
             ..crate::usage::PlanInfo::default()
         }),
         ..crate::usage::UsageInfo::default()
-    });
+    };
     let app = App::new(AppConfig {
         state: AppState {
-            profiles: vec![name],
+            profiles: vec![name.clone()],
             ..AppState::default()
         },
         profiles: vec![profile],
     });
-    build_snap(&app, true).email
+    // The email line's plan read comes from the per-frame snapshot, so seed
+    // the OAuth store (its source).
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), email_usage);
+    build_snap(&app, &app.readings_snapshot(), true).email
 }
 
 /// The login's own address reaches the snapshot, its control characters
@@ -1229,7 +1235,10 @@ fn snap_rolling_token_is_the_sidecar_content_not_the_config_flag() {
     )
     .expect("write mint");
     assert!(
-        !build_snap(&app_with_flag(true), true).rolling_token,
+        !{
+            let app = app_with_flag(true);
+            build_snap(&app, &app.readings_snapshot(), true).rolling_token
+        },
         "a degraded profile must render the mint it is actually on"
     );
 
@@ -1245,7 +1254,10 @@ fn snap_rolling_token_is_the_sidecar_content_not_the_config_flag() {
     )
     .expect("write rolling");
     assert!(
-        build_snap(&app_with_flag(false), true).rolling_token,
+        {
+            let app = app_with_flag(false);
+            build_snap(&app, &app.readings_snapshot(), true).rolling_token
+        },
         "what sessions actually hold outranks the flag in both directions"
     );
 }

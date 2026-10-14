@@ -106,11 +106,7 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
                 ..crate::profile::OAuthToken::default_extra()
             }),
         }),
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -230,11 +226,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
                 ..crate::profile::OAuthToken::default_extra()
             }),
         }),
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -298,11 +290,7 @@ fn profile_without_refresh_token_excluded() {
                 ..crate::profile::OAuthToken::default_extra()
             }),
         }),
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -395,11 +383,7 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
                 ..crate::profile::OAuthToken::default_extra()
             }),
         }),
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),
@@ -432,11 +416,7 @@ fn third_party_config(name: &str) -> AppConfig {
         disabled: false,
         console: None,
         credentials: None,
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     };
     let mut config = AppConfig {
         state: AppState::default(),

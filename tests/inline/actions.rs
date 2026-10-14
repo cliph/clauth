@@ -9,6 +9,7 @@ use crate::testutil::hold_rotation_lock;
 use crate::testutil::no_shunt_env;
 use crate::testutil::through_handle;
 use crate::testutil::write_codex_state;
+use std::collections::HashMap;
 
 const SWITCH_PUBLISH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -580,7 +581,8 @@ fn auto_switch_if_needed_walks_off_a_broken_active() {
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let _home = HomeSandbox::new();
 
-    let mk = |name: &str, access: &str, util: f64, resets_at: i64| {
+    let mut usage_map = HashMap::new();
+    let mut mk = |name: &str, access: &str, util: f64, resets_at: i64| {
         let mut p = Profile::new(name.to_string(), None, None);
         p.credentials = Some(crate::profile::ClaudeCredentials {
             claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -592,13 +594,16 @@ fn auto_switch_if_needed_walks_off_a_broken_active() {
                 ..crate::profile::OAuthToken::default_extra()
             }),
         });
-        p.usage = Some(UsageInfo {
-            five_hour: Some(UsageWindow {
-                utilization: util,
-                resets_at: Some(epoch_secs_to_iso(resets_at)),
-            }),
-            ..Default::default()
-        });
+        usage_map.insert(
+            name.to_string(),
+            UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: util,
+                    resets_at: Some(epoch_secs_to_iso(resets_at)),
+                }),
+                ..Default::default()
+            },
+        );
         crate::profile::save_profile(&p).expect("save profile");
         p
     };
@@ -631,7 +636,7 @@ fn auto_switch_if_needed_walks_off_a_broken_active() {
     };
     crate::profile::save_app_state(&config.state).expect("persist state");
 
-    let stores = one_shot_stores(&config);
+    let stores = one_shot_stores(&config, &usage_map);
     let (config, action) = through_handle(config, |h| stores.run(h, None).expect("auto switch"));
     assert_eq!(
         action,
@@ -659,13 +664,17 @@ fn auto_switch_if_needed_walks_off_a_key_rejected_active() {
     a.base_url = Some("https://api.z.ai/api/anthropic".to_string());
     a.api_key = Some("a-key".to_string());
     a.provider = Provider::from_base_url(a.base_url.as_deref().unwrap());
-    a.usage = Some(UsageInfo {
-        five_hour: Some(UsageWindow {
-            utilization: 100.0,
-            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() - 3600)),
-        }),
-        ..Default::default()
-    });
+    let mut usage_map: HashMap<String, crate::usage::UsageInfo> = HashMap::new();
+    usage_map.insert(
+        "a".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 100.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() - 3600)),
+            }),
+            ..Default::default()
+        },
+    );
     let fp = crate::usage::profile_credential_fingerprint(&a).unwrap();
     crate::profile_cache::write_auth_expired(&a.name, fp);
     crate::profile::save_profile(&a).expect("save profile");
@@ -682,13 +691,16 @@ fn auto_switch_if_needed_walks_off_a_key_rejected_active() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    b.usage = Some(UsageInfo {
-        five_hour: Some(UsageWindow {
-            utilization: 10.0,
-            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
-        }),
-        ..Default::default()
-    });
+    usage_map.insert(
+        "b".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            ..Default::default()
+        },
+    );
     crate::profile::save_profile(&b).expect("save profile");
 
     let config = AppConfig {
@@ -702,7 +714,7 @@ fn auto_switch_if_needed_walks_off_a_key_rejected_active() {
     };
     crate::profile::save_app_state(&config.state).expect("persist state");
 
-    let stores = one_shot_stores(&config);
+    let stores = one_shot_stores(&config, &usage_map);
     let (config, action) = through_handle(config, |h| stores.run(h, None).expect("auto switch"));
     assert_eq!(
         action,
@@ -731,21 +743,25 @@ fn auto_switch_if_needed_hops_off_a_scoped_blocked_active() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     };
-    let mk = |name: &str, scoped: Vec<ScopedWindow>| {
+    let mut usage_map: HashMap<String, crate::usage::UsageInfo> = HashMap::new();
+    let mut mk = |name: &str, scoped: Vec<ScopedWindow>| {
         let mut p = Profile::new(name.to_string(), None, None);
         p.credentials = Some(creds(name));
-        p.usage = Some(UsageInfo {
-            five_hour: Some(UsageWindow {
-                utilization: 10.0,
-                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
-            }),
-            seven_day: Some(UsageWindow {
-                utilization: 40.0,
-                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
-            }),
-            weekly_scoped: scoped,
-            ..Default::default()
-        });
+        usage_map.insert(
+            name.to_string(),
+            UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: 10.0,
+                    resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+                }),
+                seven_day: Some(UsageWindow {
+                    utilization: 40.0,
+                    resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
+                }),
+                weekly_scoped: scoped,
+                ..Default::default()
+            },
+        );
         crate::profile::save_profile(&p).expect("save profile");
         p
     };
@@ -781,7 +797,7 @@ fn auto_switch_if_needed_hops_off_a_scoped_blocked_active() {
     };
     crate::profile::save_app_state(&config.state).expect("persist state");
 
-    let stores = one_shot_stores(&config);
+    let stores = one_shot_stores(&config, &usage_map);
     let (config, action) = through_handle(config, |h| stores.run(h, None).expect("auto switch"));
     assert_eq!(
         action,
@@ -816,41 +832,48 @@ fn auto_switch_if_needed_does_not_hop_a_scoped_blocked_active_onto_a_canceled_me
     };
     let mut a = Profile::new("a".to_string(), None, None);
     a.credentials = Some(creds("a"));
-    a.usage = Some(UsageInfo {
-        five_hour: Some(UsageWindow {
-            utilization: 10.0,
-            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
-        }),
-        seven_day: Some(UsageWindow {
-            utilization: 40.0,
-            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
-        }),
-        weekly_scoped: vec![ScopedWindow {
-            label: "7d fable".into(),
-            window: UsageWindow {
-                utilization: 100.0,
+    let mut usage_map: HashMap<String, crate::usage::UsageInfo> = HashMap::new();
+    usage_map.insert(
+        "a".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            seven_day: Some(UsageWindow {
+                utilization: 40.0,
                 resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
-            },
-        }],
-        ..Default::default()
-    });
+            }),
+            weekly_scoped: vec![ScopedWindow {
+                label: "7d fable".into(),
+                window: UsageWindow {
+                    utilization: 100.0,
+                    resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
+                },
+            }],
+            ..Default::default()
+        },
+    );
     crate::profile::save_profile(&a).expect("save profile");
 
     let mut b = Profile::new("b".to_string(), None, None);
     b.credentials = Some(creds("b"));
-    b.usage = Some(UsageInfo {
-        five_hour: Some(UsageWindow {
-            utilization: 5.0,
-            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
-        }),
-        plan: Some(PlanInfo {
-            tier: PlanTier::Free,
-            subscription_status: Some("canceled".to_string()),
-            codex_plan: None,
-            email: None,
-        }),
-        ..Default::default()
-    });
+    usage_map.insert(
+        "b".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 5.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            plan: Some(PlanInfo {
+                tier: PlanTier::Free,
+                subscription_status: Some("canceled".to_string()),
+                codex_plan: None,
+                email: None,
+            }),
+            ..Default::default()
+        },
+    );
     crate::profile::save_profile(&b).expect("save profile");
 
     let live_path = crate::profile::claude_dir()
@@ -873,7 +896,7 @@ fn auto_switch_if_needed_does_not_hop_a_scoped_blocked_active_onto_a_canceled_me
         profiles: vec![a, b],
     };
 
-    let stores = one_shot_stores(&config);
+    let stores = one_shot_stores(&config, &usage_map);
     let (config, action) = through_handle(config, |h| stores.run(h, None).expect("auto switch"));
     assert_eq!(
         action, None,
@@ -907,20 +930,24 @@ fn auto_switch_if_needed_keeps_a_scoped_blocked_sink_parked() {
     let mut a = Profile::new("a".to_string(), None, None);
     a.credentials = Some(creds("a"));
     a.last_resort = true;
-    a.usage = Some(UsageInfo {
-        five_hour: Some(UsageWindow {
-            utilization: 10.0,
-            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
-        }),
-        weekly_scoped: vec![ScopedWindow {
-            label: "7d fable".into(),
-            window: UsageWindow {
-                utilization: 100.0,
-                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
-            },
-        }],
-        ..Default::default()
-    });
+    let mut usage_map: HashMap<String, crate::usage::UsageInfo> = HashMap::new();
+    usage_map.insert(
+        "a".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            weekly_scoped: vec![ScopedWindow {
+                label: "7d fable".into(),
+                window: UsageWindow {
+                    utilization: 100.0,
+                    resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
+                },
+            }],
+            ..Default::default()
+        },
+    );
     crate::profile::save_profile(&a).expect("save a");
     let mut b = Profile::new("b".to_string(), None, None);
     b.credentials = Some(creds("b"));
@@ -945,34 +972,42 @@ fn auto_switch_if_needed_keeps_a_scoped_blocked_sink_parked() {
         profiles: vec![a, b],
     };
 
-    let stores = one_shot_stores(&config);
+    let stores = one_shot_stores(&config, &usage_map);
     let (config, action) = through_handle(config, |h| stores.run(h, None).expect("auto switch"));
     assert_eq!(action, None, "a pinned sink stays parked");
     assert!(config.is_active(&crate::profile::ProfileName::from("a")));
 }
 
-/// The h3-probe fixture shape: third-party base_url-only profiles (no
-/// credentials, no network path), persisted through the real writers. `a` is
+/// The h3-probe fixture shape: fake-keyed third-party profiles (no network
+/// path), persisted through the real writers. `a` is
 /// the active chain head, `b` the chain's second member, `c` the explicit
 /// writer's target. `active_util`/`sibling_util` pick the decision — a clear
 /// sibling yields `To("b")`, an exhausted one under `switch_off_when_spent`
 /// yields `Off`.
-fn seed_auto_dispatch_fixture(active_util: f64, sibling_util: f64, wrap_off: bool) -> AppConfig {
+fn seed_auto_dispatch_fixture(
+    active_util: f64,
+    sibling_util: f64,
+    wrap_off: bool,
+) -> (AppConfig, HashMap<String, crate::usage::UsageInfo>) {
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
-    let mk = |name: &str, util: f64| {
+    let mut usage_map: HashMap<String, crate::usage::UsageInfo> = HashMap::new();
+    let mut mk = |name: &str, util: f64| {
         let mut p = Profile::new(
             name.to_string(),
             Some("https://api.deepseek.com".to_string()),
-            None,
+            Some("k".to_string()),
         );
         p.fallback_threshold = Some(95.0);
-        p.usage = Some(UsageInfo {
-            five_hour: Some(UsageWindow {
-                utilization: util,
-                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
-            }),
-            ..Default::default()
-        });
+        usage_map.insert(
+            name.to_string(),
+            UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: util,
+                    resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+                }),
+                ..Default::default()
+            },
+        );
         crate::profile::save_profile(&p).expect("persist profile fixture");
         p
     };
@@ -987,24 +1022,30 @@ fn seed_auto_dispatch_fixture(active_util: f64, sibling_util: f64, wrap_off: boo
         ..AppState::default()
     };
     crate::profile::save_app_state(&state).expect("persist fixture state");
-    AppConfig {
-        state,
-        profiles: vec![a, b, c],
-    }
+    (
+        AppConfig {
+            state,
+            profiles: vec![a, b, c],
+        },
+        usage_map,
+    )
 }
 
-/// The store bundle `auto_switch_if_needed` reads, seeded from the profiles'
-/// `Profile.usage` fields. A third-party-classified member takes its provider
-/// stats (one 5h bar at its 5h utilization); an OAuth member its OAuth entry.
-/// Freshness/staleness/kick verdicts stay empty: none of these tests drives a
-/// freshness preference or a kick bypass.
-fn one_shot_stores(config: &AppConfig) -> OneShotStores {
+/// The store bundle `auto_switch_if_needed` reads, seeded from a per-name
+/// usage map the test built beside its profiles. A third-party-classified
+/// member takes its provider stats (one 5h bar at its 5h utilization); an
+/// OAuth member its OAuth entry. Freshness/staleness/kick verdicts stay empty:
+/// none of these tests drives a freshness preference or a kick bypass.
+fn one_shot_stores(
+    config: &AppConfig,
+    usage: &HashMap<String, crate::usage::UsageInfo>,
+) -> OneShotStores {
     use crate::providers::{ThirdPartyStats, UsageBar};
     use std::collections::HashMap;
     let mut oauth: HashMap<String, crate::usage::UsageInfo> = HashMap::new();
     let mut third_party: HashMap<String, ThirdPartyStats> = HashMap::new();
     for p in &config.profiles {
-        let Some(usage) = p.usage.as_ref() else {
+        let Some(info) = usage.get(p.name.as_str()) else {
             continue;
         };
         if p.usage_cache_is_third_party() {
@@ -1013,7 +1054,7 @@ fn one_shot_stores(config: &AppConfig) -> OneShotStores {
                 ThirdPartyStats {
                     is_available: true,
                     rows: Vec::new(),
-                    bars: usage
+                    bars: info
                         .five_hour
                         .as_ref()
                         .map(|w| UsageBar {
@@ -1031,7 +1072,7 @@ fn one_shot_stores(config: &AppConfig) -> OneShotStores {
                 },
             );
         } else {
-            oauth.insert(p.name.to_string(), usage.clone());
+            oauth.insert(p.name.to_string(), info.clone());
         }
     }
     OneShotStores {
@@ -1095,8 +1136,8 @@ fn assert_explicit_switch_waits_out_the_auto_transaction(
 ) {
     let wrap_off = expected == crate::fallback::SwitchAction::Off;
     let sibling_util = if wrap_off { 96.0 } else { 10.0 };
-    let config = seed_auto_dispatch_fixture(96.0, sibling_util, wrap_off);
-    let stores = one_shot_stores(&config);
+    let (config, usage_map) = seed_auto_dispatch_fixture(96.0, sibling_util, wrap_off);
+    let stores = one_shot_stores(&config, &usage_map);
 
     let handle: crate::profile::ConfigHandle =
         std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
@@ -1197,16 +1238,17 @@ fn an_explicit_switch_cannot_slip_between_the_auto_off_decision_and_its_dispatch
 #[test]
 fn a_disk_only_switch_landed_after_the_decision_is_not_overwritten() {
     let _home = HomeSandbox::new();
-    let config = seed_auto_dispatch_fixture(96.0, 10.0, false);
-    let stores = one_shot_stores(&config);
+    let (config, usage_map) = seed_auto_dispatch_fixture(96.0, 10.0, false);
+    let stores = one_shot_stores(&config, &usage_map);
 
     let handle: crate::profile::ConfigHandle =
         std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
     let auto_handle = std::sync::Arc::clone(&handle);
-    let (gap_rx, gap_tx) = crate::fallback::install_auto_decision_gap();
+    let gap = crate::fallback::install_auto_decision_gap();
     let auto_worker = std::thread::spawn(move || stores.run(&auto_handle, None));
 
-    let decided = gap_rx
+    let decided = gap
+        .reached
         .recv_timeout(std::time::Duration::from_secs(30))
         .expect("the automatic actor reached the decision/hold gap");
     assert_eq!(
@@ -1218,7 +1260,7 @@ fn a_disk_only_switch_landed_after_the_decision_is_not_overwritten() {
     // in-memory config still names "a" while the on-disk marker becomes "c".
     let writer_handle = switch_handle_from_disk();
     switch_profile(&writer_handle, &"c".into()).expect("disk-only switch lands");
-    gap_tx.send(()).expect("release the automatic actor");
+    gap.release.send(()).expect("release the automatic actor");
 
     let result = auto_worker
         .join()
@@ -1237,16 +1279,17 @@ fn a_disk_only_switch_landed_after_the_decision_is_not_overwritten() {
 #[test]
 fn an_in_process_active_change_landed_after_the_decision_is_not_overwritten() {
     let _home = HomeSandbox::new();
-    let config = seed_auto_dispatch_fixture(96.0, 10.0, false);
-    let stores = one_shot_stores(&config);
+    let (config, usage_map) = seed_auto_dispatch_fixture(96.0, 10.0, false);
+    let stores = one_shot_stores(&config, &usage_map);
 
     let handle: crate::profile::ConfigHandle =
         std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
     let auto_handle = std::sync::Arc::clone(&handle);
-    let (gap_rx, gap_tx) = crate::fallback::install_auto_decision_gap();
+    let gap = crate::fallback::install_auto_decision_gap();
     let auto_worker = std::thread::spawn(move || stores.run(&auto_handle, None));
 
-    let decided = gap_rx
+    let decided = gap
+        .reached
         .recv_timeout(std::time::Duration::from_secs(30))
         .expect("the automatic actor reached the decision/hold gap");
     assert_eq!(
@@ -1260,7 +1303,7 @@ fn an_in_process_active_change_landed_after_the_decision_is_not_overwritten() {
         let mut cfg = handle.lock().expect("config mutex poisoned");
         cfg.state.active_profile = Some("c".into());
     }
-    gap_tx.send(()).expect("release the automatic actor");
+    gap.release.send(()).expect("release the automatic actor");
 
     let result = auto_worker
         .join()
@@ -1290,8 +1333,8 @@ fn an_in_process_active_change_landed_after_the_decision_is_not_overwritten() {
 #[test]
 fn auto_switch_with_headroom_yields_no_dispatch_and_leaves_an_explicit_switch_in_place() {
     let home = HomeSandbox::new();
-    let config = seed_auto_dispatch_fixture(10.0, 10.0, false);
-    let stores = one_shot_stores(&config);
+    let (config, usage_map) = seed_auto_dispatch_fixture(10.0, 10.0, false);
+    let stores = one_shot_stores(&config, &usage_map);
 
     let (_config, action) = through_handle(config, |h| stores.run(h, None).expect("auto decision"));
     assert_eq!(action, None, "a healthy active yields no decision");
@@ -2062,10 +2105,6 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
         acme.models.opus.as_deref(),
         Some("claude-opus-4"),
         "model settings preserved"
-    );
-    assert!(
-        acme.usage.is_none() && acme.fetch_status.is_none() && acme.third_party_usage.is_none(),
-        "transient fetch state cleared"
     );
 
     assert_eq!(
@@ -6250,9 +6289,6 @@ fn a_failed_endpoint_save_restores_the_in_memory_profile() {
         site: crate::profile::ConsoleSite::International,
         region: "ap-southeast-1".to_string(),
     });
-    p.third_party_usage = Some(crate::testutil::stats_with_bars(vec![
-        crate::testutil::bar("5h", 80.0),
-    ]));
     crate::profile::save_profile(&p).expect("save the profile");
     let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alice"))
         .expect("profile dir");

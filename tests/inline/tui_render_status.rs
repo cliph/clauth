@@ -23,7 +23,7 @@ fn transition_lines_keep_a_wide_name_whole() {
     assert_eq!(text, "日本語  → degraded");
 }
 
-fn oauth(name: &str, five_hour_pct: f64) -> Profile {
+fn oauth(name: &str) -> Profile {
     Profile {
         name: name.into(),
         base_url: None,
@@ -44,26 +44,17 @@ fn oauth(name: &str, five_hour_pct: f64) -> Profile {
         disabled: false,
         console: None,
         credentials: None,
-        usage: Some(UsageInfo {
-            five_hour: Some(UsageWindow {
-                utilization: five_hour_pct,
-                resets_at: None,
-            }),
-            ..UsageInfo::default()
-        }),
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     }
 }
 
 fn status_app() -> App {
-    let profiles = vec![
-        oauth("abcdefghijklmnopqrstuvwxyz", 12.0),
-        oauth("cjk-日本語アカウント", 49.0),
-        oauth("emoji-🧭⚠️-account", 63.0),
+    let five_hour = [
+        ("abcdefghijklmnopqrstuvwxyz", 12.0),
+        ("cjk-日本語アカウント", 49.0),
+        ("emoji-🧭⚠️-account", 63.0),
     ];
+    let profiles: Vec<Profile> = five_hour.iter().map(|(name, _)| oauth(name)).collect();
     let profile_names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     let mut app = App::new(AppConfig {
         state: AppState {
@@ -73,6 +64,18 @@ fn status_app() -> App {
         },
         profiles,
     });
+    for (name, pct) in five_hour {
+        app.usage_store.lock().unwrap().insert(
+            name.to_string(),
+            UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: pct,
+                    resets_at: None,
+                }),
+                ..UsageInfo::default()
+            },
+        );
+    }
     app.tab = Tab::Status;
     app.status.incidents = vec![Incident {
         id: "6ptd5skgmy3v".into(),

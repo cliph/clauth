@@ -92,6 +92,9 @@ pub(crate) struct LiveSignals<'a> {
     /// off their `kick_block.json` caches instead
     /// ([`crate::usage::switch_grade_kick_blocked_from_cache`]).
     pub(crate) queue_blocked: &'a [ProfileName],
+    /// The scheduler's OAuth usage store snapshot, for the canceled-exclusion
+    /// the queue membership rule reads (the daemon's own context).
+    pub(crate) usage: &'a HashMap<String, UsageInfo>,
     /// The gateway slot the daemon's supervisor last published. `None`
     /// single-shot or before the supervisor's first publish, where the slot
     /// reads the gateway record alone ([`super::gateway::unsupervised_slot`]).
@@ -303,7 +306,14 @@ pub(crate) fn build_profile_entries(
             (now / 1000) as i64,
         ),
     };
-    let queue_members = crate::usage::auto_start_queue_members(config, &blocked);
+    let queue_members = match live {
+        Some(l) => crate::usage::auto_start_queue_members(config, &blocked, |n| {
+            crate::fallback::is_canceled_from_usage(n, l.usage)
+        }),
+        None => crate::usage::auto_start_queue_members(config, &blocked, |n| {
+            crate::profile_json::is_canceled_cached(n)
+        }),
+    };
     let queue_anchor = match live {
         Some(l) => l.queue_anchor,
         // The anchor replays every profile's history, never just the queue

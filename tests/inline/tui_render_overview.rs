@@ -11,6 +11,20 @@ use crate::profile::{AppState, ClaudeCredentials, OAuthToken, ProfileName};
 use crate::usage::{FetchLeg, FetchStatus, UsageInfo, epoch_secs_to_iso, now_epoch_secs};
 use std::collections::BTreeMap;
 
+/// Build a `ReadingsSnapshot` seed the render helpers read, keyed by name.
+fn snap_with_usage(mut s: ReadingsSnapshot, name: &str, u: UsageInfo) -> ReadingsSnapshot {
+    s.usage.insert(name.to_string(), u);
+    s
+}
+fn snap_with_stats(
+    mut s: ReadingsSnapshot,
+    name: &str,
+    st: crate::providers::ThirdPartyStats,
+) -> ReadingsSnapshot {
+    s.third_party.insert(name.to_string(), st);
+    s
+}
+
 /// ISO reset `secs` in the future.
 fn reset_in(secs: i64) -> String {
     epoch_secs_to_iso(now_epoch_secs() + secs)
@@ -122,11 +136,11 @@ fn drain_reset_style_7d_runs_dry_first_is_warning() {
 #[test]
 fn drain_rate_covers_third_party_windows_from_avg_pace() {
     let _home = crate::testutil::HomeSandbox::new();
-    let p = third_party_profile(60.0, 30.0);
-    let config = config_with(vec![p], None, vec![]);
+    let (p, p_readings) = third_party_profile(60.0, 30.0);
+    let (config, readings) = config_with(vec![(p, p_readings)], None, vec![]);
     let app = App::new(config);
     let profile = &app.config().profiles[0];
-    let (five, seven) = overview_windows(profile);
+    let (five, seven) = overview_windows(profile, &readings);
     let five = five.expect("5h bar synthesizes a window");
     let seven = seven.expect("7d bar synthesizes a window");
 
@@ -144,6 +158,7 @@ fn drain_rate_covers_third_party_windows_from_avg_pace() {
         profile,
         LABEL_5H,
         &five,
+        &readings,
     )
     .expect("a half-elapsed 5h window yields an avg pace");
     let seven_rate = drain_rate(
@@ -152,6 +167,7 @@ fn drain_rate_covers_third_party_windows_from_avg_pace() {
         profile,
         LABEL_7D,
         &seven,
+        &readings,
     )
     .expect("a half-elapsed 7d window yields an avg pace");
     assert!(five_rate > 0.0 && seven_rate > 0.0);
@@ -178,7 +194,7 @@ fn drain_rate_covers_third_party_windows_from_avg_pace() {
     );
 }
 
-/// A SEEDED third-party 5h window — `profile.usage` filled by the mirror the
+/// A SEEDED third-party 5h window — the picked reading filled by the mirror the
 /// scheduler runs on provider-derived windows — must still rate from the
 /// window's own average pace: no third-party leg ever appends
 /// `usage_history.jsonl`, so the recency-weighted branch would resolve no rate
@@ -187,25 +203,29 @@ fn drain_rate_covers_third_party_windows_from_avg_pace() {
 #[test]
 fn drain_rate_seeded_third_party_window_keeps_avg_pace() {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut p = third_party_profile(60.0, 30.0);
-    p.usage = Some(UsageInfo {
-        five_hour: Some(crate::usage::UsageWindow {
-            utilization: 60.0,
-            resets_at: Some(reset_in(9_000)),
-        }),
-        seven_day: None,
-        ..Default::default()
-    });
-    let config = config_with(vec![p], None, vec![]);
+    let (p, mut p_readings) = third_party_profile(60.0, 30.0);
+    p_readings.usage.insert(
+        "tp".to_string(),
+        UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 60.0,
+                resets_at: Some(reset_in(9_000)),
+            }),
+            seven_day: None,
+            ..Default::default()
+        },
+    );
+    let (config, readings) = config_with(vec![(p, p_readings)], None, vec![]);
     let app = App::new(config);
     let profile = &app.config().profiles[0];
-    let w = profile.usage.as_ref().unwrap().five_hour.clone().unwrap();
+    let w = readings.usage.get("tp").unwrap().five_hour.clone().unwrap();
     let rate = drain_rate(
         &app,
         &crate::profile::ProfileName::from("tp"),
         profile,
         LABEL_5H,
         &w,
+        &readings,
     )
     .expect("the avg pace answers for a seeded third-party window");
     // 60% over the 2.5h elapsed half of a 5h window is past its 50% ideal
@@ -218,18 +238,19 @@ fn drain_rate_seeded_third_party_window_keeps_avg_pace() {
 #[test]
 fn drain_rate_oauth_five_hour_uses_recent_burn() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("a", 95.0, 60.0, 9_000);
-    let config = config_with(vec![a], None, vec![]);
+    let (a, a_readings) = profile("a", 95.0, 60.0, 9_000);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
     let app = App::new(config);
     let p = &app.config().profiles[0];
-    let w = p.usage.as_ref().unwrap().five_hour.clone().unwrap();
+    let w = readings.usage.get("a").unwrap().five_hour.clone().unwrap();
     assert!(
         drain_rate(
             &app,
             &crate::profile::ProfileName::from("a"),
             p,
             LABEL_5H,
-            &w
+            &w,
+            &readings
         )
         .is_none(),
         "no recorded history → no rate, rather than an avg-pace fallback",
@@ -239,7 +260,7 @@ fn drain_rate_oauth_five_hour_uses_recent_burn() {
 /// An api-key/provider profile: no `UsageInfo`, so its overview 5h/7d windows
 /// are synthesized from the provider bars. Both bars sit exactly half-elapsed,
 /// which is enough for `window_avg_pace_per_day` to have a pace to report.
-fn third_party_profile(five_pct: f64, seven_pct: f64) -> Profile {
+fn third_party_profile(five_pct: f64, seven_pct: f64) -> (Profile, ReadingsSnapshot) {
     let bar = |label: &str, pct: f64, reset_secs: i64| crate::providers::UsageBar {
         label: label.to_string(),
         pct,
@@ -247,49 +268,49 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> Profile {
         used: None,
         total: None,
     };
-    Profile {
-        name: "tp".into(),
-        base_url: Some("https://api.example.com".into()),
-        api_key: Some("k".into()),
-        auto_start: false,
-        env: BTreeMap::new(),
-        models: Default::default(),
-        fallback_threshold: None,
-        weekly_threshold: None,
-        last_resort: false,
-        preferred: false,
-        preferred_days: Vec::new(),
-        rolling_token: false,
-        max_auto_spend: None,
-        check_weekly: true,
-        check_scoped: true,
-        bell_threshold: None,
-        disabled: false,
-        console: None,
-        credentials: None,
-        usage: None,
-        fetch_status: None,
-        provider: None,
-        third_party_usage: Some(crate::providers::ThirdPartyStats {
-            is_available: true,
-            rows: Vec::new(),
-            bars: vec![
-                bar(LABEL_5H, five_pct, 5 * 3600 / 2),
-                bar(LABEL_7D, seven_pct, 7 * 86_400 / 2),
-            ],
-            plan: None,
-            endpoint: None,
-            best_effort: false,
-        }),
-        usage_stale: false,
-    }
+    let stats = crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: Vec::new(),
+        bars: vec![
+            bar(LABEL_5H, five_pct, 5 * 3600 / 2),
+            bar(LABEL_7D, seven_pct, 7 * 86_400 / 2),
+        ],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    };
+    (
+        Profile {
+            name: "tp".into(),
+            base_url: Some("https://api.example.com".into()),
+            api_key: Some("k".into()),
+            auto_start: false,
+            env: BTreeMap::new(),
+            models: Default::default(),
+            fallback_threshold: None,
+            weekly_threshold: None,
+            last_resort: false,
+            preferred: false,
+            preferred_days: Vec::new(),
+            rolling_token: false,
+            max_auto_spend: None,
+            check_weekly: true,
+            check_scoped: true,
+            bell_threshold: None,
+            disabled: false,
+            console: None,
+            credentials: None,
+            provider: None,
+        },
+        snap_with_stats(ReadingsSnapshot::default(), "tp", stats),
+    )
 }
 
 /// A DeepSeek api-key profile with cached balance rows built from `totals`
 /// (e.g. `["1.71 USD", "100.00 CNY"]`). Each total is preceded by a heading row
 /// whose currency is extracted from the total value. An empty slice produces an
 /// empty-rows snapshot, matching an account whose balance fetch has not landed.
-fn deepseek_profile(name: &str, totals: &[&str]) -> Profile {
+fn deepseek_profile(name: &str, totals: &[&str]) -> (Profile, ReadingsSnapshot) {
     let mut rows = Vec::new();
     for t in totals {
         if let Some((_, currency)) = t.rsplit_once(' ') {
@@ -305,39 +326,39 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> Profile {
             kind: crate::providers::StatRowKind::Body,
         });
     }
-    Profile {
-        name: name.into(),
-        base_url: Some("https://api.deepseek.com/anthropic".into()),
-        api_key: Some("k".into()),
-        auto_start: false,
-        env: BTreeMap::new(),
-        models: Default::default(),
-        fallback_threshold: None,
-        weekly_threshold: None,
-        last_resort: false,
-        preferred: false,
-        preferred_days: Vec::new(),
-        rolling_token: false,
-        max_auto_spend: None,
-        check_weekly: true,
-        check_scoped: true,
-        bell_threshold: None,
-        disabled: false,
-        console: None,
-        credentials: None,
-        usage: None,
-        fetch_status: None,
-        provider: Some(crate::providers::Provider::DeepSeek),
-        third_party_usage: Some(crate::providers::ThirdPartyStats {
-            is_available: true,
-            rows,
-            bars: Vec::new(),
-            plan: None,
-            endpoint: None,
-            best_effort: false,
-        }),
-        usage_stale: false,
-    }
+    let stats = crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows,
+        bars: Vec::new(),
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    };
+    (
+        Profile {
+            name: name.into(),
+            base_url: Some("https://api.deepseek.com/anthropic".into()),
+            api_key: Some("k".into()),
+            auto_start: false,
+            env: BTreeMap::new(),
+            models: Default::default(),
+            fallback_threshold: None,
+            weekly_threshold: None,
+            last_resort: false,
+            preferred: false,
+            preferred_days: Vec::new(),
+            rolling_token: false,
+            max_auto_spend: None,
+            check_weekly: true,
+            check_scoped: true,
+            bell_threshold: None,
+            disabled: false,
+            console: None,
+            credentials: None,
+            provider: Some(crate::providers::Provider::DeepSeek),
+        },
+        snap_with_stats(ReadingsSnapshot::default(), name, stats),
+    )
 }
 
 /// A DeepSeek profile whose cached rows come from a captured
@@ -345,8 +366,8 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> Profile {
 /// [`crate::testutil`]): the bytes go through the production cache writer and
 /// reader into the field a live app's `apply_usage` fills, so the render path
 /// is driven by captured bytes rather than a hand-built `ThirdPartyStats`.
-fn deepseek_profile_from_cache(name: &str, captured: &str) -> Profile {
-    let base = deepseek_profile(name, &[]);
+fn deepseek_profile_from_cache(name: &str, captured: &str) -> (Profile, ReadingsSnapshot) {
+    let (base, _) = deepseek_profile(name, &[]);
     // The cache writer skips names the on-disk record doesn't carry, so the
     // profile and the state list must exist before the captured bytes land.
     crate::profile::save_profile(&base).expect("save profile");
@@ -361,64 +382,83 @@ fn deepseek_profile_from_cache(name: &str, captured: &str) -> Profile {
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
     )
     .expect("captured cache written and readable");
-    Profile {
-        name: name.into(),
-        base_url: Some("https://api.deepseek.com/anthropic".into()),
-        api_key: Some("k".into()),
-        provider: Some(crate::providers::Provider::DeepSeek),
-        third_party_usage: Some(stats),
-        ..deepseek_profile(name, &[])
-    }
+    (
+        Profile {
+            name: name.into(),
+            base_url: Some("https://api.deepseek.com/anthropic".into()),
+            api_key: Some("k".into()),
+            provider: Some(crate::providers::Provider::DeepSeek),
+            ..base
+        },
+        snap_with_stats(ReadingsSnapshot::default(), name, stats),
+    )
 }
 
 /// A chain-eligible OAuth profile with a live 5h window at `util`%, resetting
 /// in `reset_secs`.
-fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
-    Profile {
-        name: name.into(),
-        base_url: None,
-        api_key: None,
-        auto_start: false,
-        env: BTreeMap::new(),
-        models: Default::default(),
-        fallback_threshold: Some(threshold),
-        weekly_threshold: None,
-        last_resort: false,
-        preferred: false,
-        preferred_days: Vec::new(),
-        rolling_token: false,
-        max_auto_spend: None,
-        check_weekly: true,
-        check_scoped: true,
-        bell_threshold: None,
-        disabled: false,
-        console: None,
-        credentials: None,
-        usage: Some(UsageInfo {
-            five_hour: Some(UsageWindow {
-                utilization: util,
-                resets_at: Some(reset_in(reset_secs)),
-            }),
-            ..UsageInfo::default()
+fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, ReadingsSnapshot) {
+    let usage = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: util,
+            resets_at: Some(reset_in(reset_secs)),
         }),
-        fetch_status: None,
-        provider: None,
-        third_party_usage: None,
-        usage_stale: false,
-    }
+        ..UsageInfo::default()
+    };
+    (
+        Profile {
+            name: name.into(),
+            base_url: None,
+            api_key: None,
+            auto_start: false,
+            env: BTreeMap::new(),
+            models: Default::default(),
+            fallback_threshold: Some(threshold),
+            weekly_threshold: None,
+            last_resort: false,
+            preferred: false,
+            preferred_days: Vec::new(),
+            rolling_token: false,
+            max_auto_spend: None,
+            check_weekly: true,
+            check_scoped: true,
+            bell_threshold: None,
+            disabled: false,
+            console: None,
+            credentials: None,
+            provider: None,
+        },
+        snap_with_usage(ReadingsSnapshot::default(), name, usage),
+    )
 }
 
-fn config_with(profiles: Vec<Profile>, active: Option<&str>, chain: Vec<&str>) -> AppConfig {
-    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
-    AppConfig {
+fn config_with(
+    profiles: Vec<(Profile, ReadingsSnapshot)>,
+    active: Option<&str>,
+    chain: Vec<&str>,
+) -> (AppConfig, ReadingsSnapshot) {
+    let names: Vec<ProfileName> = profiles.iter().map(|(p, _)| p.name.clone()).collect();
+    let mut readings = ReadingsSnapshot::default();
+    for (_p, r) in &profiles {
+        for (k, v) in &r.usage {
+            readings.usage.insert(k.clone(), v.clone());
+        }
+        for (k, v) in &r.fetch_status {
+            readings.fetch_status.insert(k.clone(), *v);
+        }
+        for (k, v) in &r.third_party {
+            readings.third_party.insert(k.clone(), v.clone());
+        }
+    }
+    let config = AppConfig {
         state: AppState {
             active_profile: active.map(Into::into),
             profiles: names,
             fallback_chain: chain.into_iter().map(Into::into).collect(),
             ..AppState::default()
         },
-        profiles,
-    }
+        profiles: profiles.into_iter().map(|(p, _)| p).collect(),
+    };
+    (config, readings)
 }
 
 /// Flattens a line's spans to plain text for substring assertions.
@@ -452,11 +492,15 @@ fn resumes_line(lines: &[Line<'static>]) -> Option<String> {
 #[test]
 fn all_exhausted_wrap_mode_shows_resumes_hint() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("a", 95.0, 100.0, 3600);
-    let b = profile("b", 95.0, 100.0, 1800);
-    let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
+    let (a, a_readings) = profile("a", 95.0, 100.0, 3600);
+    let (b, b_readings) = profile("b", 95.0, 100.0, 1800);
+    let (config, readings) = config_with(
+        vec![(a, a_readings), (b, b_readings)],
+        Some("a"),
+        vec!["a", "b"],
+    );
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60).0;
+    let lines = fallback_flow_lines(&app, 60, &readings).0;
     let hint =
         resumes_line(&lines).expect("resumes hint must render when the whole chain is exhausted");
     assert!(
@@ -470,12 +514,13 @@ fn all_exhausted_wrap_mode_shows_resumes_hint() {
 #[test]
 fn all_exhausted_wrap_off_active_cleared_shows_resumes_hint() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("a", 95.0, 100.0, 900);
-    let b = profile("b", 95.0, 100.0, 3600);
-    let mut config = config_with(vec![a, b], None, vec!["a", "b"]);
+    let (a, a_readings) = profile("a", 95.0, 100.0, 900);
+    let (b, b_readings) = profile("b", 95.0, 100.0, 3600);
+    let (mut config, readings) =
+        config_with(vec![(a, a_readings), (b, b_readings)], None, vec!["a", "b"]);
     config.state.switch_off_when_spent = true;
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60).0;
+    let lines = fallback_flow_lines(&app, 60, &readings).0;
     let hint = resumes_line(&lines)
         .expect("resumes hint must render even with no active profile (wrap-off cleared it)");
     assert!(hint.contains("resumes: a in ~"), "{hint}");
@@ -486,11 +531,15 @@ fn all_exhausted_wrap_off_active_cleared_shows_resumes_hint() {
 #[test]
 fn partially_exhausted_chain_hides_resumes_hint() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("a", 95.0, 100.0, 3600);
-    let b = profile("b", 95.0, 20.0, 3600);
-    let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
+    let (a, a_readings) = profile("a", 95.0, 100.0, 3600);
+    let (b, b_readings) = profile("b", 95.0, 20.0, 3600);
+    let (config, readings) = config_with(
+        vec![(a, a_readings), (b, b_readings)],
+        Some("a"),
+        vec!["a", "b"],
+    );
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60).0;
+    let lines = fallback_flow_lines(&app, 60, &readings).0;
     assert!(
         resumes_line(&lines).is_none(),
         "must not show when the chain isn't fully exhausted"
@@ -504,8 +553,8 @@ fn partially_exhausted_chain_hides_resumes_hint() {
 #[test]
 fn a_wallet_bearing_active_shows_its_drains_line() {
     let _home = crate::testutil::HomeSandbox::new();
-    let ds = deepseek_profile("ds", &["63.34 CNY"]);
-    let config = config_with(vec![ds], Some("ds"), vec!["ds"]);
+    let (ds, ds_readings) = deepseek_profile("ds", &["63.34 CNY"]);
+    let (config, readings) = config_with(vec![(ds, ds_readings)], Some("ds"), vec!["ds"]);
     let mut app = App::new(config);
     let now = crate::usage::now_ms();
     // A dense hourly series for the funded wallet, falling 4.5 CNY/h —
@@ -522,7 +571,7 @@ fn a_wallet_bearing_active_shows_its_drains_line() {
             })
             .collect(),
     );
-    let lines = fallback_flow_lines(&app, 60).0;
+    let lines = fallback_flow_lines(&app, 60, &readings).0;
     let drains = lines
         .iter()
         .map(line_text)
@@ -539,10 +588,10 @@ fn a_wallet_bearing_active_shows_its_drains_line() {
 #[test]
 fn a_wallet_bearing_active_without_a_series_shows_no_drains_line() {
     let _home = crate::testutil::HomeSandbox::new();
-    let ds = deepseek_profile("ds", &["63.34 CNY"]);
-    let config = config_with(vec![ds], Some("ds"), vec!["ds"]);
+    let (ds, ds_readings) = deepseek_profile("ds", &["63.34 CNY"]);
+    let (config, readings) = config_with(vec![(ds, ds_readings)], Some("ds"), vec!["ds"]);
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60).0;
+    let lines = fallback_flow_lines(&app, 60, &readings).0;
     assert!(
         !lines.iter().map(line_text).any(|t| t.contains("drains in")),
         "no series, no runway: {:?}",
@@ -554,11 +603,15 @@ fn a_wallet_bearing_active_without_a_series_shows_no_drains_line() {
 #[test]
 fn healthy_chain_hides_resumes_hint() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("a", 95.0, 10.0, 3600);
-    let b = profile("b", 95.0, 5.0, 3600);
-    let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
+    let (a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    let (b, b_readings) = profile("b", 95.0, 5.0, 3600);
+    let (config, readings) = config_with(
+        vec![(a, a_readings), (b, b_readings)],
+        Some("a"),
+        vec!["a", "b"],
+    );
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60).0;
+    let lines = fallback_flow_lines(&app, 60, &readings).0;
     assert!(resumes_line(&lines).is_none());
 }
 
@@ -570,13 +623,13 @@ fn healthy_chain_hides_resumes_hint() {
 fn broken_login_marker_outranks_bell_and_active() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let a = profile("a", 95.0, 10.0, 3600);
-    let mut config = config_with(vec![a], Some("a"), vec![]);
+    let (a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    let (mut config, readings) = config_with(vec![(a, a_readings)], Some("a"), vec![]);
     config.state.auth_broken.push("a".into());
     let mut app = App::new(config);
     app.bell_fired.observe("a", Some(50.0), Some(60.0), true);
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
     let text = line_text(&line);
     assert!(text.contains('×'), "broken login renders ×: {text}");
     assert!(!text.contains('!'), "bell yields to ×: {text}");
@@ -588,12 +641,14 @@ fn broken_login_marker_outranks_bell_and_active() {
 #[test]
 fn bell_marker_shows_when_login_is_fine() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("a", 95.0, 10.0, 3600);
-    let config = config_with(vec![a], None, vec![]);
+    let (a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
     let mut app = App::new(config);
     app.bell_fired.observe("a", Some(50.0), Some(60.0), true);
-    let widths = OverviewWidths::new(80, &app);
-    let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let text = line_text(&render_overview_row(
+        &app, 0, &widths, false, true, &readings,
+    ));
     assert!(text.contains('!'), "{text}");
     assert!(!text.contains('×'), "{text}");
 }
@@ -604,14 +659,14 @@ fn bell_marker_shows_when_login_is_fine() {
 fn token_danger_marker_outranks_bell_and_active() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let a = profile("a", 95.0, 10.0, 3600);
-    let config = config_with(vec![a], Some("a"), vec![]); // active
+    let (a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    let (config, readings) = config_with(vec![(a, a_readings)], Some("a"), vec![]); // active
     let mut app = App::new(config);
     app.bell_fired.observe("a", Some(50.0), Some(60.0), true); // bell also fired
     app.session_tokens
         .insert("a".into(), crate::claude::SessionTokenStatus::NotLongLived);
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
     let text = line_text(&line);
     assert!(text.contains('⊘'), "mis-filled token renders ⊘: {text}");
     assert!(!text.contains('!'), "bell yields to ⊘: {text}");
@@ -631,19 +686,19 @@ fn canceled_marker_is_dead_first() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     use crate::usage::{PlanInfo, PlanTier};
-    let mut a = profile("a", 95.0, 10.0, 3600);
-    a.usage.as_mut().unwrap().plan = Some(PlanInfo {
+    let (a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    a_readings.usage.get_mut("a").unwrap().plan = Some(PlanInfo {
         tier: PlanTier::Free,
         subscription_status: Some("canceled".to_string()),
         codex_plan: None,
         email: None,
     });
-    let mut config = config_with(vec![a], Some("a"), vec![]); // also active
+    let (mut config, readings) = config_with(vec![(a, a_readings)], Some("a"), vec![]); // also active
     config.state.auth_broken.push("a".into()); // also auth-broken
     let mut app = App::new(config);
     app.bell_fired.observe("a", Some(50.0), Some(60.0), true); // bell also fired
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
     let text = line_text(&line);
     assert!(text.contains('⊖'), "canceled renders ⊖: {text}");
     assert!(!text.contains('×'), "broken login yields to ⊖: {text}");
@@ -657,14 +712,16 @@ fn canceled_marker_is_dead_first() {
 #[test]
 fn broken_login_outranks_token_danger_marker() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("a", 95.0, 10.0, 3600);
-    let mut config = config_with(vec![a], Some("a"), vec![]);
+    let (a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    let (mut config, readings) = config_with(vec![(a, a_readings)], Some("a"), vec![]);
     config.state.auth_broken.push("a".into());
     let mut app = App::new(config);
     app.session_tokens
         .insert("a".into(), crate::claude::SessionTokenStatus::NotLongLived);
-    let widths = OverviewWidths::new(80, &app);
-    let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let text = line_text(&render_overview_row(
+        &app, 0, &widths, false, true, &readings,
+    ));
     assert!(text.contains('×'), "broken login wins: {text}");
     assert!(!text.contains('⊘'), "token marker yields to ×: {text}");
 }
@@ -675,14 +732,16 @@ fn long_lived_token_expired_marks() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::claude::SessionTokenStatus as S;
     let day = 86_400_000_i64;
-    let a = profile("a", 95.0, 10.0, 3600);
-    let config = config_with(vec![a], None, vec![]);
+    let (a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
     let mut app = App::new(config);
-    let widths = OverviewWidths::new(120, &app);
+    let widths = OverviewWidths::new(120, &app, &readings);
 
     app.session_tokens
         .insert("a".into(), S::LongLived(Some(now_ms() as i64 + 340 * day)));
-    let live = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    let live = line_text(&render_overview_row(
+        &app, 0, &widths, false, true, &readings,
+    ));
     assert!(
         !live.contains('⊘'),
         "a live token raises no danger marker: {live}"
@@ -690,7 +749,9 @@ fn long_lived_token_expired_marks() {
 
     app.session_tokens
         .insert("a".into(), S::LongLived(Some(now_ms() as i64 - day)));
-    let dead = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    let dead = line_text(&render_overview_row(
+        &app, 0, &widths, false, true, &readings,
+    ));
     assert!(dead.contains('⊘'), "expired token raises ⊘: {dead}");
 }
 
@@ -700,16 +761,18 @@ fn long_lived_token_expired_marks() {
 fn cached_row_colors_countdown_amber_and_underlines_nothing() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let mut a = profile("a", 95.0, 10.0, 3600);
-    a.fetch_status = Some(FetchStatus::Cached);
-    let config = config_with(vec![a], None, vec![]);
+    let (a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    a_readings
+        .fetch_status
+        .insert("a".to_string(), FetchStatus::Cached);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
     let app = App::new(config);
     app.next_refresh_per_profile.lock().unwrap().insert(
         FetchLeg::OAuth.key(ProfileName::from("a")),
         now_ms() + 30_000,
     );
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
     assert!(
         line.spans
             .iter()
@@ -734,16 +797,18 @@ fn cached_row_colors_countdown_amber_and_underlines_nothing() {
 fn failed_row_colors_countdown_red() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let mut a = profile("a", 95.0, 10.0, 3600);
-    a.fetch_status = Some(FetchStatus::Failed);
-    let config = config_with(vec![a], None, vec![]);
+    let (a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
+    a_readings
+        .fetch_status
+        .insert("a".to_string(), FetchStatus::Failed);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
     let app = App::new(config);
     app.next_refresh_per_profile.lock().unwrap().insert(
         FetchLeg::OAuth.key(ProfileName::from("a")),
         now_ms() + 30_000,
     );
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
     let bracket = line
         .spans
         .iter()
@@ -774,14 +839,16 @@ fn reset_suffixes(line: &Line<'static>) -> Vec<Span<'static>> {
 fn third_party_row_drain_colors_both_countdowns() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let config = config_with(vec![third_party_profile(60.0, 30.0)], None, vec![]);
+    let (config, readings) = config_with(vec![third_party_profile(60.0, 30.0)], None, vec![]);
     let app = App::new(config);
-    let widths = OverviewWidths::new(200, &app);
+    let widths = OverviewWidths::new(200, &app, &readings);
     assert!(
         widths.five_hour >= 26 && widths.seven_day >= 26,
         "test needs both columns wide enough to render a (reset) suffix",
     );
-    let suffixes = reset_suffixes(&render_overview_row(&app, 0, &widths, false, true));
+    let suffixes = reset_suffixes(&render_overview_row(
+        &app, 0, &widths, false, true, &readings,
+    ));
     assert_eq!(suffixes.len(), 2, "both windows render a (reset) suffix");
     for s in suffixes {
         assert_ne!(
@@ -799,15 +866,17 @@ fn third_party_row_drain_colors_both_countdowns() {
 fn oauth_row_drain_colors_the_seven_day_countdown() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let mut a = profile("a", 95.0, 60.0, 9_000);
-    a.usage.as_mut().unwrap().seven_day = Some(UsageWindow {
+    let (a, mut a_readings) = profile("a", 95.0, 60.0, 9_000);
+    a_readings.usage.get_mut("a").unwrap().seven_day = Some(UsageWindow {
         utilization: 30.0,
         resets_at: Some(reset_in(7 * 86_400 / 2)),
     });
-    let config = config_with(vec![a], None, vec![]);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
     let app = App::new(config);
-    let widths = OverviewWidths::new(200, &app);
-    let suffixes = reset_suffixes(&render_overview_row(&app, 0, &widths, false, true));
+    let widths = OverviewWidths::new(200, &app, &readings);
+    let suffixes = reset_suffixes(&render_overview_row(
+        &app, 0, &widths, false, true, &readings,
+    ));
     assert_eq!(suffixes.len(), 2);
     assert_eq!(
         suffixes[0].style.fg,
@@ -830,12 +899,16 @@ fn oauth_row_drain_colors_the_seven_day_countdown() {
 #[test]
 fn gap_widening_never_clips_the_row() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("ax-main", 95.0, 10.0, 3600);
-    let b = profile("ax-backup", 95.0, 20.0, 3600);
-    let config = config_with(vec![a, b], Some("ax-main"), vec![]);
+    let (a, a_readings) = profile("ax-main", 95.0, 10.0, 3600);
+    let (b, b_readings) = profile("ax-backup", 95.0, 20.0, 3600);
+    let (config, readings) = config_with(
+        vec![(a, a_readings), (b, b_readings)],
+        Some("ax-main"),
+        vec![],
+    );
     let app = App::new(config);
     for width in 34u16..=200 {
-        let w = OverviewWidths::new(width, &app);
+        let w = OverviewWidths::new(width, &app, &readings);
         let min =
             fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, w.live, 2) + TIMER_SLOT;
         if min > width as usize {
@@ -856,42 +929,41 @@ fn gap_widening_never_clips_the_row() {
 /// A credentialed OAuth profile with no fetched `usage.plan` yet, so
 /// `account_type_label` falls back to the token's `subscription_type` via
 /// `PlanTier::from_subscription_type(..).display()`.
-fn credentialed_profile(name: &str, subscription_type: &str) -> Profile {
-    Profile {
-        name: name.into(),
-        base_url: None,
-        api_key: None,
-        auto_start: false,
-        env: BTreeMap::new(),
-        models: Default::default(),
-        fallback_threshold: None,
-        weekly_threshold: None,
-        last_resort: false,
-        preferred: false,
-        preferred_days: Vec::new(),
-        rolling_token: false,
-        max_auto_spend: None,
-        check_weekly: true,
-        check_scoped: true,
-        bell_threshold: None,
-        disabled: false,
-        console: None,
-        credentials: Some(ClaudeCredentials {
-            claude_ai_oauth: Some(OAuthToken {
-                access_token: "tok".into(),
-                refresh_token: None,
-                expires_at: None,
-                scopes: None,
-                subscription_type: Some(subscription_type.into()),
-                ..crate::profile::OAuthToken::default_extra()
+fn credentialed_profile(name: &str, subscription_type: &str) -> (Profile, ReadingsSnapshot) {
+    (
+        Profile {
+            name: name.into(),
+            base_url: None,
+            api_key: None,
+            auto_start: false,
+            env: BTreeMap::new(),
+            models: Default::default(),
+            fallback_threshold: None,
+            weekly_threshold: None,
+            last_resort: false,
+            preferred: false,
+            preferred_days: Vec::new(),
+            rolling_token: false,
+            max_auto_spend: None,
+            check_weekly: true,
+            check_scoped: true,
+            bell_threshold: None,
+            disabled: false,
+            console: None,
+            credentials: Some(ClaudeCredentials {
+                claude_ai_oauth: Some(OAuthToken {
+                    access_token: "tok".into(),
+                    refresh_token: None,
+                    expires_at: None,
+                    scopes: None,
+                    subscription_type: Some(subscription_type.into()),
+                    ..crate::profile::OAuthToken::default_extra()
+                }),
             }),
-        }),
-        usage: None,
-        fetch_status: None,
-        provider: None,
-        third_party_usage: None,
-        usage_stale: false,
-    }
+            provider: None,
+        },
+        ReadingsSnapshot::default(),
+    )
 }
 
 /// The credentialed pulse arm must clamp the type-column label to
@@ -901,16 +973,16 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> Profile {
 #[test]
 fn credentialed_long_label_clamps_to_kind_width() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = credentialed_profile("acct", "enterprise");
-    let config = config_with(vec![a], None, vec![]);
+    let (a, a_readings) = credentialed_profile("acct", "enterprise");
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
     let app = App::new(config);
-    let widths = OverviewWidths::new(60, &app);
+    let widths = OverviewWidths::new(60, &app, &readings);
     assert_eq!(
         widths.kind, 6,
         "test assumes a 6-wide kind column at this pane width"
     );
 
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
     let chars: Vec<char> = line_text(&line).chars().collect();
 
     // 2 = cursor slot, 2 = marker slot (both always exactly 2 chars).
@@ -940,25 +1012,25 @@ fn credentialed_long_label_clamps_to_kind_width() {
 fn disabled_row_dims_its_name_and_keeps_the_real_type_value() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let mut a = profile("a", 95.0, 10.0, 3600);
+    let (mut a, mut a_readings) = profile("a", 95.0, 10.0, 3600);
     a.disabled = true;
-    let mut b = profile("b", 95.0, 10.0, 3600);
+    let (b, mut b_readings) = profile("b", 95.0, 10.0, 3600);
     // Give both a real FETCHED Pro tier so the TYPE column reads a genuine tier —
     // this test is about dimming keeping whatever tier is real, not about the
     // fallback tier a credential-less profile happens to default to.
-    for p in [&mut a, &mut b] {
-        p.usage.as_mut().unwrap().plan = Some(crate::usage::PlanInfo {
-            tier: crate::usage::PlanTier::Pro,
-            subscription_status: None,
-            codex_plan: None,
-            email: None,
-        });
-    }
-    let config = config_with(vec![a, b], None, vec![]);
+    let plan = crate::usage::PlanInfo {
+        tier: crate::usage::PlanTier::Pro,
+        subscription_status: None,
+        codex_plan: None,
+        email: None,
+    };
+    a_readings.usage.get_mut("a").unwrap().plan = Some(plan.clone());
+    b_readings.usage.get_mut("b").unwrap().plan = Some(plan);
+    let (config, readings) = config_with(vec![(a, a_readings), (b, b_readings)], None, vec![]);
     let app = App::new(config);
-    let widths = OverviewWidths::new(80, &app);
+    let widths = OverviewWidths::new(80, &app, &readings);
 
-    let disabled_line = render_overview_row(&app, 0, &widths, false, true);
+    let disabled_line = render_overview_row(&app, 0, &widths, false, true, &readings);
     let name_span = disabled_line
         .spans
         .iter()
@@ -970,7 +1042,7 @@ fn disabled_row_dims_its_name_and_keeps_the_real_type_value() {
         "a disabled account's name renders dim, not the active/inactive name_color"
     );
 
-    let enabled_line = render_overview_row(&app, 1, &widths, false, true);
+    let enabled_line = render_overview_row(&app, 1, &widths, false, true, &readings);
     let enabled_name_span = enabled_line
         .spans
         .iter()
@@ -1031,20 +1103,20 @@ fn oauth_creds() -> ClaudeCredentials {
 fn disabled_row_flattens_every_semantic_hue_to_dim() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let mut a = profile("a", 95.0, 90.0, 3600);
+    let (mut a, a_readings) = profile("a", 95.0, 90.0, 3600);
     a.disabled = true;
     a.credentials = Some(oauth_creds());
-    let mut b = profile("b", 95.0, 90.0, 3600);
+    let (mut b, b_readings) = profile("b", 95.0, 90.0, 3600);
     b.credentials = Some(oauth_creds());
     // Both rows must actually REACH the marker branch, or the flattening
     // assertion silently skips it: a disabled, non-active, unbroken profile
     // falls through to a blank marker with no fg to flatten. Marking both
     // auth-broken puts the `×` (DANGER) on each.
-    let mut config = config_with(vec![a, b], None, vec![]);
+    let (mut config, readings) = config_with(vec![(a, a_readings), (b, b_readings)], None, vec![]);
     config.state.auth_broken.push("a".into());
     config.state.auth_broken.push("b".into());
     let app = App::new(config);
-    let widths = OverviewWidths::new(110, &app);
+    let widths = OverviewWidths::new(110, &app, &readings);
 
     let non_dim = |line: &Line<'static>| -> Vec<String> {
         line.spans
@@ -1055,7 +1127,7 @@ fn disabled_row_flattens_every_semantic_hue_to_dim() {
             .collect()
     };
 
-    let disabled_line = render_overview_row(&app, 0, &widths, false, true);
+    let disabled_line = render_overview_row(&app, 0, &widths, false, true, &readings);
     assert_eq!(
         non_dim(&disabled_line),
         Vec::<String>::new(),
@@ -1063,7 +1135,7 @@ fn disabled_row_flattens_every_semantic_hue_to_dim() {
     );
 
     // The control row must still carry hue, or the assertion above is vacuous.
-    let enabled_line = render_overview_row(&app, 1, &widths, false, true);
+    let enabled_line = render_overview_row(&app, 1, &widths, false, true, &readings);
     assert!(
         !non_dim(&enabled_line).is_empty(),
         "control: an enabled row keeps its semantic colors"
@@ -1093,12 +1165,12 @@ fn disabled_row_type_cell_does_not_pulse() {
     // so an unpinned tier renders every row flat. That makes the assertion
     // below vacuous and fails its control.
     let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
-    let mut a = profile("a", 95.0, 10.0, 3600);
+    let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
     a.disabled = true;
     a.credentials = Some(oauth_creds());
-    let mut b = profile("b", 95.0, 10.0, 3600);
+    let (mut b, b_readings) = profile("b", 95.0, 10.0, 3600);
     b.credentials = Some(oauth_creds());
-    let config = config_with(vec![a, b], None, vec![]);
+    let (config, readings) = config_with(vec![(a, a_readings), (b, b_readings)], None, vec![]);
 
     // `pulse_name_spans` keys off `App::anim_ms`, so two Apps with different
     // pinned phases sample different points of the wave. 450ms is the crest of
@@ -1108,8 +1180,8 @@ fn disabled_row_type_cell_does_not_pulse() {
     let snapshot = |idx: usize| -> Vec<(String, Option<ratatui::style::Color>)> {
         let mut app = App::new(config.clone());
         app.anim_phase_ms = Some(450 * idx as u64);
-        let widths = OverviewWidths::new(110, &app);
-        render_overview_row(&app, 0, &widths, false, true)
+        let widths = OverviewWidths::new(110, &app, &readings);
+        render_overview_row(&app, 0, &widths, false, true, &readings)
             .spans
             .iter()
             .map(|s| (s.content.to_string(), s.style.fg))
@@ -1125,8 +1197,8 @@ fn disabled_row_type_cell_does_not_pulse() {
     let enabled_snapshot = |elapsed_ms: u64| -> Vec<Option<ratatui::style::Color>> {
         let mut app = App::new(config.clone());
         app.anim_phase_ms = Some(elapsed_ms);
-        let widths = OverviewWidths::new(110, &app);
-        render_overview_row(&app, 1, &widths, false, true)
+        let widths = OverviewWidths::new(110, &app, &readings);
+        render_overview_row(&app, 1, &widths, false, true, &readings)
             .spans
             .iter()
             .map(|s| s.style.fg)
@@ -1158,7 +1230,7 @@ fn no_tier_type_cell_does_not_pulse() {
     let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
     // `something_new` is a claim clauth cannot classify, so the row has no tier
     // at all; `max` is the same row WITH one.
-    let config = config_with(
+    let (config, readings) = config_with(
         vec![
             credentialed_profile("a", "something_new"),
             credentialed_profile("b", "max"),
@@ -1170,8 +1242,8 @@ fn no_tier_type_cell_does_not_pulse() {
     let snapshot = |idx: usize, phase_ms: u64| -> Vec<(String, Option<ratatui::style::Color>)> {
         let mut app = App::new(config.clone());
         app.anim_phase_ms = Some(phase_ms);
-        let widths = OverviewWidths::new(110, &app);
-        render_overview_row(&app, idx, &widths, false, true)
+        let widths = OverviewWidths::new(110, &app, &readings);
+        render_overview_row(&app, idx, &widths, false, true, &readings)
             .spans
             .iter()
             .map(|s| (s.content.to_string(), s.style.fg))
@@ -1212,18 +1284,24 @@ fn no_tier_type_cell_does_not_pulse() {
 fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
-    let mut disabled = credentialed_profile("c", "something_new");
+    let (mut disabled, _disabled_readings) = credentialed_profile("c", "something_new");
     disabled.disabled = true;
-    let config = config_with(
+    let (config, readings) = config_with(
         vec![
             credentialed_profile("a", "something_new"),
-            disabled,
-            Profile::new(
-                "d".to_string(),
-                Some("https://api.deepseek.com/anthropic".to_string()),
-                Some("sk-fixture".to_string()),
+            (disabled, _disabled_readings),
+            (
+                Profile::new(
+                    "d".to_string(),
+                    Some("https://api.deepseek.com/anthropic".to_string()),
+                    Some("sk-fixture".to_string()),
+                ),
+                ReadingsSnapshot::default(),
             ),
-            Profile::new("e".to_string(), None, None),
+            (
+                Profile::new("e".to_string(), None, None),
+                ReadingsSnapshot::default(),
+            ),
         ],
         None,
         vec![],
@@ -1232,8 +1310,9 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
     let cell = |idx: usize| -> (String, Option<ratatui::style::Color>) {
         let mut app = App::new(config.clone());
         app.anim_phase_ms = Some(0);
-        let widths = OverviewWidths::new(110, &app);
-        let span = render_overview_row(&app, idx, &widths, false, true).spans[KIND_SPAN].clone();
+        let widths = OverviewWidths::new(110, &app, &readings);
+        let span = render_overview_row(&app, idx, &widths, false, true, &readings).spans[KIND_SPAN]
+            .clone();
         (span.content.to_string(), span.style.fg)
     };
 
@@ -1287,10 +1366,10 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
 #[test]
 fn disabled_row_blanks_the_refresh_countdown_at_full_width() {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut a = profile("a", 95.0, 10.0, 3600);
+    let (mut a, a_readings) = profile("a", 95.0, 10.0, 3600);
     a.disabled = true;
-    let b = profile("b", 95.0, 10.0, 3600);
-    let config = config_with(vec![a, b], None, vec![]);
+    let (b, b_readings) = profile("b", 95.0, 10.0, 3600);
+    let (config, readings) = config_with(vec![(a, a_readings), (b, b_readings)], None, vec![]);
     let app = App::new(config);
     // Both profiles carry a live countdown in the shared map.
     if let Ok(mut m) = app.next_refresh_per_profile.lock() {
@@ -1303,10 +1382,10 @@ fn disabled_row_blanks_the_refresh_countdown_at_full_width() {
             now_ms() + 42_000,
         );
     }
-    let widths = OverviewWidths::new(110, &app);
+    let widths = OverviewWidths::new(110, &app, &readings);
 
-    let disabled_line = render_overview_row(&app, 0, &widths, false, true);
-    let enabled_line = render_overview_row(&app, 1, &widths, false, true);
+    let disabled_line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    let enabled_line = render_overview_row(&app, 1, &widths, false, true, &readings);
     let text =
         |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
 
@@ -1369,14 +1448,18 @@ fn bar_fade_spans(line: &Line<'static>) -> (Style, Style, Style) {
 fn stale_window_fades_bar_fill_and_percent() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let stale = profile("a", 95.0, 73.0, -60); // reset 60s in the past
-    let live = profile("b", 95.0, 73.0, 3600); // reset in 1h
-    let config = config_with(vec![stale, live], None, vec![]);
+    let (stale, stale_readings) = profile("a", 95.0, 73.0, -60); // reset 60s in the past
+    let (live, live_readings) = profile("b", 95.0, 73.0, 3600); // reset in 1h
+    let (config, readings) = config_with(
+        vec![(stale, stale_readings), (live, live_readings)],
+        None,
+        vec![],
+    );
     let app = App::new(config);
-    let widths = OverviewWidths::new(110, &app);
+    let widths = OverviewWidths::new(110, &app, &readings);
 
-    let stale_line = render_overview_row(&app, 0, &widths, false, true);
-    let live_line = render_overview_row(&app, 1, &widths, false, true);
+    let stale_line = render_overview_row(&app, 0, &widths, false, true, &readings);
+    let live_line = render_overview_row(&app, 1, &widths, false, true, &readings);
     let (stale_bracket, stale_fill, stale_pct) = bar_fade_spans(&stale_line);
     let (live_bracket, live_fill, live_pct) = bar_fade_spans(&live_line);
 
@@ -1413,13 +1496,13 @@ fn stale_window_fades_bar_fill_and_percent() {
 fn disabled_and_past_reset_row_stays_fully_dim() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let mut a = profile("a", 95.0, 73.0, -60); // disabled + past-reset
+    let (mut a, a_readings) = profile("a", 95.0, 73.0, -60); // disabled + past-reset
     a.disabled = true;
-    let config = config_with(vec![a], None, vec![]);
+    let (config, readings) = config_with(vec![(a, a_readings)], None, vec![]);
     let app = App::new(config);
-    let widths = OverviewWidths::new(110, &app);
+    let widths = OverviewWidths::new(110, &app, &readings);
 
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
     let non_dim: Vec<String> = line
         .spans
         .iter()
@@ -1464,8 +1547,8 @@ fn chain_panel_height_floors_at_three_without_panicking() {
 #[test]
 fn chain_row_switch_hint_rides_the_target_row() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("a", 95.0, 10.0, 3600);
-    let config = config_with(vec![a], Some("a"), vec!["a"]);
+    let (a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    let (config, _readings) = config_with(vec![(a, a_readings)], Some("a"), vec!["a"]);
     let app = App::new(config);
     let cfg = app.config();
     let row = chain_row(
@@ -1480,6 +1563,7 @@ fn chain_row_switch_hint_rides_the_target_row() {
             figure_inline: true,
             reason: None,
             switch_eta: Some(7200),
+            pct: Some(10.0),
         },
     );
     let base = row.base_width();
@@ -1504,10 +1588,14 @@ fn chain_row_switch_hint_rides_the_target_row() {
 #[test]
 fn chain_row_renders_every_projected_hop_with_the_return_glyph() {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut home = profile("home", 95.0, 10.0, 3600);
+    let (mut home, home_readings) = profile("home", 95.0, 10.0, 3600);
     home.preferred = true;
-    let plain = profile("plain", 95.0, 10.0, 3600);
-    let config = config_with(vec![home, plain], Some("plain"), vec!["home", "plain"]);
+    let (plain, plain_readings) = profile("plain", 95.0, 10.0, 3600);
+    let (config, _readings) = config_with(
+        vec![(home, home_readings), (plain, plain_readings)],
+        Some("plain"),
+        vec!["home", "plain"],
+    );
     let app = App::new(config);
     let cfg = app.config();
 
@@ -1524,6 +1612,7 @@ fn chain_row_renders_every_projected_hop_with_the_return_glyph() {
                 figure_inline: true,
                 reason: None,
                 switch_eta: Some(7200),
+                pct: Some(10.0),
             },
         );
         let base = row.base_width();
@@ -1552,10 +1641,10 @@ fn fallback_panel_parks_trailers_next_to_the_content() {
     // `ghost` sits in the chain with no profile behind it, so its row renders
     // the short `missing` arm. Leading with it proves the column is measured off
     // the WIDEST row rather than whichever one happens to come first.
-    let short = profile("ab", 100.0, 10.0, 3600);
-    let long = profile("a-much-longer-name", 100.0, 10.0, 3600);
-    let mut config = config_with(
-        vec![short, long],
+    let (short, short_readings) = profile("ab", 100.0, 10.0, 3600);
+    let (long, long_readings) = profile("a-much-longer-name", 100.0, 10.0, 3600);
+    let (mut config, readings) = config_with(
+        vec![(short, short_readings), (long, long_readings)],
         Some("ab"),
         vec!["ghost", "ab", "a-much-longer-name"],
     );
@@ -1563,7 +1652,7 @@ fn fallback_panel_parks_trailers_next_to_the_content() {
     let app = App::new(config);
 
     let wide = 120;
-    let lines = fallback_flow_lines(&app, wide).0;
+    let lines = fallback_flow_lines(&app, wide, &readings).0;
     let marked = lines
         .iter()
         .find(|l| line_text(l).contains('×'))
@@ -1594,11 +1683,18 @@ fn fallback_panel_parks_trailers_next_to_the_content() {
 #[test]
 fn chain_rows_align_the_threshold_percent_column() {
     let _home = crate::testutil::HomeSandbox::new();
-    let ninety_five = profile("a", 95.0, 10.0, 3600);
-    let hundred = profile("b", 100.0, 10.0, 3600);
-    let config = config_with(vec![ninety_five, hundred], Some("a"), vec!["a", "b"]);
+    let (ninety_five, ninety_five_readings) = profile("a", 95.0, 10.0, 3600);
+    let (hundred, hundred_readings) = profile("b", 100.0, 10.0, 3600);
+    let (config, readings) = config_with(
+        vec![
+            (ninety_five, ninety_five_readings),
+            (hundred, hundred_readings),
+        ],
+        Some("a"),
+        vec!["a", "b"],
+    );
     let app = App::new(config);
-    let texts: Vec<String> = fallback_flow_lines(&app, 60)
+    let texts: Vec<String> = fallback_flow_lines(&app, 60, &readings)
         .0
         .iter()
         .map(line_text)
@@ -1621,8 +1717,8 @@ fn chain_rows_align_the_threshold_percent_column() {
 #[test]
 fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("a", 95.0, 10.0, 3600);
-    let config = config_with(vec![a], Some("a"), vec!["a"]);
+    let (a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    let (config, _readings) = config_with(vec![(a, a_readings)], Some("a"), vec!["a"]);
     let app = App::new(config);
     let cfg = app.config();
     let row = chain_row(
@@ -1637,6 +1733,7 @@ fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
             figure_inline: true,
             reason: Some(BlockedReason::AuthBroken),
             switch_eta: Some(7200),
+            pct: Some(10.0),
         },
     );
     let col = row.base_width() + TRAILER_GAP;
@@ -1653,8 +1750,8 @@ fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
 #[test]
 fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("a", 95.0, 10.0, 3600);
-    let config = config_with(vec![a], Some("a"), vec!["a"]);
+    let (a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    let (config, _readings) = config_with(vec![(a, a_readings)], Some("a"), vec!["a"]);
     let app = App::new(config);
     let cfg = app.config();
 
@@ -1671,6 +1768,7 @@ fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
                 figure_inline: true,
                 reason: Some(BlockedReason::AuthBroken),
                 switch_eta: Some(7200),
+                pct: Some(10.0),
             },
         )
     };
@@ -1698,11 +1796,11 @@ fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
 #[test]
 fn fallback_panel_marks_a_blocked_member() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("a", 95.0, 10.0, 3600);
-    let mut config = config_with(vec![a], Some("a"), vec!["a"]);
+    let (a, a_readings) = profile("a", 95.0, 10.0, 3600);
+    let (mut config, readings) = config_with(vec![(a, a_readings)], Some("a"), vec!["a"]);
     config.state.auth_broken.push("a".into());
     let app = App::new(config);
-    let joined = fallback_flow_lines(&app, 60)
+    let joined = fallback_flow_lines(&app, 60, &readings)
         .0
         .iter()
         .map(line_text)
@@ -1748,23 +1846,24 @@ fn live_cell_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
 #[test]
 fn the_live_column_counts_live_sessions_and_marks_chain_followers() {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut app = App::new(config_with(
+    let (config, readings) = config_with(
         vec![
             profile("main", 95.0, 10.0, 3600),
             profile("spare", 95.0, 20.0, 3600),
         ],
         Some("main"),
         vec![],
-    ));
+    );
+    let mut app = App::new(config);
     app.live_sessions = crate::live_sessions::LiveTally::of([
         live_row("4242-0", "main", true),
         live_row("4242-1", "main", false),
         live_row("4242-2", "spare", false),
     ]);
 
-    let widths = OverviewWidths::new(160, &app);
-    let main = render_overview_row(&app, 0, &widths, false, false);
-    let spare = render_overview_row(&app, 1, &widths, false, false);
+    let widths = OverviewWidths::new(160, &app, &readings);
+    let main = render_overview_row(&app, 0, &widths, false, false, &readings);
+    let spare = render_overview_row(&app, 1, &widths, false, false, &readings);
 
     assert_eq!(
         live_cell_text(&widths, &main),
@@ -1787,19 +1886,20 @@ fn the_live_column_counts_live_sessions_and_marks_chain_followers() {
 #[test]
 fn live_cell_stays_under_header_when_7d_reset_is_two_digit_hours() {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut p = profile("main", 95.0, 10.0, 3600);
-    if let Some(ref mut usage) = p.usage {
+    let (p, mut p_readings) = profile("main", 95.0, 10.0, 3600);
+    if let Some(ref mut usage) = p_readings.usage.get_mut("main") {
         // 37200s = 10h 20m → `humanize_duration` emits the 7-char form.
         usage.seven_day = Some(UsageWindow {
             utilization: 95.0,
             resets_at: Some(reset_in(37_200)),
         });
     }
-    let mut app = App::new(config_with(vec![p], Some("main"), vec![]));
+    let (config, readings) = config_with(vec![(p, p_readings)], Some("main"), vec![]);
+    let mut app = App::new(config);
     app.live_sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "main", true)]);
 
-    let widths = OverviewWidths::new(120, &app);
-    let row = render_overview_row(&app, 0, &widths, false, false);
+    let widths = OverviewWidths::new(120, &app, &readings);
+    let row = render_overview_row(&app, 0, &widths, false, false, &readings);
 
     assert_eq!(
         live_cell_text(&widths, &row),
@@ -1813,15 +1913,16 @@ fn live_cell_stays_under_header_when_7d_reset_is_two_digit_hours() {
 #[test]
 fn an_account_with_no_live_sessions_renders_a_blank_live_cell() {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut app = App::new(config_with(
+    let (config, readings) = config_with(
         vec![profile("main", 95.0, 10.0, 3600)],
         Some("main"),
         vec![],
-    ));
+    );
+    let mut app = App::new(config);
     app.live_sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "other", true)]);
 
-    let widths = OverviewWidths::new(160, &app);
-    let row = render_overview_row(&app, 0, &widths, false, false);
+    let widths = OverviewWidths::new(160, &app, &readings);
+    let row = render_overview_row(&app, 0, &widths, false, false, &readings);
 
     assert_eq!(live_cell_text(&widths, &row), "    ");
 }
@@ -1833,20 +1934,35 @@ fn an_account_with_no_live_sessions_renders_a_blank_live_cell() {
 #[test]
 fn the_live_column_holds_its_place_while_nothing_is_live() {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut app = App::new(config_with(
+    let (config, readings) = config_with(
         vec![profile("main", 95.0, 10.0, 3600)],
         Some("main"),
         vec![],
+    );
+    let mut app = App::new(config);
+
+    let idle_widths = OverviewWidths::new(160, &app, &readings);
+    let idle_header = line_text(&overview_header(&idle_widths, false));
+    let idle_row = line_text(&render_overview_row(
+        &app,
+        0,
+        &idle_widths,
+        false,
+        false,
+        &readings,
     ));
 
-    let idle_widths = OverviewWidths::new(160, &app);
-    let idle_header = line_text(&overview_header(&idle_widths, false));
-    let idle_row = line_text(&render_overview_row(&app, 0, &idle_widths, false, false));
-
     app.live_sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "main", true)]);
-    let busy_widths = OverviewWidths::new(160, &app);
+    let busy_widths = OverviewWidths::new(160, &app, &readings);
     let busy_header = line_text(&overview_header(&busy_widths, false));
-    let busy_row = line_text(&render_overview_row(&app, 0, &busy_widths, false, false));
+    let busy_row = line_text(&render_overview_row(
+        &app,
+        0,
+        &busy_widths,
+        false,
+        false,
+        &readings,
+    ));
 
     assert_eq!(idle_header, busy_header, "the header must not move");
     let col = idle_header.find("live").expect("a `live` header");
@@ -1865,15 +1981,16 @@ fn the_live_column_holds_its_place_while_nothing_is_live() {
 #[test]
 fn the_live_column_is_dropped_rather_than_clipped_when_it_does_not_fit() {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut app = App::new(config_with(
+    let (config, readings) = config_with(
         vec![profile("main", 95.0, 10.0, 3600)],
         Some("main"),
         vec![],
-    ));
+    );
+    let mut app = App::new(config);
     app.live_sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "main", true)]);
 
     for width in 34u16..=200 {
-        let widths = OverviewWidths::new(width, &app);
+        let widths = OverviewWidths::new(width, &app, &readings);
         let header = line_text(&overview_header(&widths, false));
         if widths.live == 0 {
             assert!(
@@ -1882,7 +1999,9 @@ fn the_live_column_is_dropped_rather_than_clipped_when_it_does_not_fit() {
             );
             continue;
         }
-        let row = line_text(&render_overview_row(&app, 0, &widths, false, false));
+        let row = line_text(&render_overview_row(
+            &app, 0, &widths, false, false, &readings,
+        ));
         assert!(
             header.chars().count() <= width as usize,
             "the header overflows at {width} cols ({} cells): {header:?}",
@@ -1950,11 +2069,9 @@ fn five_hour_cell_text(widths: &OverviewWidths, deepseek: bool, row: &Line<'stat
 #[test]
 fn deepseek_balance_sheds_brackets_before_it_ever_cuts() {
     let _home = crate::testutil::HomeSandbox::new();
-    let app = App::new(config_with(
-        vec![deepseek_profile("ds", &["1132.60 CNY"])],
-        None,
-        vec![],
-    ));
+    let (config, readings) =
+        config_with(vec![deepseek_profile("ds", &["1132.60 CNY"])], None, vec![]);
+    let app = App::new(config);
     // `OverviewWidths` takes the accounts list's INNER width (terminal − 4).
     // Below 42 cols the 5h column is the 4-cell figure-only tier, so the whole
     // 11-cell balance must cut — with `…`, never a closed bracket around a cut
@@ -1966,8 +2083,8 @@ fn deepseek_balance_sheds_brackets_before_it_ever_cuts() {
         (42u16, "1132.60 CNY "),
         (60u16, "1132.60 CNY "),
     ] {
-        let widths = OverviewWidths::new(terminal.saturating_sub(4), &app);
-        let row = render_overview_row(&app, 0, &widths, false, false);
+        let widths = OverviewWidths::new(terminal.saturating_sub(4), &app, &readings);
+        let row = render_overview_row(&app, 0, &widths, false, false, &readings);
         let cell = five_hour_cell_text(&widths, true, &row);
         assert_eq!(cell, expected, "balance cell at {terminal} cols");
     }
@@ -1980,10 +2097,10 @@ fn a_long_chain_name_renders_whole_on_desktop() {
     let _home = crate::testutil::HomeSandbox::new();
     let name = "abcdefghijklmnopqrstuvwxyz";
     let a = profile(name, 95.0, 10.0, 3600);
-    let config = config_with(vec![a], Some(name), vec![name]);
+    let (config, readings) = config_with(vec![a], Some(name), vec![name]);
     let app = App::new(config);
     for w in [80usize, 160] {
-        let lines = fallback_flow_lines(&app, w).0;
+        let lines = fallback_flow_lines(&app, w, &readings).0;
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         let row = texts
             .iter()
@@ -2003,7 +2120,7 @@ fn a_long_chain_name_renders_whole_on_desktop() {
 fn the_stay_caption_wraps_without_overrunning_the_first_line() {
     let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 10.0, 3600);
-    let config = config_with(vec![a], Some("a"), vec!["a"]);
+    let (config, readings) = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
     // Every caption line, chip included, stays within the pane: the round-1
     // budget let the first line overrun by two cells. Pinned whole-row at the
@@ -2031,7 +2148,7 @@ fn the_stay_caption_wraps_without_overrunning_the_first_line() {
             &["  [ stay ] on the active account when all", "  spent"][..],
         ),
     ] {
-        let lines = fallback_flow_lines(&app, w).0;
+        let lines = fallback_flow_lines(&app, w, &readings).0;
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         let start = texts
             .iter()
@@ -2048,15 +2165,16 @@ fn the_stay_caption_wraps_without_overrunning_the_first_line() {
 #[test]
 fn header_reads_5h_balance_when_a_deepseek_profile_is_present() {
     let _home = crate::testutil::HomeSandbox::new();
-    let app = App::new(config_with(
+    let (config, readings) = config_with(
         vec![
             profile("main", 95.0, 10.0, 3600),
             deepseek_profile("ds", &["1.71 USD"]),
         ],
         Some("main"),
         vec![],
-    ));
-    let widths = OverviewWidths::new(120, &app);
+    );
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings);
     let header = line_text(&overview_header(&widths, any_deepseek(&app)));
     assert!(
         header.contains("5h / balance"),
@@ -2070,12 +2188,13 @@ fn header_reads_5h_balance_when_a_deepseek_profile_is_present() {
 #[test]
 fn header_keeps_plain_5h_when_no_deepseek_profile_is_present() {
     let _home = crate::testutil::HomeSandbox::new();
-    let app = App::new(config_with(
+    let (config, readings) = config_with(
         vec![profile("main", 95.0, 10.0, 3600)],
         Some("main"),
         vec![],
-    ));
-    let widths = OverviewWidths::new(120, &app);
+    );
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings);
     let header = line_text(&overview_header(&widths, any_deepseek(&app)));
     assert!(
         !header.contains("balance"),
@@ -2093,16 +2212,17 @@ fn header_keeps_plain_5h_when_no_deepseek_profile_is_present() {
 #[test]
 fn deepseek_row_shows_total_balance_in_5h_column() {
     let _home = crate::testutil::HomeSandbox::new();
-    let app = App::new(config_with(
+    let (config, readings) = config_with(
         vec![
             profile("main", 95.0, 10.0, 3600),
             deepseek_profile("ds", &["1.71 USD"]),
         ],
         Some("main"),
         vec![],
-    ));
-    let widths = OverviewWidths::new(120, &app);
-    let row = render_overview_row(&app, 1, &widths, false, false);
+    );
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings);
+    let row = render_overview_row(&app, 1, &widths, false, false, &readings);
     let cell = five_hour_cell_text(&widths, true, &row);
     assert!(
         cell.starts_with("[1.71 USD"),
@@ -2129,16 +2249,17 @@ fn a_deepseek_cache_written_before_the_rename_still_shows_its_balance() {
     let stats: crate::providers::ThirdPartyStats =
         serde_json::from_str(crate::testutil::THIRD_PARTY_CACHE_BYTES)
             .expect("the captured legacy cache parses");
-    let mut ds = deepseek_profile("ds", &[]);
-    ds.third_party_usage = Some(stats);
-    let app = App::new(config_with(vec![ds], Some("ds"), vec![]));
+    let (ds, mut ds_readings) = deepseek_profile("ds", &[]);
+    ds_readings.third_party.insert("ds".to_string(), stats);
+    let (config, readings) = config_with(vec![(ds, ds_readings)], Some("ds"), vec![]);
+    let app = App::new(config);
 
-    let widths = OverviewWidths::new(120, &app);
+    let widths = OverviewWidths::new(120, &app, &readings);
     assert_eq!(
         widths.deepseek_amount_w, 5,
         "the legacy row still sizes the amount column (from `31.45`), not 0",
     );
-    let row = render_overview_row(&app, 0, &widths, false, false);
+    let row = render_overview_row(&app, 0, &widths, false, false, &readings);
     let cell = five_hour_cell_text(&widths, true, &row);
     assert!(
         cell.starts_with("[31.45 CNY"),
@@ -2152,13 +2273,10 @@ fn a_deepseek_cache_written_before_the_rename_still_shows_its_balance() {
 #[test]
 fn deepseek_row_without_balance_shows_no_data_dash() {
     let _home = crate::testutil::HomeSandbox::new();
-    let app = App::new(config_with(
-        vec![deepseek_profile("ds", &[])],
-        Some("ds"),
-        vec![],
-    ));
-    let widths = OverviewWidths::new(120, &app);
-    let row = render_overview_row(&app, 0, &widths, false, false);
+    let (config, readings) = config_with(vec![deepseek_profile("ds", &[])], Some("ds"), vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings);
+    let row = render_overview_row(&app, 0, &widths, false, false, &readings);
     let cell = five_hour_cell_text(&widths, true, &row);
     assert_eq!(
         cell.trim(),
@@ -2174,17 +2292,18 @@ fn deepseek_row_without_balance_shows_no_data_dash() {
 #[test]
 fn deepseek_balance_currencies_align_across_rows() {
     let _home = crate::testutil::HomeSandbox::new();
-    let app = App::new(config_with(
+    let (config, readings) = config_with(
         vec![
             deepseek_profile("short", &["1.71 USD"]),
             deepseek_profile("long", &["197.50 CNY"]),
         ],
         Some("short"),
         vec![],
-    ));
-    let widths = OverviewWidths::new(120, &app);
-    let short_row = render_overview_row(&app, 0, &widths, false, false);
-    let long_row = render_overview_row(&app, 1, &widths, false, false);
+    );
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings);
+    let short_row = render_overview_row(&app, 0, &widths, false, false, &readings);
+    let long_row = render_overview_row(&app, 1, &widths, false, false, &readings);
     let short_cell = five_hour_cell_text(&widths, true, &short_row);
     let long_cell = five_hour_cell_text(&widths, true, &long_row);
 
@@ -2207,13 +2326,14 @@ fn deepseek_balance_currencies_align_across_rows() {
 #[test]
 fn deepseek_multi_currency_shows_all_above_zero() {
     let _home = crate::testutil::HomeSandbox::new();
-    let app = App::new(config_with(
+    let (config, readings) = config_with(
         vec![deepseek_profile("ds", &["1.71 USD", "100.00 CNY"])],
         None,
         vec![],
-    ));
-    let widths = OverviewWidths::new(120, &app);
-    let row = render_overview_row(&app, 0, &widths, false, false);
+    );
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings);
+    let row = render_overview_row(&app, 0, &widths, false, false, &readings);
     let cell = five_hour_cell_text(&widths, true, &row);
     assert!(
         cell.contains("USD") && cell.contains("CNY"),
@@ -2233,13 +2353,14 @@ fn deepseek_multi_currency_shows_all_above_zero() {
 #[test]
 fn deepseek_multi_currency_only_shows_above_zero() {
     let _home = crate::testutil::HomeSandbox::new();
-    let app = App::new(config_with(
+    let (config, readings) = config_with(
         vec![deepseek_profile("ds", &["0.00 USD", "100.00 CNY"])],
         None,
         vec![],
-    ));
-    let widths = OverviewWidths::new(120, &app);
-    let row = render_overview_row(&app, 0, &widths, false, false);
+    );
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings);
+    let row = render_overview_row(&app, 0, &widths, false, false, &readings);
     let cell = five_hour_cell_text(&widths, true, &row);
     assert!(
         cell.contains("CNY") && !cell.contains("USD"),
@@ -2253,16 +2374,17 @@ fn deepseek_multi_currency_only_shows_above_zero() {
 #[test]
 fn deepseek_two_wallet_renders_only_the_funded_wallet() {
     let _home = crate::testutil::HomeSandbox::new();
-    let app = App::new(config_with(
+    let (config, readings) = config_with(
         vec![deepseek_profile_from_cache(
             "tw",
             crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE,
         )],
         None,
         vec![],
-    ));
-    let widths = OverviewWidths::new(120, &app);
-    let row = render_overview_row(&app, 0, &widths, false, false);
+    );
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings);
+    let row = render_overview_row(&app, 0, &widths, false, false, &readings);
     let cell = five_hour_cell_text(&widths, true, &row);
     assert!(
         cell.contains("498.18 CNY"),
@@ -2282,16 +2404,17 @@ fn deepseek_two_wallet_renders_only_the_funded_wallet() {
 #[test]
 fn deepseek_single_wallet_renders_unchanged() {
     let _home = crate::testutil::HomeSandbox::new();
-    let app = App::new(config_with(
+    let (config, readings) = config_with(
         vec![deepseek_profile_from_cache(
             "one",
             crate::testutil::CAPTURED_ONE_WALLET_DS_CACHE,
         )],
         None,
         vec![],
-    ));
-    let widths = OverviewWidths::new(120, &app);
-    let row = render_overview_row(&app, 0, &widths, false, false);
+    );
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings);
+    let row = render_overview_row(&app, 0, &widths, false, false, &readings);
     let cell = five_hour_cell_text(&widths, true, &row);
     assert!(
         cell.contains("3640.55 CNY"),
@@ -2304,13 +2427,14 @@ fn deepseek_single_wallet_renders_unchanged() {
 #[test]
 fn deepseek_all_zero_shows_the_highest() {
     let _home = crate::testutil::HomeSandbox::new();
-    let app = App::new(config_with(
+    let (config, readings) = config_with(
         vec![deepseek_profile("ds", &["0.00 USD", "0.00 CNY"])],
         None,
         vec![],
-    ));
-    let widths = OverviewWidths::new(120, &app);
-    let row = render_overview_row(&app, 0, &widths, false, false);
+    );
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings);
+    let row = render_overview_row(&app, 0, &widths, false, false, &readings);
     let cell = five_hour_cell_text(&widths, true, &row);
     assert!(
         !cell.contains('—'),
@@ -2328,22 +2452,23 @@ fn deepseek_all_zero_shows_the_highest() {
 #[test]
 fn deepseek_amount_w_spans_all_currencies() {
     let _home = crate::testutil::HomeSandbox::new();
-    let app = App::new(config_with(
+    let (config, readings) = config_with(
         vec![
             deepseek_profile("multi", &["1.71 USD", "197.50 CNY"]),
             deepseek_profile("single", &["3.14 USD"]),
         ],
         None,
         vec![],
-    ));
-    let widths = OverviewWidths::new(120, &app);
+    );
+    let app = App::new(config);
+    let widths = OverviewWidths::new(120, &app, &readings);
     assert_eq!(
         widths.deepseek_amount_w, 6,
         "amount_w must be 6 (from '197.50'), not capped at 4 or 5"
     );
 
-    let multi_row = render_overview_row(&app, 0, &widths, false, false);
-    let single_row = render_overview_row(&app, 1, &widths, false, false);
+    let multi_row = render_overview_row(&app, 0, &widths, false, false, &readings);
+    let single_row = render_overview_row(&app, 1, &widths, false, false, &readings);
     let multi_cell = five_hour_cell_text(&widths, true, &multi_row);
     let single_cell = five_hour_cell_text(&widths, true, &single_row);
 
@@ -2390,7 +2515,7 @@ fn the_harness_filter_cycles_and_names_itself() {
 fn accounts_title_row(app: &App, width: u16) -> String {
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 8)).expect("terminal");
-    term.draw(|f| draw_overview_accounts(f, f.area(), app))
+    term.draw(|f| draw_overview_accounts(f, f.area(), app, &app.readings_snapshot()))
         .expect("draw");
     crate::testutil::buffer_rows(term.backend().buffer())[0].clone()
 }
@@ -2411,11 +2536,8 @@ fn accounts_title_row(app: &App, width: u16) -> String {
 fn the_accounts_title_row_carries_the_harness_filter() {
     use crate::tui::app::HarnessFilter;
     let _home = crate::testutil::HomeSandbox::new();
-    let mut app = App::new(config_with(
-        vec![profile("cl1", 80.0, 10.0, 3_600)],
-        None,
-        vec![],
-    ));
+    let (config, _readings) = config_with(vec![profile("cl1", 80.0, 10.0, 3_600)], None, vec![]);
+    let mut app = App::new(config);
 
     assert_eq!(
         accounts_title_row(&app, 25),
@@ -2448,7 +2570,7 @@ fn the_accounts_title_opens_with_the_corner_dash_and_the_counts_keep_their_gap()
     use crate::tui::app::HarnessFilter;
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::write_codex_roster(&["cx1", "cx2"]);
-    let mut app = App::new(config_with(
+    let (config, _readings) = config_with(
         vec![
             profile("cl1", 80.0, 10.0, 3_600),
             profile("cl2", 80.0, 20.0, 3_600),
@@ -2456,7 +2578,8 @@ fn the_accounts_title_opens_with_the_corner_dash_and_the_counts_keep_their_gap()
         ],
         None,
         vec![],
-    ));
+    );
+    let mut app = App::new(config);
 
     assert_eq!(
         accounts_title_row(&app, 25),
@@ -2490,11 +2613,8 @@ fn the_accounts_title_opens_with_the_corner_dash_and_the_counts_keep_their_gap()
 fn a_title_row_narrower_than_the_eyebrow_and_its_slot_clips_the_slot() {
     use crate::tui::app::HarnessFilter;
     let _home = crate::testutil::HomeSandbox::new();
-    let mut app = App::new(config_with(
-        vec![profile("cl1", 80.0, 10.0, 3_600)],
-        None,
-        vec![],
-    ));
+    let (config, _readings) = config_with(vec![profile("cl1", 80.0, 10.0, 3_600)], None, vec![]);
+    let mut app = App::new(config);
 
     for (filter, at_16, at_20) in [
         (
@@ -2604,7 +2724,7 @@ fn the_counts_slot_sheds_before_the_filter_slot() {
     use crate::tui::app::HarnessFilter;
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::write_codex_roster(&["cx1", "cx2"]);
-    let mut app = App::new(config_with(
+    let (config, _readings) = config_with(
         vec![
             profile("cl1", 80.0, 10.0, 3_600),
             profile("cl2", 80.0, 20.0, 3_600),
@@ -2612,7 +2732,8 @@ fn the_counts_slot_sheds_before_the_filter_slot() {
         ],
         None,
         vec![],
-    ));
+    );
+    let mut app = App::new(config);
     assert_eq!(
         app.codex_rows.len(),
         2,
@@ -2674,11 +2795,8 @@ fn the_filter_slot_is_dim_data_and_the_eyebrow_keeps_its_title_style() {
     use crate::tui::app::HarnessFilter;
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let mut app = App::new(config_with(
-        vec![profile("cl1", 80.0, 10.0, 3_600)],
-        None,
-        vec![],
-    ));
+    let (config, readings) = config_with(vec![profile("cl1", 80.0, 10.0, 3_600)], None, vec![]);
+    let mut app = App::new(config);
 
     for (filter, name) in [
         (HarnessFilter::Claude, "claude"),
@@ -2687,7 +2805,7 @@ fn the_filter_slot_is_dim_data_and_the_eyebrow_keeps_its_title_style() {
         app.harness_filter = filter;
         let mut term =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(50, 8)).expect("terminal");
-        term.draw(|f| draw_overview_accounts(f, f.area(), &app))
+        term.draw(|f| draw_overview_accounts(f, f.area(), &app, &readings))
             .expect("draw");
         let buf = term.backend().buffer();
         let row = crate::testutil::buffer_rows(buf)[0].clone();
@@ -2751,7 +2869,7 @@ fn the_accounts_meta_slot_counts_both_harnesses_whatever_the_filter_shows() {
     use crate::tui::app::HarnessFilter;
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::write_codex_roster(&["cx1", "cx2"]);
-    let mut app = App::new(config_with(
+    let (config, _readings) = config_with(
         vec![
             profile("cl1", 80.0, 10.0, 3_600),
             profile("cl2", 80.0, 20.0, 3_600),
@@ -2759,7 +2877,8 @@ fn the_accounts_meta_slot_counts_both_harnesses_whatever_the_filter_shows() {
         ],
         None,
         vec![],
-    ));
+    );
+    let mut app = App::new(config);
     assert_eq!(
         app.codex_rows.len(),
         2,
@@ -2793,21 +2912,23 @@ fn the_accounts_meta_slot_counts_both_harnesses_whatever_the_filter_shows() {
 #[test]
 fn the_accounts_meta_slot_omits_a_roster_with_no_accounts() {
     let _home = crate::testutil::HomeSandbox::new();
-    let claude_only = App::new(config_with(
+    let (config, _readings) = config_with(
         vec![
             profile("cl1", 80.0, 10.0, 3_600),
             profile("cl2", 80.0, 20.0, 3_600),
         ],
         None,
         vec![],
-    ));
+    );
+    let claude_only = App::new(config);
     assert_eq!(
         accounts_title_row(&claude_only, 50),
         "╭─ ACCOUNTS ────────────────────────── 2 claude ─╮"
     );
 
     crate::testutil::write_codex_roster(&["cx1", "cx2"]);
-    let codex_only = App::new(config_with(Vec::new(), None, vec![]));
+    let (config, _readings) = config_with(Vec::new(), None, vec![]);
+    let codex_only = App::new(config);
     assert_eq!(
         codex_only.codex_rows.len(),
         2,
@@ -2824,7 +2945,8 @@ fn the_accounts_meta_slot_omits_a_roster_with_no_accounts() {
 #[test]
 fn an_empty_roster_pair_renders_no_meta_slot() {
     let _home = crate::testutil::HomeSandbox::new();
-    let app = App::new(config_with(Vec::new(), None, vec![]));
+    let (config, _readings) = config_with(Vec::new(), None, vec![]);
+    let app = App::new(config);
     assert_eq!(
         accounts_title_row(&app, 50),
         "╭─ ACCOUNTS ─────────────────────────────────────╮"
@@ -2858,7 +2980,7 @@ fn an_empty_title_keeps_the_full_rule_run() {
 fn the_accounts_meta_slot_sheds_before_the_title_loses_its_rule() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::write_codex_roster(&["cx1", "cx2"]);
-    let app = App::new(config_with(
+    let (config, _readings) = config_with(
         vec![
             profile("cl1", 80.0, 10.0, 3_600),
             profile("cl2", 80.0, 20.0, 3_600),
@@ -2866,7 +2988,8 @@ fn the_accounts_meta_slot_sheds_before_the_title_loses_its_rule() {
         ],
         None,
         vec![],
-    ));
+    );
+    let app = App::new(config);
     assert_eq!(
         app.codex_rows.len(),
         2,
@@ -3012,9 +3135,10 @@ fn a_codex_rows_usage_cells_sit_under_their_headers() {
         seven_day: None,
         resets: None,
     };
-    let app = App::new(config_with(vec![], None, vec![]));
+    let (config, readings) = config_with(vec![], None, vec![]);
+    let app = App::new(config);
 
-    let wide = OverviewWidths::new(80, &app);
+    let wide = OverviewWidths::new(80, &app, &readings);
     assert!(wide.seven_day > 0, "80 columns keep the 7d column");
     let line = render_codex_row(&row, &wide, false);
     assert_eq!(
@@ -3028,7 +3152,7 @@ fn a_codex_rows_usage_cells_sit_under_their_headers() {
         "a missing window is a dash under its own header"
     );
 
-    let narrow = OverviewWidths::new(56, &app);
+    let narrow = OverviewWidths::new(56, &app, &readings);
     assert_eq!(narrow.seven_day, 0, "56 columns drop the 7d column");
     let line = render_codex_row(&row, &narrow, false);
     assert_eq!(
@@ -3056,12 +3180,13 @@ fn a_codex_row_shows_the_reset_chip_only_while_one_is_available() {
         seven_day: None,
         resets,
     };
-    let app = App::new(config_with(vec![], None, vec![]));
+    let (config, readings) = config_with(vec![], None, vec![]);
+    let app = App::new(config);
     let text = |line: ratatui::text::Line<'_>| -> String {
         line.spans.iter().map(|s| s.content.clone()).collect()
     };
 
-    let wide = OverviewWidths::new(80, &app);
+    let wide = OverviewWidths::new(80, &app, &readings);
     assert!(
         text(render_codex_row(&row(Some(2)), &wide, false)).contains("↺ 2"),
         "two banked resets render the chip"
@@ -3101,8 +3226,9 @@ fn a_quarantined_codex_row_renders_the_broken_marker() {
     assert!(rows[0].broken, "the snapshot carries the quarantine read");
     assert!(!rows[1].broken, "no record for cx2");
 
-    let app = App::new(config_with(vec![], None, vec![]));
-    let widths = OverviewWidths::new(80, &app);
+    let (config, readings) = config_with(vec![], None, vec![]);
+    let app = App::new(config);
+    let widths = OverviewWidths::new(80, &app, &readings);
     let broken = render_codex_row(&rows[0], &widths, false);
     let live = render_codex_row(&rows[1], &widths, false);
 
@@ -3171,14 +3297,14 @@ fn seven_day_cell_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
 #[test]
 fn five_hour_stamp_never_lost_without_a_7d_bar_gain() {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut p = profile("aaaaaaaaaaaa", 40.0, 60.0, 3 * 3600 + 1800);
-    if let Some(ref mut usage) = p.usage {
+    let (p, mut p_readings) = profile("aaaaaaaaaaaa", 40.0, 60.0, 3 * 3600 + 1800);
+    if let Some(ref mut usage) = p_readings.usage.get_mut("aaaaaaaaaaaa") {
         usage.seven_day = Some(UsageWindow {
             utilization: 60.0,
             resets_at: Some(reset_in(4 * 86400 + 43200)),
         });
     }
-    let mut config = config_with(vec![p], None, vec![]);
+    let (mut config, readings) = config_with(vec![(p, p_readings)], None, vec![]);
     config.state.reset_display = Some(crate::profile::ResetDisplay::Both);
     let app = App::new(config);
 
@@ -3187,8 +3313,8 @@ fn five_hour_stamp_never_lost_without_a_7d_bar_gain() {
     let mut seven_bar = Vec::with_capacity((170 - 40 + 1) as usize);
 
     for terminal in 40u16..=170 {
-        let widths = OverviewWidths::new(terminal - 4, &app);
-        let row = render_overview_row(&app, 0, &widths, false, false);
+        let widths = OverviewWidths::new(terminal - 4, &app, &readings);
+        let row = render_overview_row(&app, 0, &widths, false, false, &readings);
         let five = five_hour_cell_text(&widths, false, &row);
         let seven = seven_day_cell_text(&widths, &row);
         five_stamp.push(five.contains('·'));
@@ -3270,11 +3396,11 @@ fn windowed_table(start: &str, end: &str) -> crate::pricing::PriceTable {
 /// A profile on the deepseek endpoint — the provider whose store rows the
 /// fixture tables carry — over the shared `profile` fixture shape. The peak
 /// marker is provider-bound: what the profile pins never feeds it.
-fn peak_profile(name: &str) -> Profile {
-    let mut p = profile(name, 40.0, 20.0, 3600);
+fn peak_profile(name: &str) -> (Profile, ReadingsSnapshot) {
+    let (mut p, p_readings) = profile(name, 40.0, 20.0, 3600);
     p.base_url = Some("https://api.deepseek.com/anthropic".into());
     p.provider = Some(crate::providers::Provider::DeepSeek);
-    p
+    (p, p_readings)
 }
 
 /// An active profile on peak hours keeps its `●` — the active dot outranks
@@ -3283,11 +3409,11 @@ fn peak_profile(name: &str) -> Profile {
 fn active_dot_outranks_the_peak_marker() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let config = config_with(vec![peak_profile("a")], Some("a"), vec![]);
+    let (config, readings) = config_with(vec![peak_profile("a")], Some("a"), vec![]);
     let mut app = App::new(config);
     app.price_table = Some(windowed_table("00:00", "24:00"));
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
     let text = line_text(&line);
     assert!(text.contains('●'), "active peak row keeps ●: {text}");
     assert!(
@@ -3304,15 +3430,15 @@ fn active_dot_outranks_the_peak_marker() {
 fn peak_marker_renders_on_inactive_rows() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let config = config_with(
+    let (config, readings) = config_with(
         vec![peak_profile("a"), peak_profile("b")],
         Some("a"),
         vec![],
     );
     let mut app = App::new(config);
     app.price_table = Some(windowed_table("00:00", "24:00"));
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 1, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 1, &widths, false, true, &readings);
     let text = line_text(&line);
     assert!(text.contains('▲'), "inactive peak row renders ▲: {text}");
     assert!(
@@ -3329,13 +3455,13 @@ fn peak_marker_renders_on_inactive_rows() {
 fn disabled_peak_row_dims_the_marker() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let mut p = peak_profile("a");
+    let (mut p, p_readings) = peak_profile("a");
     p.disabled = true;
-    let config = config_with(vec![p], None, vec![]);
+    let (config, readings) = config_with(vec![(p, p_readings)], None, vec![]);
     let mut app = App::new(config);
     app.price_table = Some(windowed_table("00:00", "24:00"));
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
     let text = line_text(&line);
     assert!(text.contains('▲'), "disabled peak row keeps ▲: {text}");
     let marker = line.spans.iter().find(|s| s.content == "▲").unwrap();
@@ -3353,11 +3479,13 @@ fn off_peak_row_keeps_the_active_dot() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     // An empty window ("12:00"–"12:00") is active at no hour.
-    let config = config_with(vec![peak_profile("a")], Some("a"), vec![]);
+    let (config, readings) = config_with(vec![peak_profile("a")], Some("a"), vec![]);
     let mut app = App::new(config);
     app.price_table = Some(windowed_table("12:00", "12:00"));
-    let widths = OverviewWidths::new(80, &app);
-    let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let text = line_text(&render_overview_row(
+        &app, 0, &widths, false, true, &readings,
+    ));
     assert!(text.contains('●'), "off-peak active row keeps ●: {text}");
     assert!(!text.contains('▲'), "no peak marker off-peak: {text}");
 }
@@ -3367,12 +3495,14 @@ fn off_peak_row_keeps_the_active_dot() {
 fn bell_outranks_the_peak_marker() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let config = config_with(vec![peak_profile("a")], Some("a"), vec![]);
+    let (config, readings) = config_with(vec![peak_profile("a")], Some("a"), vec![]);
     let mut app = App::new(config);
     app.price_table = Some(windowed_table("00:00", "24:00"));
     app.bell_fired.observe("a", Some(50.0), Some(60.0), true);
-    let widths = OverviewWidths::new(80, &app);
-    let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let text = line_text(&render_overview_row(
+        &app, 0, &widths, false, true, &readings,
+    ));
     assert!(text.contains('!'), "{text}");
     assert!(
         !text.contains('▲'),
@@ -3385,10 +3515,12 @@ fn bell_outranks_the_peak_marker() {
 #[test]
 fn no_table_no_peak_marker() {
     let _home = crate::testutil::HomeSandbox::new();
-    let config = config_with(vec![peak_profile("a")], Some("a"), vec![]);
+    let (config, readings) = config_with(vec![peak_profile("a")], Some("a"), vec![]);
     let app = App::new(config);
-    let widths = OverviewWidths::new(80, &app);
-    let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let text = line_text(&render_overview_row(
+        &app, 0, &widths, false, true, &readings,
+    ));
     assert!(!text.contains('▲'), "no table, no marker: {text}");
     assert!(text.contains('●'), "the active dot is untouched: {text}");
 }
@@ -3402,7 +3534,7 @@ fn no_table_no_peak_marker() {
 fn accounts_scrollbar_column(app: &App, width: u16, height: u16) -> String {
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
         .expect("terminal");
-    term.draw(|f| draw_overview_accounts(f, f.area(), app))
+    term.draw(|f| draw_overview_accounts(f, f.area(), app, &app.readings_snapshot()))
         .expect("draw");
     let buf = term.backend().buffer();
     (2..height - 1)
@@ -3424,7 +3556,8 @@ fn the_accounts_scrollbar_counts_the_codex_rows() {
         ]
     };
 
-    let no_codex = App::new(config_with(claude(), None, vec![]));
+    let (config, _readings) = config_with(claude(), None, vec![]);
+    let no_codex = App::new(config);
     assert_eq!(
         accounts_scrollbar_column(&no_codex, 80, 8),
         "     ",
@@ -3432,7 +3565,8 @@ fn the_accounts_scrollbar_counts_the_codex_rows() {
     );
 
     crate::testutil::write_codex_roster(&["cx1", "cx2", "cx3"]);
-    let with_codex = App::new(config_with(claude(), None, vec![]));
+    let (config, _readings) = config_with(claude(), None, vec![]);
+    let with_codex = App::new(config);
     assert_eq!(
         with_codex.codex_rows.len(),
         3,
@@ -3456,11 +3590,12 @@ fn selecting_the_active_codex_row_keeps_its_active_name_color() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     crate::testutil::write_codex_roster(&["cx1"]);
-    let mut app = App::new(config_with(vec![], None, vec![]));
+    let (config, readings) = config_with(vec![], None, vec![]);
+    let mut app = App::new(config);
     app.codex_rows[0].active = true;
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 8)).expect("terminal");
-    term.draw(|f| draw_overview_accounts(f, f.area(), &app))
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &readings))
         .expect("draw");
     let buf = term.backend().buffer();
     let rows = crate::testutil::buffer_rows(buf);
@@ -3476,14 +3611,15 @@ fn selecting_the_active_codex_row_keeps_its_active_name_color() {
 fn the_last_codex_row_and_thumb_follow_a_short_viewport() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::write_codex_roster(&["cx1", "cx2", "cx3"]);
-    let mut app = App::new(config_with(
+    let (config, readings) = config_with(
         vec![
             profile("cl1", 80.0, 10.0, 3_600),
             profile("cl2", 80.0, 20.0, 3_600),
         ],
         None,
         vec![],
-    ));
+    );
+    let mut app = App::new(config);
     assert_eq!(app.codex_rows.len(), 3);
     app.overview_cursor = 4;
     assert_eq!(
@@ -3492,7 +3628,7 @@ fn the_last_codex_row_and_thumb_follow_a_short_viewport() {
     );
     let mut term =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 8)).expect("terminal");
-    term.draw(|f| draw_overview_accounts(f, f.area(), &app))
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &readings))
         .expect("draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(
@@ -3502,7 +3638,7 @@ fn the_last_codex_row_and_thumb_follow_a_short_viewport() {
     assert_eq!(accounts_scrollbar_column(&app, 80, 8), "┊┊┃┃┃");
     app.harness_filter = crate::tui::app::HarnessFilter::Codex;
     app.overview_cursor = 2;
-    term.draw(|f| draw_overview_accounts(f, f.area(), &app))
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app, &readings))
         .expect("codex-only draw");
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(
@@ -3521,11 +3657,8 @@ fn the_codex_heading_styles_its_switch_command() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     crate::testutil::write_codex_roster(&["cx1"]);
-    let app = App::new(config_with(
-        vec![profile("cl1", 80.0, 10.0, 3_600)],
-        None,
-        vec![],
-    ));
+    let (config, _readings) = config_with(vec![profile("cl1", 80.0, 10.0, 3_600)], None, vec![]);
+    let app = App::new(config);
     let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
     term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
     crate::testutil::assert_prose_part(
@@ -3541,9 +3674,10 @@ fn the_codex_heading_styles_its_switch_command() {
 /// A chain of live, unexhausted members — the only caption is the always-on
 /// all-spent line, so the truncation arithmetic is pinned exactly.
 fn chain_app(names: &[String]) -> App {
-    let profiles: Vec<Profile> = names.iter().map(|n| profile(n, 95.0, 20.0, 3600)).collect();
+    let profiles: Vec<(Profile, ReadingsSnapshot)> =
+        names.iter().map(|n| profile(n, 95.0, 20.0, 3600)).collect();
     let chain: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-    App::new(config_with(profiles, None, chain))
+    App::new(config_with(profiles, None, chain).0)
 }
 
 #[test]
@@ -3551,7 +3685,7 @@ fn truncate_chain_keeps_captions_and_names_hidden_members() {
     let _home = crate::testutil::HomeSandbox::new();
     let names: Vec<String> = (0..28).map(|i| format!("a{i}")).collect();
     let app = chain_app(&names);
-    let (full, member_count) = fallback_flow_lines(&app, 76);
+    let (full, member_count) = fallback_flow_lines(&app, 76, &app.readings_snapshot());
     assert_eq!(member_count, 28, "the builder returns its member count");
     assert_eq!(full.len(), 29, "28 members + the all-spent caption");
     // 11 inner rows: 9 members + the caption + the more-line.
@@ -3579,7 +3713,7 @@ fn truncate_chain_draws_every_member_that_fits_without_the_more_line() {
     // the round-1 code hid two behind a `+2 more` line.
     let names: Vec<String> = (0..11).map(|i| format!("a{i}")).collect();
     let app = chain_app(&names);
-    let (full, member_count) = fallback_flow_lines(&app, 76);
+    let (full, member_count) = fallback_flow_lines(&app, 76, &app.readings_snapshot());
     assert_eq!(full.len(), 12, "11 members + the all-spent caption");
     let cut = truncate_chain(full, member_count, 11);
     assert_eq!(cut.len(), 11, "every member fits, the caption drops");
@@ -3665,7 +3799,7 @@ fn overview_more_line_styles_the_arrow_as_a_key() {
 }
 
 /// A hybrid's Overview bar text equals the
-/// provider-derived percentage — `apply_usage` fills `Profile.usage` from the
+/// provider-derived percentage — `apply_usage` fills the snapshot from the
 /// picker, so the Overview shows 10% (the provider bar), never the OAuth 100%.
 #[test]
 fn a_hybrids_overview_bar_shows_the_provider_percentage() {
@@ -3689,7 +3823,11 @@ fn a_hybrids_overview_bar_shows_the_provider_percentage() {
         hybrid.usage_cache_is_third_party(),
         "fixture classifies third-party"
     );
-    let config = config_with(vec![hybrid], Some("h"), vec!["h"]);
+    let (config, _readings) = config_with(
+        vec![(hybrid, ReadingsSnapshot::default())],
+        Some("h"),
+        vec!["h"],
+    );
     let mut app = App::new(config);
     app.usage_store
         .lock()
@@ -3700,8 +3838,9 @@ fn a_hybrids_overview_bar_shows_the_provider_percentage() {
         .unwrap()
         .insert("h".into(), tp_bar(10.0));
     app.apply_usage();
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let readings = app.readings_snapshot();
+    let widths = OverviewWidths::new(80, &app, &readings);
+    let line = render_overview_row(&app, 0, &widths, false, true, &readings);
     let text = line_text(&line);
     assert_eq!(
         text, "  ● h             API                [█░░░░░░░░░]  10%      —              ",
@@ -3765,8 +3904,15 @@ fn a_hybrid_has_no_projected_switch_eta() {
         hybrid.usage_cache_is_third_party(),
         "fixture classifies third-party"
     );
-    let spare = profile("spare", 95.0, 10.0, 3600);
-    let config = config_with(vec![hybrid, spare], Some("h"), vec!["h", "spare"]);
+    let (spare, spare_readings) = profile("spare", 95.0, 10.0, 3600);
+    let (config, _readings) = config_with(
+        vec![
+            (hybrid, ReadingsSnapshot::default()),
+            (spare, spare_readings),
+        ],
+        Some("h"),
+        vec!["h", "spare"],
+    );
     let mut app = App::new(config);
     // The provider's live 5h bar at 92% — below the static threshold, but a
     // burn series would project it past.
@@ -3833,9 +3979,13 @@ fn seed_heavy_burn(app: &mut App, name: &str) {
 /// so the margin that matters is the 30 s up to 540 s (a fixture landing on
 /// exactly 540 s rendered `8m` or `9m` by whether the clock moved a millisecond).
 fn healthy_burning_alpha(bravo_pct: f64, switch_off_when_spent: bool) -> App {
-    let a = profile("alpha", 95.0, 52.5, 3600);
-    let b = profile("bravo", 95.0, bravo_pct, 3600);
-    let mut config = config_with(vec![a, b], Some("alpha"), vec!["alpha", "bravo"]);
+    let (a, a_readings) = profile("alpha", 95.0, 52.5, 3600);
+    let (b, b_readings) = profile("bravo", 95.0, bravo_pct, 3600);
+    let (mut config, _readings) = config_with(
+        vec![(a, a_readings), (b, b_readings)],
+        Some("alpha"),
+        vec!["alpha", "bravo"],
+    );
     config.state.switch_off_when_spent = switch_off_when_spent;
     let mut app = App::new(config);
     #[allow(clippy::unwrap_used, reason = "test mutex poisoning is unrecoverable")]
@@ -3867,7 +4017,7 @@ fn healthy_burning_alpha(bravo_pct: f64, switch_off_when_spent: bool) -> App {
 fn reviewer_r1_default_caption_names_the_next_member_for_a_healthy_burning_active() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = healthy_burning_alpha(10.0, false);
-    let lines = fallback_flow_lines(&app, 120).0;
+    let lines = fallback_flow_lines(&app, 120, &app.readings_snapshot()).0;
     assert_eq!(
         hinted_row_text(&lines),
         " ╰ 2 bravo   ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~8m",
@@ -3882,7 +4032,7 @@ fn reviewer_r1_default_caption_names_the_next_member_for_a_healthy_burning_activ
 fn the_off_caption_warns_a_healthy_active_in_the_default_config() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = healthy_burning_alpha(100.0, true);
-    let lines = fallback_flow_lines(&app, 120).0;
+    let lines = fallback_flow_lines(&app, 120, &app.readings_snapshot()).0;
     let off: Vec<String> = lines
         .iter()
         .map(line_text)
@@ -3898,11 +4048,11 @@ fn the_off_caption_warns_a_healthy_active_in_the_default_config() {
 #[test]
 fn the_projected_switch_skips_a_kick_rejected_member() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("alpha", 95.0, 94.0, 3600);
-    let b = profile("bravo", 95.0, 10.0, 3600);
-    let c = profile("charlie", 95.0, 10.0, 3600);
-    let config = config_with(
-        vec![a, b, c],
+    let (a, a_readings) = profile("alpha", 95.0, 94.0, 3600);
+    let (b, b_readings) = profile("bravo", 95.0, 10.0, 3600);
+    let (c, c_readings) = profile("charlie", 95.0, 10.0, 3600);
+    let (config, _readings) = config_with(
+        vec![(a, a_readings), (b, b_readings), (c, c_readings)],
         Some("alpha"),
         vec!["alpha", "bravo", "charlie"],
     );
@@ -3934,7 +4084,7 @@ fn the_projected_switch_skips_a_kick_rejected_member() {
             .insert("charlie".to_string(), crate::usage::FetchStatus::Fresh);
     }
 
-    let lines = fallback_flow_lines(&app, 120).0;
+    let lines = fallback_flow_lines(&app, 120, &app.readings_snapshot()).0;
     assert_eq!(
         hinted_row_text(&lines),
         " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
@@ -3950,11 +4100,11 @@ fn the_projected_switch_skips_a_kick_rejected_member() {
 #[test]
 fn the_projected_switch_prefers_a_fresh_reading_over_a_dead_reading_member() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("alpha", 95.0, 94.0, 3600);
-    let b = profile("bravo", 95.0, 10.0, 3600);
-    let c = profile("charlie", 95.0, 10.0, 3600);
-    let config = config_with(
-        vec![a, b, c],
+    let (a, a_readings) = profile("alpha", 95.0, 94.0, 3600);
+    let (b, b_readings) = profile("bravo", 95.0, 10.0, 3600);
+    let (c, c_readings) = profile("charlie", 95.0, 10.0, 3600);
+    let (config, _readings) = config_with(
+        vec![(a, a_readings), (b, b_readings), (c, c_readings)],
         Some("alpha"),
         vec!["alpha", "bravo", "charlie"],
     );
@@ -3986,7 +4136,7 @@ fn the_projected_switch_prefers_a_fresh_reading_over_a_dead_reading_member() {
             .insert("charlie".to_string(), crate::usage::FetchStatus::Fresh);
     }
 
-    let lines = fallback_flow_lines(&app, 120).0;
+    let lines = fallback_flow_lines(&app, 120, &app.readings_snapshot()).0;
     assert_eq!(
         hinted_row_text(&lines),
         " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
@@ -4001,9 +4151,13 @@ fn the_projected_switch_prefers_a_fresh_reading_over_a_dead_reading_member() {
 #[test]
 fn the_projected_switch_names_the_next_member_under_burn_aware_default_floor() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("alpha", 95.0, 94.0, 3600);
-    let b = profile("bravo", 95.0, 10.0, 3600);
-    let mut config = config_with(vec![a, b], Some("alpha"), vec!["alpha", "bravo"]);
+    let (a, a_readings) = profile("alpha", 95.0, 94.0, 3600);
+    let (b, b_readings) = profile("bravo", 95.0, 10.0, 3600);
+    let (mut config, _readings) = config_with(
+        vec![(a, a_readings), (b, b_readings)],
+        Some("alpha"),
+        vec!["alpha", "bravo"],
+    );
     config.state.burn_aware_switching = true;
     let mut app = App::new(config);
     seed_5h(&mut app, "alpha", 94.0);
@@ -4020,7 +4174,7 @@ fn the_projected_switch_names_the_next_member_under_burn_aware_default_floor() {
             .unwrap()
             .insert("bravo".to_string(), crate::usage::FetchStatus::Fresh);
     }
-    let lines = fallback_flow_lines(&app, 120).0;
+    let lines = fallback_flow_lines(&app, 120, &app.readings_snapshot()).0;
     assert_eq!(
         hinted_row_text(&lines),
         " ╰ 2 bravo   ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
@@ -4035,13 +4189,13 @@ fn the_projected_switch_names_the_next_member_under_burn_aware_default_floor() {
 #[test]
 fn the_projected_switch_skips_a_live_key_rejected_member() {
     let _home = crate::testutil::HomeSandbox::new();
-    let a = profile("alpha", 95.0, 94.0, 3600);
-    let mut bravo = third_party_profile(10.0, 10.0);
+    let (a, a_readings) = profile("alpha", 95.0, 94.0, 3600);
+    let (mut bravo, bravo_readings) = third_party_profile(10.0, 10.0);
     bravo.name = "bravo".into();
     let fp = crate::usage::profile_credential_fingerprint(&bravo).expect("fingerprint");
-    let c = profile("charlie", 95.0, 10.0, 3600);
-    let config = config_with(
-        vec![a, bravo, c],
+    let (c, c_readings) = profile("charlie", 95.0, 10.0, 3600);
+    let (config, _readings) = config_with(
+        vec![(a, a_readings), (bravo, bravo_readings), (c, c_readings)],
         Some("alpha"),
         vec!["alpha", "bravo", "charlie"],
     );
@@ -4074,7 +4228,7 @@ fn the_projected_switch_skips_a_live_key_rejected_member() {
             .unwrap()
             .insert("charlie".to_string(), crate::usage::FetchStatus::Fresh);
     }
-    let lines = fallback_flow_lines(&app, 120).0;
+    let lines = fallback_flow_lines(&app, 120, &app.readings_snapshot()).0;
     assert_eq!(
         hinted_row_text(&lines),
         " ╰ 3 charlie  ▰▱▱▱▱▱▱▱▱▱▱▱   10 / 95%   ↲ ~6s",
@@ -4088,17 +4242,15 @@ fn the_projected_switch_skips_a_live_key_rejected_member() {
 #[test]
 fn the_deepseek_balance_cell_desktop_matches_the_pre_s9_render() {
     let _home = crate::testutil::HomeSandbox::new();
-    let app = App::new(config_with(
-        vec![deepseek_profile("ds", &["1132.60 CNY"])],
-        None,
-        vec![],
-    ));
+    let (config, readings) =
+        config_with(vec![deepseek_profile("ds", &["1132.60 CNY"])], None, vec![]);
+    let app = App::new(config);
     for (terminal, expected) in [
         (80u16, "[1132.60 CNY]    "),
         (160u16, "[1132.60 CNY]             "),
     ] {
-        let widths = OverviewWidths::new(terminal.saturating_sub(4), &app);
-        let row = render_overview_row(&app, 0, &widths, false, false);
+        let widths = OverviewWidths::new(terminal.saturating_sub(4), &app, &readings);
+        let row = render_overview_row(&app, 0, &widths, false, false, &readings);
         let cell = five_hour_cell_text(&widths, true, &row);
         assert_eq!(cell, expected, "balance cell at {terminal} cols");
     }
@@ -4110,10 +4262,10 @@ fn the_deepseek_balance_cell_desktop_matches_the_pre_s9_render() {
 fn the_stay_caption_desktop_rows_match_the_pre_s9_render() {
     let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 10.0, 3600);
-    let config = config_with(vec![a], Some("a"), vec!["a"]);
+    let (config, readings) = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
     for w in [76usize, 156] {
-        let lines = fallback_flow_lines(&app, w).0;
+        let lines = fallback_flow_lines(&app, w, &readings).0;
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         let start = texts
             .iter()

@@ -115,11 +115,11 @@ mod tests;
 /// last-known numbers (cached / rate-limited both do — matches the amber
 /// `rate limited` badge on the usage detail line), red when the fetch failed,
 /// `None` when live.
-pub(super) fn fetch_cue_color(profile: &Profile) -> Option<Color> {
+pub(super) fn fetch_cue_color(profile: &Profile, status: Option<FetchStatus>) -> Option<Color> {
     if !profile.is_oauth() {
         return None;
     }
-    match profile.fetch_status {
+    match status {
         Some(FetchStatus::Cached | FetchStatus::RateLimited) => Some(theme::warning_color()),
         Some(FetchStatus::Failed) => Some(theme::danger_color()),
         _ => None,
@@ -140,11 +140,14 @@ pub(super) const NO_DATA: &str = "—";
 /// gets [`NO_DATA`]: the old bare "Claude" read as a real plan, and this column
 /// is the one place a reader compares tiers side by side. The caller styles the
 /// cell, so it is the caller that keeps a no-data dash out of the identity pulse.
-pub(super) fn account_type_label(profile: &Profile) -> String {
+pub(super) fn account_type_label(
+    profile: &Profile,
+    usage: Option<&crate::usage::UsageInfo>,
+) -> String {
     if !profile.is_oauth() {
         return "API".to_string();
     }
-    account_tier(profile)
+    account_tier(profile, usage)
         .and_then(|t| t.short_label())
         .unwrap_or_else(|| NO_DATA.to_string())
 }

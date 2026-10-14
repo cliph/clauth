@@ -12,8 +12,8 @@ use ratatui::text::{Line, Span};
 use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, load_profile_cache};
 
 use super::super::app::{
-    App, ConfigDraft, ConfigFocus, ConfigRow, DraftLogin, InputState, MODEL_PRESETS, config_rows,
-    escape_control,
+    App, ConfigDraft, ConfigFocus, ConfigRow, DraftLogin, InputState, MODEL_PRESETS,
+    ReadingsSnapshot, config_rows, escape_control,
 };
 use super::super::theme;
 use super::format::{middle_truncate, truncate};
@@ -25,14 +25,14 @@ use super::panes::{
 };
 use super::prose::{cmd, cmd_lit, key_lit};
 
-pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &ReadingsSnapshot) {
     // +1 for the trailing `+ new` picker row.
     let items = app.config().profiles.len() + 1;
     let (selector, settings) = master_detail(area, items);
 
     let profiles_focused = app.config_focus == ConfigFocus::Profiles;
     draw_selector(frame, selector, app, profiles_focused);
-    draw_settings(frame, settings, app);
+    draw_settings(frame, settings, app, readings);
 }
 
 fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
@@ -221,7 +221,7 @@ impl Snap {
     }
 }
 
-fn build_snap(app: &App, with_text: bool) -> Snap {
+fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
     let text = |s: &Option<String>| {
         if with_text {
             s.clone().unwrap_or_default()
@@ -320,7 +320,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
                 rolling_token: matches!(&sidecar, Some((crate::claude::SidecarKind::Rolling, _))),
                 rolling_armed: p.rolling_token,
                 has_static_backup: crate::claude::has_static_backup(&p.name),
-                email: login_email(p),
+                email: login_email(p, readings.usage_of(&p.name).and_then(|u| u.plan.as_ref())),
                 mint_armed: false,
             }
         }
@@ -336,18 +336,21 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
 /// the next read re-anchors). A plan carried over from an earlier login, here
 /// or in another process, names no one. Read per frame for the selected
 /// profile only (two small files).
-fn login_email(p: &crate::profile::Profile) -> Option<String> {
+fn login_email(
+    p: &crate::profile::Profile,
+    plan: Option<&crate::usage::PlanInfo>,
+) -> Option<String> {
     p.credentials.as_ref()?.claude_ai_oauth.as_ref()?;
-    let email = p.usage.as_ref()?.plan.as_ref()?.email.as_ref()?;
+    let email = plan?.email.as_ref()?;
     load_profile_cache::<u64>(&p.name, PROFILE_FETCHED_CACHE_FILE)?;
     let anchor = load_profile_cache::<crate::profile::AccountId>(&p.name, ACCOUNT_ID_CACHE_FILE)?;
     (email.account == anchor).then(|| escape_control(&email.address))
 }
 
-fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &ReadingsSnapshot) {
     let actions_focused = app.config_focus == ConfigFocus::Actions;
     let draft = app.config_draft.as_ref();
-    let snap = build_snap(app, draft.is_none());
+    let snap = build_snap(app, readings, draft.is_none());
 
     // Profile names render verbatim; structural titles ("+ new account", "settings") stay uppercased.
     let is_profile_name = app.profile_cursor < app.config().profiles.len();

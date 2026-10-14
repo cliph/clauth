@@ -759,9 +759,6 @@ pub(crate) fn edit_profile_endpoint(
             .and_then(crate::providers::Provider::from_base_url);
         let drop_cache =
             provider != profile.provider || (provider.is_some() && profile.api_key != old_api_key);
-        if drop_cache {
-            profile.third_party_usage = None;
-        }
         // The console session is a FOURTH credential and it means nothing off
         // Alibaba: left behind, an endpoint move parks a live Model Studio
         // session on a profile that no longer talks to Model Studio, and every
@@ -824,7 +821,6 @@ pub(crate) fn store_console_login(
     with_state_lock(|_held| {
         let profile = config.find_mut(name).context("profile not found")?;
         profile.console = Some(console);
-        profile.third_party_usage = None;
         save_profile_config(profile)?;
         crate::profile_cache::remove_profile_cache(
             name,
@@ -921,7 +917,6 @@ pub(crate) fn edit_profile_preset(
             .as_deref()
             .and_then(Provider::from_base_url);
         if provider != profile.provider {
-            profile.third_party_usage = None;
             // The disk cache holds the same stale figures, and
             // `bootstrap_third_party` reseeds them `Fresh` — on a restart,
             // a daemon boot/standby promotion, or the stood-down TUI's
@@ -2344,9 +2339,6 @@ pub(crate) fn overwrite_captured_profile(
         if provider != Some(Provider::Alibaba) {
             profile.console = None;
         }
-        profile.usage = None;
-        profile.fetch_status = None;
-        profile.third_party_usage = None;
         crate::oauth::retire_unreadable_spent_record(&profile.name);
         save_profile(profile)?;
 
@@ -2454,9 +2446,6 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileNa
             .find_mut(name)
             .with_context(|| format!("profile '{name}' not found"))?;
         profile.set_credentials(None, held);
-        profile.usage = None;
-        profile.fetch_status = None;
-        profile.third_party_usage = None;
         crate::oauth::retire_unreadable_spent_record(name);
         save_profile(profile)?;
         // Drop any legacy `.pending` rotation sidecar too: with credentials.json gone,

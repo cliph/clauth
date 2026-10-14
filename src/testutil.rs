@@ -1122,11 +1122,7 @@ pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profil
         disabled: false,
         console: None,
         credentials: None,
-        usage: None,
-        fetch_status: None,
-        usage_stale: false,
         provider: None,
-        third_party_usage: None,
     }
 }
 
@@ -1263,6 +1259,15 @@ pub(crate) fn register_names(names: &[&str]) {
         }
     }
     crate::profile::save_app_state(&state).expect("save app state");
+}
+
+/// Write a plain (diverged) `~/.claude/.credentials.json` carrying `creds`.
+pub(crate) fn write_live_creds(creds: &crate::profile::ClaudeCredentials) {
+    let path = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(&path, serde_json::to_vec(creds).expect("ser live")).expect("write live");
 }
 
 // ── provider-cache fixtures ──────────────────────────────────────────────────
@@ -1768,6 +1773,81 @@ pub(crate) fn bar_reset_in(
             crate::usage::now_epoch_secs() + secs_in_future,
         )),
         ..bar(label, pct)
+    }
+}
+
+/// The walk fixture reviewer A's r3 probe used: `act` and `ok` are OAuth
+/// accounts (`act` exhausted at 99%, `ok` at 10% fresh or aged), `kl` is a
+/// KEYLESS DeepSeek chain member with a `third_party_cache.json` reading
+/// `kl_five`% — a display-only name (third-party-classified, no api key), the
+/// exact shape whose cached reading commit 2b's display superset lets reach the
+/// walk. The active's credentials are linked so startup reconcile is Clean.
+/// Runs under the caller's `HomeSandbox`.
+pub(crate) fn keyless_walk_fixture(chain: &[&str], active: &str, ok_age_secs: u64, kl_five: f64) {
+    use crate::profile::{AppState, ProfileName, save_app_state, save_profile};
+    let oauth = |n: &str| {
+        let mut p = blank_profile(&ProfileName::from(n));
+        p.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: format!("acc-{n}"),
+                refresh_token: Some(format!("rt-{n}")),
+                expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        });
+        p
+    };
+    let act = oauth("act");
+    let ok = oauth("ok");
+    let mut kl = blank_profile(&ProfileName::from("kl"));
+    kl.base_url = Some("https://api.deepseek.com/anthropic".into());
+    kl.provider = Some(crate::providers::Provider::DeepSeek);
+    for p in [&act, &kl, &ok] {
+        save_profile(p).expect("save profile");
+    }
+    save_app_state(&AppState {
+        active_profile: Some(active.into()),
+        profiles: vec!["act".into(), "kl".into(), "ok".into()],
+        fallback_chain: chain.iter().map(|&n| n.into()).collect(),
+        refresh_interval_ms: 90_000,
+        ..AppState::default()
+    })
+    .expect("save state");
+    let write_oauth_cache = |name: &str, five: f64, age_secs: u64| {
+        let now = crate::usage::now_epoch_secs();
+        let info = crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: five,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(now + 7200)),
+            }),
+            fetched_at: Some(crate::usage::now_ms() - age_secs * 1000),
+            ..crate::usage::UsageInfo::default()
+        };
+        crate::profile_cache::write_profile_cache(
+            &ProfileName::from(name),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &info,
+        );
+        let path = crate::profile::profile_dir(&ProfileName::from(name))
+            .unwrap()
+            .join(crate::profile_cache::USAGE_CACHE_FILE);
+        set_mtime(
+            &path,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs),
+        );
+    };
+    write_oauth_cache("act", 99.0, 0);
+    write_oauth_cache("ok", 10.0, ok_age_secs);
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("kl"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats_with_bars(vec![bar_reset_in("5h", kl_five, 7200), bar("7d", 23.0)]),
+    );
+    if active != "kl" {
+        crate::claude::force_link_profile_credentials(&ProfileName::from(active))
+            .expect("link active");
     }
 }
 

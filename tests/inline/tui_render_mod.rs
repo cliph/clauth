@@ -4,12 +4,11 @@ use super::*;
 use crate::profile::{AppConfig, AppState, Profile, ProfileName};
 use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase};
 use crate::tui::app::{App, ConfigFocus, StatusFocus};
-use crate::usage::{UsageInfo, UsageWindow};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use std::collections::BTreeMap;
 
-fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
+fn oauth(name: &str, auto: bool) -> Profile {
     Profile {
         name: name.into(),
         base_url: None,
@@ -30,22 +29,25 @@ fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
         disabled: false,
         console: None,
         credentials: None,
-        usage: Some(UsageInfo {
-            plan: None,
-            five_hour: Some(UsageWindow {
-                utilization: five,
-                resets_at: None,
-            }),
-            seven_day: Some(UsageWindow {
-                utilization: seven,
-                resets_at: None,
-            }),
-            ..UsageInfo::default()
-        }),
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
+    }
+}
+
+/// A 5h and 7d OAuth reading with no reset stamp, seeded into the OAuth store
+/// by the fixtures whose expected bytes carry those figures.
+fn oauth_usage(five: f64, seven: f64) -> crate::usage::UsageInfo {
+    use crate::usage::UsageWindow;
+    crate::usage::UsageInfo {
+        plan: None,
+        five_hour: Some(UsageWindow {
+            utilization: five,
+            resets_at: None,
+        }),
+        seven_day: Some(UsageWindow {
+            utilization: seven,
+            resets_at: None,
+        }),
+        ..crate::usage::UsageInfo::default()
     }
 }
 
@@ -137,7 +139,7 @@ fn overview_selection_moves_inside_a_persistent_viewport() {
     let mut app = App::new(AppConfig {
         state: AppState::default(),
         profiles: (0..25)
-            .map(|i| oauth(&format!("fixture-{i:02}"), 40.0, 20.0, false))
+            .map(|i| oauth(&format!("fixture-{i:02}"), false))
             .collect(),
     });
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -169,7 +171,7 @@ fn account_selectors_hold_separate_viewports_across_tabs_and_resize() {
     let mut app = App::new(AppConfig {
         state: AppState::default(),
         profiles: (0..25)
-            .map(|i| oauth(&format!("fixture-{i:02}"), 40.0, 20.0, false))
+            .map(|i| oauth(&format!("fixture-{i:02}"), false))
             .collect(),
     });
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -683,7 +685,7 @@ fn a_shrunk_selector_restores_its_first_row_and_removes_its_bar() {
     let mut app = App::new(AppConfig {
         state: AppState::default(),
         profiles: (0..25)
-            .map(|i| oauth(&format!("fixture-{i:02}"), 40.0, 20.0, false))
+            .map(|i| oauth(&format!("fixture-{i:02}"), false))
             .collect(),
     });
     app.tab = Tab::Usage;
@@ -727,7 +729,7 @@ fn hybrid_renders_the_activity_and_deadline_of_its_provider_cache() {
     use crate::tui::app::Tab;
     use crate::usage::{FetchLeg, ProfileActivity, mark_activity, mark_fetch_activity};
 
-    let mut hybrid = oauth("hybrid", 40.0, 60.0, false);
+    let mut hybrid = oauth("hybrid", false);
     hybrid.base_url = Some("https://api.deepseek.com".to_string());
     hybrid.api_key = Some("key".to_string());
     hybrid.provider = crate::providers::Provider::from_base_url("https://api.deepseek.com");
@@ -1101,9 +1103,9 @@ fn login_modal_drops_the_url_and_offers_a_retry() {
 fn all_tabs_render() {
     let _home = crate::testutil::HomeSandbox::new();
     let profiles = vec![
-        oauth("uwuclxdy", 42.0, 18.0, true),
-        oauth("work", 12.0, 3.0, false),
-        oauth("spare", 0.0, 0.0, false),
+        oauth("uwuclxdy", true),
+        oauth("work", false),
+        oauth("spare", false),
     ];
     let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     let config = AppConfig {
@@ -1286,7 +1288,7 @@ fn config_context_nudge_custom_editor_renders() {
 fn fallback_threshold_editor_shows_range_tooltip() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{CardEdit, FallbackFocus, InputState, MemberEdit, Tab};
-    let profiles = vec![oauth("uwuclxdy", 42.0, 18.0, true)];
+    let profiles = vec![oauth("uwuclxdy", true)];
     let config = AppConfig {
         state: AppState {
             active_profile: Some("uwuclxdy".into()),
@@ -1329,7 +1331,7 @@ fn fallback_threshold_editor_shows_range_tooltip() {
 fn setup_delete_row_hint_names_usage_history() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{ConfigRow, Tab, config_rows};
-    let profiles = vec![oauth("uwuclxdy", 42.0, 18.0, true)];
+    let profiles = vec![oauth("uwuclxdy", true)];
     let config = AppConfig {
         state: AppState {
             active_profile: Some("uwuclxdy".into()),
@@ -1359,10 +1361,9 @@ fn setup_delete_row_hint_names_usage_history() {
 fn setup_api_account_shows_relogin_and_logout_rows() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{ConfigRow, Tab, config_rows};
-    let mut api = oauth("acme", 0.0, 0.0, false);
+    let mut api = oauth("acme", false);
     api.base_url = Some("https://api.example.com".to_string());
     api.api_key = Some("sk-secret".to_string());
-    api.usage = None;
     let config = AppConfig {
         state: AppState {
             profiles: vec!["acme".into()],
@@ -1487,10 +1488,9 @@ fn new_form_renders_the_capture_row_and_its_done_state() {
 fn setup_hybrid_account_reads_logged_in_on_its_oauth_pair() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{ConfigRow, Tab, config_rows};
-    let mut hybrid = oauth("acme", 0.0, 0.0, false);
+    let mut hybrid = oauth("acme", false);
     hybrid.base_url = Some("http://127.0.0.1:1234".to_string());
     hybrid.credentials = Some(hybrid_creds());
-    hybrid.usage = None;
     let config = AppConfig {
         state: AppState {
             profiles: vec!["acme".into()],
@@ -1529,11 +1529,10 @@ fn setup_hybrid_account_reads_logged_in_on_its_oauth_pair() {
 fn setup_hybrid_logout_hint_names_the_oauth_login() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{ConfigRow, Tab, config_rows};
-    let mut hybrid = oauth("acme", 0.0, 0.0, false);
+    let mut hybrid = oauth("acme", false);
     hybrid.base_url = Some("https://api.example.com".to_string());
     hybrid.api_key = Some("sk-secret".to_string());
     hybrid.credentials = Some(hybrid_creds());
-    hybrid.usage = None;
     let config = AppConfig {
         state: AppState {
             profiles: vec!["acme".into()],
@@ -1675,10 +1674,7 @@ fn status_selected_row_tint_spans_both_lines() {
 fn narrow_app() -> App {
     use crate::tokens::{ModelTokens, TokenStats};
 
-    let profiles = vec![
-        oauth("uwuclxdy", 42.0, 18.0, true),
-        oauth("work-account", 12.0, 3.0, false),
-    ];
+    let profiles = vec![oauth("uwuclxdy", true), oauth("work-account", false)];
     let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     let config = AppConfig {
         state: AppState {
@@ -1690,6 +1686,14 @@ fn narrow_app() -> App {
         profiles,
     };
     let mut app = App::new(config);
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("uwuclxdy".to_string(), oauth_usage(42.0, 18.0));
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("work-account".to_string(), oauth_usage(12.0, 3.0));
     app.status.incidents = demo_incidents();
     app.token_stats = Some(TokenStats {
         models: vec![
@@ -1720,11 +1724,11 @@ fn usage_weekly_teach_keys_on_the_hard_cap_not_the_member_line() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::usage::{FetchStatus, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let mk_app = |seven_day: f64| {
-        let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-        p.weekly_threshold = Some(90.0);
+        let p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
         // 5h spent (past its rotate threshold, live reset) so the `spent`
-        // pill — the teach's gate — renders at all.
-        p.usage = Some(UsageInfo {
+        // pill — the teach's gate — renders at all. The reading seeds the
+        // OAuth store, the per-frame snapshot's source.
+        let info = UsageInfo {
             five_hour: Some(UsageWindow {
                 utilization: 100.0,
                 resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
@@ -1734,16 +1738,25 @@ fn usage_weekly_teach_keys_on_the_hard_cap_not_the_member_line() {
                 resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 5 * 86_400)),
             }),
             ..UsageInfo::default()
-        });
-        p.fetch_status = Some(FetchStatus::Fresh);
+        };
+        let mut p_with_threshold = p;
+        p_with_threshold.weekly_threshold = Some(90.0);
         let config = AppConfig {
             state: AppState {
                 profiles: vec!["a".into()],
                 ..AppState::default()
             },
-            profiles: vec![p],
+            profiles: vec![p_with_threshold],
         };
         let mut app = App::new(config);
+        app.usage_store
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), info);
+        app.usage_status
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), FetchStatus::Fresh);
         app.tab = Tab::Usage;
         app
     };
@@ -2009,7 +2022,7 @@ fn banner_renders() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{Banner, BannerSeverity};
 
-    let profiles = vec![oauth("alpha", 99.0, 50.0, true)];
+    let profiles = vec![oauth("alpha", true)];
     let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     let config = AppConfig {
         state: AppState {
@@ -2049,7 +2062,7 @@ fn tokens_models_view_empty_filter_names_the_filter() {
     use crate::tokens::{ModelTokens, TokenStats};
     use crate::tui::app::{TokenFilter, TokenView};
 
-    let profiles = vec![oauth("uwuclxdy", 42.0, 18.0, true)];
+    let profiles = vec![oauth("uwuclxdy", true)];
     let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     let config = AppConfig {
         state: AppState {
@@ -2108,11 +2121,7 @@ fn bare(name: &str) -> Profile {
         disabled: false,
         console: None,
         credentials: None,
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     }
 }
 
@@ -2239,7 +2248,7 @@ fn form_panes_keep_the_focused_row_on_screen_when_they_overflow() {
 
     // Setup's detail pane grows with a profile's env entries, so it overflows
     // the same way — its last row (`delete account`) must stay reachable.
-    let mut p = oauth("uwuclxdy", 10.0, 10.0, false);
+    let mut p = oauth("uwuclxdy", false);
     for i in 0..8 {
         p.env.insert(format!("CUSTOM_VAR_{i}"), "value".into());
     }
@@ -2684,16 +2693,24 @@ fn usage_tab_reset_follows_the_reset_display_setting() {
     use crate::profile::ResetDisplay;
     use crate::tui::app::Tab;
 
-    let mut profile = oauth("a", 40.0, 10.0, false);
-    if let Some(w) = profile.usage.as_mut().and_then(|u| u.five_hour.as_mut()) {
-        w.resets_at = Some(crate::usage::epoch_secs_to_iso(
-            crate::usage::now_epoch_secs() + 40 * 60,
-        ));
-    }
+    let profile = oauth("a", false);
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 40.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 40 * 60,
+            )),
+        }),
+        ..Default::default()
+    };
     let mut app = App::new(AppConfig {
         state: AppState::default(),
         profiles: vec![profile],
     });
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), info);
     app.tab = Tab::Usage;
 
     // The stamp carries a `mon`-style day qualifier when the reset crosses
@@ -2766,26 +2783,30 @@ fn the_overview_column_budget_never_pays_for_a_new_column_with_an_old_one() {
 
     for (name_len, first_bar, first_reset, seven_bar, seven_reset) in BUDGET {
         let name = "n".repeat(*name_len);
-        let mut profile = oauth(&name, 40.0, 60.0, false);
+        let profile = oauth(&name, false);
         let now = crate::usage::now_epoch_secs();
-        if let Some(u) = profile.usage.as_mut() {
-            // Both resets sit MID-unit, deliberately. `humanize_duration` narrows
-            // by a cell the moment a countdown crosses a unit boundary (`3h 0m` →
-            // `2h 59m`, `4d 0h` → `3d 23h`), and `reset_suffix` fit-checks the
-            // stamp — so a fixture pinned exactly ON a boundary decides a column
-            // boundary by which second the render lands in. That shipped as a
-            // 28%-flaky pin at the 22-char row's 107th column.
-            if let Some(w) = u.five_hour.as_mut() {
-                w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 3 * 3600 + 1800));
-            }
-            if let Some(w) = u.seven_day.as_mut() {
-                w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 4 * 86400 + 43200));
-            }
-        }
+        // Both resets sit MID-unit, deliberately. `humanize_duration` narrows
+        // by a cell the moment a countdown crosses a unit boundary (`3h 0m` →
+        // `2h 59m`, `4d 0h` → `3d 23h`), and `reset_suffix` fit-checks the
+        // stamp — so a fixture pinned exactly ON a boundary decides a column
+        // boundary by which second the render lands in. That shipped as a
+        // 28%-flaky pin at the 22-char row's 107th column.
+        let info = crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 40.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3 * 3600 + 1800)),
+            }),
+            seven_day: Some(crate::usage::UsageWindow {
+                utilization: 60.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(now + 4 * 86400 + 43200)),
+            }),
+            ..Default::default()
+        };
         let mut app = App::new(AppConfig {
             state: AppState::default(),
             profiles: vec![profile],
         });
+        app.usage_store.lock().unwrap().insert(name, info);
         app.tab = Tab::Overview;
 
         for width in 34u16..=200 {
@@ -2816,9 +2837,9 @@ fn s9_overview_app() -> App {
     // ASCII first so the cursor lands on it, CJK active, emoji third — the
     // same order the accounts table renders them in.
     let profiles = vec![
-        oauth(names[2], 12.0, 8.0, false),
-        oauth(names[0], 49.0, 30.0, true),
-        oauth(names[1], 63.0, 40.0, false),
+        oauth(names[2], false),
+        oauth(names[0], true),
+        oauth(names[1], false),
     ];
     let profile_names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     let mut app = App::new(AppConfig {
@@ -2830,6 +2851,18 @@ fn s9_overview_app() -> App {
         },
         profiles,
     });
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(names[2].to_string(), oauth_usage(12.0, 8.0));
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(names[0].to_string(), oauth_usage(49.0, 30.0));
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(names[1].to_string(), oauth_usage(63.0, 40.0));
     app.tab = Tab::Overview;
     app
 }
@@ -3169,20 +3202,27 @@ fn overview_reset_column_never_loses_ground_to_the_clock_setting() {
     use crate::profile::ResetDisplay;
     use crate::tui::app::Tab;
 
-    let mut profile = oauth("a", 40.0, 60.0, false);
+    let profile = oauth("a", false);
     let now = crate::usage::now_epoch_secs();
-    if let Some(u) = profile.usage.as_mut() {
-        if let Some(w) = u.five_hour.as_mut() {
-            w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 3 * 3600));
-        }
-        if let Some(w) = u.seven_day.as_mut() {
-            w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 4 * 86400));
-        }
-    }
+    let info = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 40.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 3 * 3600)),
+        }),
+        seven_day: Some(crate::usage::UsageWindow {
+            utilization: 60.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(now + 4 * 86400)),
+        }),
+        ..Default::default()
+    };
     let mut app = App::new(AppConfig {
         state: AppState::default(),
         profiles: vec![profile],
     });
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), info);
     app.tab = Tab::Overview;
 
     // The reset cell is whatever sits in parens after a bar's `%`, so this counts
@@ -3292,7 +3332,7 @@ fn the_live_column_appears_monotonically_in_width() {
             };
             let mut app = App::new(AppConfig {
                 state,
-                profiles: vec![oauth(&name, 40.0, 60.0, false)],
+                profiles: vec![oauth(&name, false)],
             });
             app.tab = Tab::Overview;
 
@@ -3580,9 +3620,9 @@ fn preferred_days_app(config: AppConfig) -> App {
 
 /// One chain member holding `days`, on the Fallback detail.
 fn preferred_days_card(days: Vec<chrono::Weekday>) -> App {
-    let mut p = oauth("uwuclxdy", 42.0, 18.0, true);
+    let mut p = oauth("uwuclxdy", true);
     p.preferred_days = days;
-    preferred_days_app(AppConfig {
+    let app = preferred_days_app(AppConfig {
         state: AppState {
             active_profile: Some("uwuclxdy".into()),
             profiles: vec!["uwuclxdy".into()],
@@ -3590,7 +3630,12 @@ fn preferred_days_card(days: Vec<chrono::Weekday>) -> App {
             ..AppState::default()
         },
         profiles: vec![p],
-    })
+    });
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("uwuclxdy".to_string(), oauth_usage(42.0, 18.0));
+    app
 }
 
 /// Both hint arms, whole footer row: the row's own keys at rest, then the
@@ -3939,7 +3984,7 @@ fn a_hand_written_day_list_renders_without_rewriting_its_file() {
     let path = crate::profile::profile_subpath(&name, "config.toml").expect("config path");
 
     // Seeded the way an operator would write it: the weekends the other way round.
-    let mut seeded = oauth("uwuclxdy", 42.0, 18.0, true);
+    let mut seeded = oauth("uwuclxdy", true);
     seeded.preferred_days = vec![chrono::Weekday::Sun, chrono::Weekday::Sat];
     crate::profile::save_profile(&seeded).expect("seed the hand-written list");
     let before = std::fs::read(&path).expect("read the seeded file");
@@ -4455,9 +4500,9 @@ fn boxed_rows(out: &str, title: &str) -> (Vec<String>, Vec<char>) {
 fn the_add_picker_follows_its_cursor_and_draws_its_scrollbar() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{FallbackFocus, Tab};
-    let mut profiles = vec![oauth("a", 42.0, 18.0, false)];
+    let mut profiles = vec![oauth("a", false)];
     for i in 1..=12 {
-        profiles.push(oauth(&format!("c{i:02}"), 10.0, 10.0, false));
+        profiles.push(oauth(&format!("c{i:02}"), false));
     }
     profiles[12].preferred_days = vec![chrono::Weekday::Sat, chrono::Weekday::Sun];
     let names = profiles.iter().map(|p| p.name.clone()).collect();
@@ -4532,7 +4577,7 @@ fn the_preferred_days_hint_reads_whole_on_a_narrow_card() {
     let _home = crate::testutil::HomeSandbox::new();
     use chrono::Weekday::{Fri, Sat, Sun};
     let member = |name: &str, days: Vec<chrono::Weekday>, disabled: bool| {
-        let mut p = oauth(name, 42.0, 18.0, false);
+        let mut p = oauth(name, false);
         p.preferred_days = days;
         p.disabled = disabled;
         p
@@ -4601,9 +4646,9 @@ fn the_preferred_days_hint_reads_whole_on_a_narrow_card() {
 fn a_mid_list_add_candidate_keeps_its_whole_note_on_screen() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{FallbackFocus, Tab};
-    let mut profiles = vec![oauth("a", 42.0, 18.0, false)];
+    let mut profiles = vec![oauth("a", false)];
     for i in 1..=12 {
-        profiles.push(oauth(&format!("c{i:02}"), 10.0, 10.0, false));
+        profiles.push(oauth(&format!("c{i:02}"), false));
     }
     profiles[8].preferred_days = vec![chrono::Weekday::Sat, chrono::Weekday::Sun];
     let names = profiles.iter().map(|p| p.name.clone()).collect();
@@ -5100,7 +5145,7 @@ fn page_never_skips_content() {
 
     // Setup detail.
     let mk = || {
-        let profiles = vec![oauth("uwuclxdy", 42.0, 18.0, true)];
+        let profiles = vec![oauth("uwuclxdy", true)];
         let mut a = App::new(AppConfig {
             state: AppState {
                 active_profile: Some("uwuclxdy".into()),
@@ -5153,7 +5198,7 @@ fn page_never_skips_content() {
 
     // Fallback member card.
     let mk = || {
-        let profiles = vec![oauth("uwuclxdy", 42.0, 18.0, true)];
+        let profiles = vec![oauth("uwuclxdy", true)];
         let mut a = App::new(AppConfig {
             state: AppState {
                 active_profile: Some("uwuclxdy".into()),
@@ -5631,9 +5676,9 @@ fn narrow_chain_names_keep_their_full_width_when_the_row_has_room() {
         "abcdefghijklmnopqrstuvwxyz",
     ];
     let profiles = vec![
-        oauth(names[0], 49.0, 30.0, true),
-        oauth(names[1], 63.0, 40.0, false),
-        oauth(names[2], 12.0, 8.0, false),
+        oauth(names[0], true),
+        oauth(names[1], false),
+        oauth(names[2], false),
     ];
     let profile_names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     let mut app = App::new(AppConfig {
@@ -5645,6 +5690,18 @@ fn narrow_chain_names_keep_their_full_width_when_the_row_has_room() {
         },
         profiles,
     });
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(names[0].to_string(), oauth_usage(49.0, 30.0));
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(names[1].to_string(), oauth_usage(63.0, 40.0));
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(names[2].to_string(), oauth_usage(12.0, 8.0));
     app.tab = Tab::Overview;
     for (w, members, caption) in [
         (
@@ -5714,9 +5771,9 @@ fn s9_fixture_app() -> App {
         "abcdefghijklmnopqrstuvwxyz",
     ];
     let profiles = vec![
-        oauth(names[2], 12.0, 8.0, false),
-        oauth(names[0], 49.0, 30.0, true),
-        oauth(names[1], 63.0, 40.0, false),
+        oauth(names[2], false),
+        oauth(names[0], true),
+        oauth(names[1], false),
     ];
     let profile_names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
     let mut app = App::new(AppConfig {
@@ -5728,6 +5785,18 @@ fn s9_fixture_app() -> App {
         },
         profiles,
     });
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(names[2].to_string(), oauth_usage(12.0, 8.0));
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(names[0].to_string(), oauth_usage(49.0, 30.0));
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert(names[1].to_string(), oauth_usage(63.0, 40.0));
     app.token_stats = Some(TokenStats {
         models: vec![
             ModelTokens {
@@ -6225,5 +6294,652 @@ fn the_fallback_selector_row_desktop_replaces_the_pre_s9_clip() {
             "│ ❯  #1 cjk-日 本 語 ア …  ││ 5h usage        ███████████░░░░░░░│░░░  49% used     │"
         ],
         "fallback selector + 5h usage row at 80 cols"
+    );
+}
+
+/// Drive the real startup order the production `run_loop` uses — `load_config`
+/// off the sandbox disk, `App::new`, then `reconcile_startup` (the seed runs
+/// there on every arm that leaves the drain nothing to resolve: no active
+/// profile, `Clean`, a banner-only divergence) — so a first-paint pin covers
+/// the seed's real entry point, never a hand-built config the seed skips.
+fn startup_app_from_disk() -> App {
+    let config = crate::profile::load_config().expect("load config off disk");
+    let mut app = App::new(config);
+    crate::tui::app::reconcile_startup(&mut app);
+    app
+}
+
+/// Write `p` plus `profiles.toml` to the sandbox disk and register its name, so
+/// `load_config` (the real startup loader) reads it back.
+fn save_profile_to_disk(p: &Profile) {
+    save_startup_state(&[p], AppState::default());
+}
+
+/// Write each of `profiles` plus `state` (its profile list filled from them)
+/// to the sandbox disk, so `load_config` reads back this exact startup.
+fn save_startup_state(profiles: &[&Profile], state: AppState) {
+    for p in profiles {
+        crate::profile::save_profile(p).expect("save profile");
+    }
+    crate::profile::save_app_state(&AppState {
+        profiles: profiles.iter().map(|p| p.name.clone()).collect(),
+        ..state
+    })
+    .expect("save state");
+}
+
+/// A DeepSeek account: `keyed` gives it the api key the fetch leg needs,
+/// `disabled` takes it off the work list.
+fn deepseek(name: &str, keyed: bool, disabled: bool) -> Profile {
+    let name = crate::profile::ProfileName::from(name);
+    let mut p = crate::testutil::blank_profile(&name);
+    p.base_url = Some("https://api.deepseek.com/anthropic".into());
+    if keyed {
+        p.api_key = Some("k".into());
+    }
+    p.provider = Some(crate::providers::Provider::DeepSeek);
+    p.disabled = disabled;
+    p
+}
+
+/// Write `name`'s `third_party_cache.json` with 5h/7d bars, `age` old.
+fn write_deepseek_cache(name: &str, five: f64, seven: f64, age: std::time::Duration) {
+    let name = crate::profile::ProfileName::from(name);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![
+            crate::testutil::bar("5h", five),
+            crate::testutil::bar("7d", seven),
+        ]),
+    );
+    let path = crate::profile::profile_dir(&name)
+        .expect("profile dir")
+        .join(crate::profile_cache::THIRD_PARTY_CACHE_FILE);
+    crate::testutil::set_mtime(&path, std::time::SystemTime::now() - age);
+}
+
+/// C9: the first frame after the real startup path (load_config → construction
+/// → reconcile → the seed → one draw) shows a third-party account's cached bars
+/// with no fetch — never a blank first paint.
+#[test]
+fn first_paint_shows_a_third_party_accounts_cached_bars() {
+    use crate::profile::ProfileName;
+    use crate::tui::app::Tab;
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("tp");
+    let mut p = crate::testutil::blank_profile(&name);
+    p.base_url = Some("https://api.deepseek.com/anthropic".into());
+    p.api_key = Some("k".into());
+    p.provider = Some(crate::providers::Provider::DeepSeek);
+    save_profile_to_disk(&p);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![
+            crate::testutil::bar("5h", 62.0),
+            crate::testutil::bar("7d", 31.0),
+        ]),
+    );
+    let mut app = startup_app_from_disk();
+    app.tab = Tab::Usage;
+    let out = dump(&app, 100, 24);
+    assert_eq!(
+        rows_with(&out, &["5h", "7d"]),
+        vec![
+            "│                            ││ 5h                                                             62% │",
+            "│                            ││ 7d                                                             31% │",
+        ],
+        "the first frame shows the seeded 5h/7d bars"
+    );
+}
+
+/// A DISABLED third-party account keeps its cached bars on the first frame:
+/// the seed set is every `usage_cache_is_third_party` profile (the deleted
+/// `load_profile` seed's predicate), disabled included — never the enabled-only
+/// work list.
+#[test]
+fn first_paint_shows_a_disabled_third_party_accounts_cached_bars() {
+    use crate::profile::ProfileName;
+    use crate::tui::app::Tab;
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("tp");
+    let mut p = crate::testutil::blank_profile(&name);
+    p.base_url = Some("https://api.deepseek.com/anthropic".into());
+    p.api_key = Some("k".into());
+    p.provider = Some(crate::providers::Provider::DeepSeek);
+    p.disabled = true;
+    save_profile_to_disk(&p);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![
+            crate::testutil::bar("5h", 47.0),
+            crate::testutil::bar("7d", 23.0),
+        ]),
+    );
+    let mut app = startup_app_from_disk();
+    app.tab = Tab::Usage;
+    let out = dump(&app, 100, 24);
+    assert_eq!(
+        rows_with(&out, &["5h", "7d"]),
+        vec![
+            "│                            ││ 5h                                                             47% │",
+            "│                            ││ 7d                                                             23% │",
+        ],
+        "a disabled account's cached bars render on the first frame"
+    );
+}
+
+/// A KEYLESS third-party account (a provider profile whose api key was moved
+/// out, cache still on disk) keeps its cached bars: `usage_cache_is_third_party`
+/// is true for a typed provider even without a key, so the display superset
+/// seeds it while the work list never could.
+#[test]
+fn first_paint_shows_a_keyless_third_party_accounts_cached_bars() {
+    use crate::profile::ProfileName;
+    use crate::tui::app::Tab;
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("tp");
+    let mut p = crate::testutil::blank_profile(&name);
+    p.base_url = Some("https://api.deepseek.com/anthropic".into());
+    p.provider = Some(crate::providers::Provider::DeepSeek);
+    save_profile_to_disk(&p);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![
+            crate::testutil::bar("5h", 55.0),
+            crate::testutil::bar("7d", 35.0),
+        ]),
+    );
+    let mut app = startup_app_from_disk();
+    app.tab = Tab::Usage;
+    let out = dump(&app, 100, 24);
+    assert_eq!(
+        rows_with(&out, &["5h", "7d"]),
+        vec![
+            "│                            ││ 5h                                                             55% │",
+            "│                            ││ 7d                                                             35% │",
+        ],
+        "a keyless account's cached bars render on the first frame"
+    );
+}
+
+/// The first-paint startup the OAuth pins share: `oauth` (a stored login,
+/// cache 42/18) active beside `tp` (a keyed DeepSeek, cache 62/31), then
+/// `extra`, all on the sandbox disk under `state`'s knobs.
+fn save_oauth_beside_provider(extra: &[&Profile], state: AppState) {
+    let oauth_name = ProfileName::from("oauth");
+    let mut oauth = crate::testutil::blank_profile(&oauth_name);
+    oauth.credentials = Some(hybrid_creds());
+    let tp = deepseek("tp", true, false);
+    let mut profiles = vec![&oauth, &tp];
+    profiles.extend_from_slice(extra);
+    save_startup_state(
+        &profiles,
+        AppState {
+            active_profile: Some(oauth_name.clone()),
+            ..state
+        },
+    );
+    crate::profile_cache::write_profile_cache(
+        &oauth_name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.0,
+                resets_at: None,
+            }),
+            seven_day: Some(crate::usage::UsageWindow {
+                utilization: 18.0,
+                resets_at: None,
+            }),
+            fetched_at: Some(crate::usage::now_ms()),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+    write_deepseek_cache("tp", 62.0, 31.0, std::time::Duration::ZERO);
+}
+
+/// The Usage tab's 5h/7d rows for the account at `cursor` on `app`'s frame.
+fn usage_bars_at(app: &mut App, cursor: usize) -> Vec<String> {
+    app.tab = crate::tui::app::Tab::Usage;
+    app.profile_cursor = cursor;
+    rows_with(&dump(app, 100, 24), &["5h", "7d"])
+}
+
+/// The seed loads the OAuth store too, so an OAuth account's cached bars show
+/// on the first frame beside a provider's — both halves seeded in one pass.
+#[test]
+fn first_paint_shows_an_oauth_accounts_cached_bars_beside_a_provider() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_oauth_beside_provider(&[], AppState::default());
+    let mut app = startup_app_from_disk();
+    assert_eq!(
+        usage_bars_at(&mut app, 0),
+        vec![
+            "│                            ││ 5h                                                             42% │",
+            "│                            ││ 7d                                                             18% │",
+        ],
+        "the OAuth account's cached bars render on the first frame"
+    );
+    assert_eq!(
+        usage_selector_cols(&app, 100),
+        vec![
+            "│ ❯ oauth                    │",
+            "│   tp                       │",
+        ],
+        "the provider account sits beside the OAuth one in the selector"
+    );
+}
+
+/// The first frame after a startup whose verdict is not `Clean` but whose
+/// resolution is the banner alone shows both halves' cached bars: the seed
+/// runs in `reconcile_startup` there too, since the drain changes nothing it
+/// reads. `arm` names the fixture's startup in each failure message.
+fn assert_banner_arm_first_paint(mut app: App, arm: &str) {
+    let signal = app.startup_results.try_recv();
+    assert!(
+        matches!(
+            signal,
+            Ok(crate::usage::StartupSignal::ReconcileNeedsPrompt { .. })
+        ),
+        "fixture: {arm} takes the non-Clean arm, got {signal:?}"
+    );
+    assert_eq!(
+        usage_bars_at(&mut app, 0),
+        vec![
+            "│                            ││ 5h                                                             42% │",
+            "│                            ││ 7d                                                             18% │",
+        ],
+        "{arm}: the OAuth account's cached bars render on the first frame"
+    );
+    assert_eq!(
+        usage_bars_at(&mut app, 1),
+        vec![
+            "│                            ││ 5h                                                             62% │",
+            "│                            ││ 7d                                                             31% │",
+        ],
+        "{arm}: the provider account's cached bars render on the first frame"
+    );
+}
+
+/// A logged-out shell in the live slot with no `default_divergence`: the
+/// drain only flags the banner, so the first frame carries the cached bars.
+#[test]
+fn first_paint_shows_cached_bars_over_a_logged_out_shell() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_oauth_beside_provider(&[], AppState::default());
+    crate::testutil::write_live_creds(&crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: String::new(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    assert!(
+        crate::claude::live_credentials_are_shell(),
+        "fixture: a logged-out shell"
+    );
+    assert_banner_arm_first_paint(startup_app_from_disk(), "a logged-out shell");
+}
+
+/// The live login of an account clauth never stored, no `default_divergence`
+/// configured: the startup resolution is the banner alone.
+#[test]
+fn first_paint_shows_cached_bars_beside_an_unsaved_live_login() {
+    let _home = crate::testutil::HomeSandbox::new();
+    save_oauth_beside_provider(&[], AppState::default());
+    crate::testutil::write_live_creds(&crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "acc-new".to_string(),
+            refresh_token: Some("ref-new".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    assert_banner_arm_first_paint(startup_app_from_disk(), "an unsaved live login");
+}
+
+/// A configured `default_divergence` is owner-gated: when a sibling account
+/// owns the live login the default never runs and the banner is the whole
+/// resolution, so the first frame carries the cached bars.
+#[test]
+fn first_paint_shows_cached_bars_when_a_sibling_owns_the_live_login() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let sibling_login = crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "acc-sib".to_string(),
+            refresh_token: Some("ref-sib".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    let mut sib = crate::testutil::blank_profile(&ProfileName::from("sib"));
+    sib.credentials = Some(sibling_login.clone());
+    save_oauth_beside_provider(
+        &[&sib],
+        AppState {
+            default_divergence: Some(crate::profile::DivergenceChoice::Overwrite),
+            ..AppState::default()
+        },
+    );
+    crate::testutil::write_live_creds(&sibling_login);
+    assert_banner_arm_first_paint(startup_app_from_disk(), "a sibling-owned live login");
+}
+
+/// The bell judges a polled reading. A disabled or keyless provider account's
+/// cache is seeded for display only, with no `Fresh` status, so its young 47%
+/// rings nothing past a 10% `bell_threshold`; the enabled, keyed twin holding
+/// the same cache is polled and rings.
+#[test]
+fn a_display_only_provider_account_rings_no_bell_on_its_cached_reading() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut on = deepseek("on", true, false);
+    let mut off = deepseek("off", true, true);
+    let mut kl = deepseek("kl", false, false);
+    for p in [&mut on, &mut off, &mut kl] {
+        p.bell_threshold = Some(10.0);
+    }
+    save_startup_state(&[&on, &off, &kl], AppState::default());
+    for name in ["on", "off", "kl"] {
+        write_deepseek_cache(name, 47.0, 23.0, std::time::Duration::ZERO);
+    }
+    let mut app = startup_app_from_disk();
+    app.apply_usage();
+    let toasts: Vec<String> = app.toasts.iter().map(|t| t.body.to_string()).collect();
+    assert_eq!(
+        toasts,
+        vec!["alert: on at 47%".to_string()],
+        "only the polled account rings"
+    );
+}
+
+/// A one-member chain holding `p`, its cache `age` old, through the real
+/// startup and one `apply_usage` tick.
+fn chain_member_after_one_tick(p: &Profile, age: std::time::Duration) -> App {
+    save_startup_state(
+        &[p],
+        AppState {
+            fallback_chain: vec![p.name.clone()],
+            ..AppState::default()
+        },
+    );
+    write_deepseek_cache(p.name.as_str(), 97.0, 23.0, age);
+    let mut app = startup_app_from_disk();
+    app.apply_usage();
+    app
+}
+
+/// The Fallback card's rows from the selector's `#1` member down to its
+/// `rotate at` row, exclusive: the head a status pill stacks into.
+fn fallback_card_head(app: &mut App) -> Vec<String> {
+    app.tab = crate::tui::app::Tab::Fallback;
+    let rows: Vec<String> = dump(app, 100, 30)
+        .lines()
+        .map(|l| l.trim_end().to_string())
+        .collect();
+    let start = rows.iter().position(|r| r.contains("#1 ")).expect("#1 row");
+    let end = rows
+        .iter()
+        .position(|r| r.contains("rotate at"))
+        .expect("rotate at row");
+    rows[start..end].to_vec()
+}
+
+/// The Overview fallback-chain row of the `#1` member.
+fn overview_chain_row(app: &mut App) -> Vec<String> {
+    app.tab = crate::tui::app::Tab::Overview;
+    rows_with(&dump(app, 100, 30), &["╶ 1 "])
+}
+
+/// Behaviour change 5: every surface shows a disabled provider account's cached
+/// reading. After one tick the Overview chain row and the Fallback card's
+/// `5h usage` row carry the 97% figure, where `6836c1a6` dropped it to no data.
+#[test]
+fn a_disabled_provider_accounts_cached_reading_shows_after_one_tick() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app =
+        chain_member_after_one_tick(&deepseek("tp", true, true), std::time::Duration::ZERO);
+    assert_eq!(
+        overview_chain_row(&mut app),
+        vec![
+            "│  ╶ 1 tp      ▰▰▰▰▰▰▰▰▰▰▰▰   97 / 95%   ⊖                                                         │"
+        ],
+        "the Overview chain row shows the cached 5h figure"
+    );
+    assert_eq!(
+        fallback_card_head(&mut app),
+        vec![
+            "│ ❯  #1 tp                 ⊖ ││ status          [ disabled ]                                       │",
+            "│                            ││ └ excluded from the walk, enable it on the setup tab               │",
+            "│                            ││                                                                    │",
+            "│                            ││ 5h usage        █████████████████████│  97% used                   │",
+            "│                            ││                 0% until rotate                                    │",
+            "│                            ││                                                                    │",
+        ],
+        "the Fallback card's 5h usage row shows the cached figure"
+    );
+}
+
+/// Nothing polls a disabled provider account, so its aged cache claims no
+/// failed check: the Fallback card stacks no `[ stale data ]` pill and no
+/// "last usage check failed" line under `[ disabled ]`.
+#[test]
+fn a_disabled_provider_card_claims_no_failed_check_after_one_tick() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = chain_member_after_one_tick(
+        &deepseek("tp", true, true),
+        std::time::Duration::from_secs(6 * 3600),
+    );
+    assert_eq!(
+        fallback_card_head(&mut app),
+        vec![
+            "│ ❯  #1 tp                 ⊖ ││ status          [ disabled ]                                       │",
+            "│                            ││ └ excluded from the walk, enable it on the setup tab               │",
+            "│                            ││                                                                    │",
+            "│                            ││ 5h usage        █████████████████████│  97% used                   │",
+            "│                            ││                 0% until rotate                                    │",
+            "│                            ││                                                                    │",
+        ],
+        "the disabled card carries no stale-data pill or failed-check line"
+    );
+}
+
+/// A keyless provider chain member is never polled either: its aged cache adds
+/// no `[ stale data ]` status row to its card and no `⋯` to its chain rows.
+#[test]
+fn a_keyless_provider_member_claims_no_failed_check_after_one_tick() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = chain_member_after_one_tick(
+        &deepseek("tp", false, false),
+        std::time::Duration::from_secs(6 * 3600),
+    );
+    assert_eq!(
+        overview_chain_row(&mut app),
+        vec![
+            "│  ╶ 1 tp      ▰▰▰▰▰▰▰▰▰▰▰▰   97 / 95%                                                             │"
+        ],
+        "the Overview chain row carries no `⋯`"
+    );
+    assert_eq!(
+        fallback_card_head(&mut app),
+        vec![
+            "│ ❯  #1 tp                   ││ 5h usage        █████████████████████│  97% used                   │",
+            "│                            ││                 0% until rotate                                    │",
+            "│                            ││                                                                    │",
+        ],
+        "the keyless card opens on its reading, with no stale-data status row"
+    );
+}
+
+/// The Usage tab's queue chip reads the canceled verdict off the raw OAuth
+/// store, the source the scheduler's election reads: a hybrid whose OAuth plan
+/// is canceled (its picked reading is the provider's, which carries no plan)
+/// holds no queue slot, so `b` is the queue's only member and waits one full
+/// one-member gap (5h less the 90 s interval tolerance = 17910 s = `4h 58m`)
+/// rather than the two-member `2h 28m`.
+#[test]
+fn the_queue_chip_drops_a_hybrid_canceled_only_in_the_oauth_store() {
+    use crate::tui::app::Tab;
+    use crate::usage::{PlanInfo, UsageInfo};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut hy = oauth("hy", true);
+    hy.credentials = Some(hybrid_creds());
+    hy.base_url = Some("https://api.deepseek.com/anthropic".into());
+    hy.api_key = Some("k".into());
+    hy.provider = Some(crate::providers::Provider::DeepSeek);
+    let mut b = oauth("b", true);
+    b.credentials = Some(hybrid_creds());
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["hy".into(), "b".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![hy, b],
+    };
+    let mut app = App::new(config);
+    app.usage_store.lock().unwrap().insert(
+        "hy".to_string(),
+        UsageInfo {
+            plan: Some(PlanInfo {
+                subscription_status: Some("canceled".to_string()),
+                ..PlanInfo::default()
+            }),
+            ..UsageInfo::default()
+        },
+    );
+    app.third_party_usage_store.lock().unwrap().insert(
+        "hy".to_string(),
+        crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 40.0)]),
+    );
+    app.auto_start_queue.lock().unwrap().last_open_at = Some(crate::usage::now_epoch_secs());
+    app.tab = Tab::Usage;
+    let chip = |app: &mut App, cursor: usize| {
+        app.profile_cursor = cursor;
+        rows_with(&dump(app, 100, 24), &["usage auto-start"])
+    };
+    assert_eq!(
+        chip(&mut app, 0),
+        vec![
+            "│ ❯ hy                       ││ plan      api                             usage auto-start due now │"
+        ],
+        "the canceled hybrid holds no slot: its kick waits on its own window alone"
+    );
+    assert_eq!(
+        chip(&mut app, 1),
+        vec![
+            "│   hy                       ││ plan      —                             usage auto-start in 4h 58m │"
+        ],
+        "`b` is the one-member queue's only slot"
+    );
+}
+
+/// The #74 `stale` pill end to end: an aged `usage_cache.json` on disk, one
+/// `apply_usage` (the per-tick map), then a real draw whose per-frame snapshot
+/// carries that map to the Usage tab's status block.
+#[test]
+fn an_aged_cache_shows_the_stale_pill_after_one_tick() {
+    use crate::tui::app::Tab;
+    use crate::usage::{UsageInfo, UsageWindow};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut o = oauth("o", false);
+    o.credentials = Some(hybrid_creds());
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["o".into()],
+            ..AppState::default()
+        },
+        profiles: vec![o],
+    };
+    let interval = config.state.refresh_interval_ms;
+    let reading = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 30.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        fetched_at: Some(
+            crate::usage::now_ms() - 2 * crate::profile_json::stale_after_ms(interval),
+        ),
+        ..UsageInfo::default()
+    };
+    let mut app = App::new(config);
+    crate::testutil::register_names(&["o"]);
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("o"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &reading,
+    );
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("o".to_string(), reading);
+    app.apply_usage();
+    app.tab = Tab::Usage;
+    assert_eq!(
+        rows_with(&dump(&app, 100, 40), &["stale"]),
+        vec![
+            "│                            ││ status    [ stale ] ◌ up to date                                   │"
+        ],
+        "the aged cache's stale pill reaches the drawn status block"
+    );
+}
+
+/// C3: a reading inserted into a store shows in the very next draw, with no
+/// `apply_usage` / `on_tick` between — the Overview account row reads the
+/// per-frame snapshot built fresh from the stores, not a copy a tick refreshes.
+/// (The Overview tab draws no header gauge, so the row is the only `87%`.)
+#[test]
+fn a_reading_inserted_into_a_store_shows_in_the_next_draw() {
+    use crate::usage::{FetchStatus, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let _home = crate::testutil::HomeSandbox::new();
+    let p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("o"));
+    let config = AppConfig {
+        state: AppState {
+            active_profile: Some("o".into()),
+            profiles: vec!["o".into()],
+            ..AppState::default()
+        },
+        profiles: vec![p],
+    };
+    let app = App::new(config);
+    let before = dump(&app, 100, 24);
+    assert_eq!(
+        rows_with(&before, &["87%"]),
+        Vec::<String>::new(),
+        "no reading seeded, the first draw shows none"
+    );
+    app.usage_store.lock().unwrap().insert(
+        "o".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 87.0,
+                // 30 s past the hour, so a second ticking over before the draw
+                // still reads `1h 0m`.
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3630)),
+            }),
+            ..UsageInfo::default()
+        },
+    );
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("o".to_string(), FetchStatus::Fresh);
+    let after = dump(&app, 100, 24);
+    assert_eq!(
+        rows_with(&after, &["87%"]),
+        vec![
+            "│ ❯ ● o              —                       [█████████░]  87% (1h 0m)        —                    │"
+        ],
+        "the very next draw shows the store reading on the account row"
     );
 }

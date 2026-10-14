@@ -68,8 +68,9 @@ use crate::usage::{
     StartupSender, StartupSignal, StatusStore, SuppressedAuthExpiredStore, ThirdPartyBroken,
     ThirdPartyList, ThirdPartyStatusStore, ThirdPartyStreaks, ThirdPartyUsageStore, TokenList,
     UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party, clear_activity,
-    collect_oauth_seed_names, collect_third_party_entries, collect_tokens, is_idle, mark_activity,
-    now_ms, spawn_refresher, switch_gate_in_flight, windows_maxed,
+    collect_oauth_seed_names, collect_third_party_entries, collect_third_party_seed_names,
+    collect_tokens, is_idle, mark_activity, now_ms, spawn_refresher, switch_gate_in_flight,
+    windows_maxed,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -3806,6 +3807,10 @@ pub(crate) struct App {
     pub(crate) third_party_status: ThirdPartyStatusStore,
     pub(crate) third_party_streaks: ThirdPartyStreaks,
     pub(crate) third_party_broken: ThirdPartyBroken,
+    /// The #74 degraded cue per profile, written each tick by `apply_usage`
+    /// (it reads the DISK cache age) and read by the per-frame snapshot. A
+    /// plain map, not a ranked store: written and read only on the UI thread.
+    pub(crate) stale_cues: HashMap<String, bool>,
     /// Per-name stat of the durable key-rejection record the last time
     /// [`sync_broken_verdicts`] checked it (`None` = the record was absent).
     /// The stat is the read gate: a per-second stat per profile is cheap, a
@@ -4092,6 +4097,10 @@ pub(crate) struct App {
     pub(crate) reconcile_done: bool,
     /// Set once `spawn_bootstrap` is dispatched; prevents double-dispatch.
     pub(crate) bootstrap_started: bool,
+    /// Set once `reconcile_startup` seeded the stores, so the gate's
+    /// synchronous seed in [`maybe_spawn_bootstrap`] only runs on the
+    /// acting-default arms that reconcile left to it.
+    pub(crate) startup_seeded: bool,
     /// Tunable per-profile refresh interval; the scheduler reads this each tick.
     pub(crate) refresh_interval: Arc<AtomicU64>,
     /// Set before bootstrap spawn, cleared on every worker exit path.
@@ -4267,6 +4276,42 @@ fn series_fingerprint(path: &std::path::Path) -> Option<(u64, u64)> {
     Some((len, hasher.finish()))
 }
 
+/// One frame's usage readings, cloned off the four stores (each locked once
+/// and released) plus the per-tick stale map, so a render entry that holds
+/// the config guard reads only this snapshot — never a store lock under
+/// `Config` (the stores rank below it).
+#[derive(Debug, Default)]
+pub(crate) struct ReadingsSnapshot {
+    /// Picked usage per profile name (the walk's `picked_usage` side).
+    pub(crate) usage: HashMap<String, UsageInfo>,
+    /// Picked fetch status per profile name (a third-party name's own
+    /// status; every other name OAuth-first with the third-party fallback).
+    pub(crate) fetch_status: HashMap<String, FetchStatus>,
+    /// Raw provider stats per profile name (the balance rows' source).
+    pub(crate) third_party: HashMap<String, crate::providers::ThirdPartyStats>,
+    /// Raw OAuth store per profile name, unpicked: the queue chips' canceled
+    /// source, the same one the scheduler's election reads, so a hybrid whose
+    /// OAuth plan is canceled drops from both.
+    pub(crate) oauth: HashMap<String, UsageInfo>,
+    /// The #74 degraded cue per profile name, cloned off `App::stale_cues`.
+    pub(crate) stale: HashMap<String, bool>,
+}
+
+impl ReadingsSnapshot {
+    pub(crate) fn usage_of(&self, name: &str) -> Option<&UsageInfo> {
+        self.usage.get(name)
+    }
+    pub(crate) fn status_of(&self, name: &str) -> Option<FetchStatus> {
+        self.fetch_status.get(name).copied()
+    }
+    pub(crate) fn stats_of(&self, name: &str) -> Option<&crate::providers::ThirdPartyStats> {
+        self.third_party.get(name)
+    }
+    pub(crate) fn stale_of(&self, name: &str) -> bool {
+        self.stale.get(name).copied().unwrap_or(false)
+    }
+}
+
 impl App {
     pub(crate) fn new(config: AppConfig) -> Self {
         let usage_store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -4432,6 +4477,7 @@ impl App {
             third_party_status,
             third_party_streaks,
             third_party_broken,
+            stale_cues: HashMap::new(),
             broken_verdict_mtimes: HashMap::new(),
             last_broken_verdict_sync: None,
             tab: Tab::Overview,
@@ -4559,6 +4605,7 @@ impl App {
             last_services_refresh: Instant::now(),
             reconcile_done: false,
             bootstrap_started: false,
+            startup_seeded: false,
             refresh_interval,
             bootstrap_active: Arc::new(AtomicBool::new(false)),
             shutting_down: Arc::new(AtomicBool::new(false)),
@@ -4686,13 +4733,16 @@ impl App {
     }
 
     /// Spawn the bootstrap on a background thread (never blocks first paint).
-    /// Re-links credentials, then seeds usage from disk — OAuth caches via
-    /// `bootstrap_fetch`, api-key/provider caches via `bootstrap_third_party`, both
-    /// gated on the cache being fresher than one refresh interval and stamped at the
-    /// cache mtime so the refresh cadence resumes across the restart — so the UI
-    /// shows last-known numbers instantly while the scheduler refreshes on the normal
-    /// cadence; profiles with no fresh cache are left for the scheduler to fetch in
-    /// the background. No proactive token rotation (401-recovery is lazy). Posts
+    /// Re-links credentials, then marks every cache-due work-list name Queued so
+    /// the first paint shows a spinner instead of a stale countdown. The store
+    /// seed itself runs synchronously at the gate ([`maybe_spawn_bootstrap`]) on
+    /// every arm — OAuth caches via `bootstrap_fetch`, api-key/provider caches
+    /// via `bootstrap_third_party`, whatever the cache's age, each work-list name
+    /// stamped at its cache clock so the refresh cadence resumes across the
+    /// restart; a display-only name gets its reading alone, never a status or
+    /// stamp. The scheduler then refreshes on the normal cadence; profiles with
+    /// no fresh cache are left for it to fetch in the background. No proactive
+    /// token rotation (401-recovery is lazy). Posts
     /// `StartupSignal::BootstrapDone` when done; the UI thread then rebuilds the
     /// token snapshot, starts the scheduler, applies usage, and runs the startup
     /// auto-switch.
@@ -4717,33 +4767,20 @@ impl App {
                 let _ = link_profile_credentials(&active);
             }
 
-            // `seed_names` is the display superset (disabled included) for the
-            // cache seed; `snapshot` is the enabled-only work-list that drives
-            // the `Queued` marking below — a disabled profile is seeded but never
-            // queued for a fetch it will never get.
-            let (seed_names, snapshot, third_party) = {
+            // The store seed runs synchronously at the gate
+            // (`maybe_spawn_bootstrap`) on every arm, so the worker keeps only
+            // the relink and the `Queued` marking. `snapshot` /
+            // `third_party_entries` are the enabled-only work-lists that drive
+            // that marking — a display-only name is never queued for a fetch it
+            // will never get.
+            let (snapshot, third_party_entries) = {
                 let cfg = Self::lock_config(&h.config);
                 (
-                    collect_oauth_seed_names(&cfg),
                     collect_tokens(&cfg),
                     collect_third_party_entries(&cfg.profiles),
                 )
             };
             let interval_ms = h.refresh_interval.load(Ordering::Relaxed);
-            bootstrap_fetch(
-                &h.usage_store,
-                &h.usage_status,
-                &h.last_fetched,
-                &seed_names,
-                interval_ms,
-            );
-            bootstrap_third_party(
-                &h.third_party_usage_store,
-                &h.third_party_status,
-                &h.last_fetched,
-                &third_party,
-                interval_ms,
-            );
 
             // Seeded-but-due and stale/missing profiles are fetched by the
             // scheduler's first tick (started in `finish_bootstrap`); 5h windows
@@ -4763,7 +4800,7 @@ impl App {
                     .iter()
                     .map(|e| FetchLeg::OAuth.key(e.name.clone()))
                     .chain(
-                        third_party
+                        third_party_entries
                             .iter()
                             .map(|e| FetchLeg::ThirdParty.key(e.name.clone())),
                     )
@@ -4808,8 +4845,8 @@ impl App {
         .flatten()
     }
 
-    /// The startup one-shot's gate + burn rate, both off the stores (never
-    /// `Profile.usage`, never disk): `(active_fresh, rate)`. Freshness reads the
+    /// The startup one-shot's gate + burn rate, both off the stores (never a
+    /// reading copy, never disk): `(active_fresh, rate)`. Freshness reads the
     /// picker's status store via `decision_fresh_any` — the same verdict the
     /// scheduler's scan gates on. The rate is the ACTIVE's picked 5h window from
     /// `usage_store` paired with the in-memory `history_cache`; `None` for a
@@ -4858,7 +4895,7 @@ impl App {
         &self,
         key_rejected: &HashSet<ProfileName>,
     ) -> AutoSwitchProjection {
-        let (mut snapshot, third_party_names) = {
+        let (mut snapshot, third_party_names, polled) = {
             let cfg = self.config();
             let Some(snapshot) = crate::fallback::snapshot_chain(&cfg, key_rejected) else {
                 return AutoSwitchProjection::none();
@@ -4872,7 +4909,8 @@ impl App {
                 .filter(|p| p.usage_cache_is_third_party())
                 .map(|p| p.name.clone())
                 .collect();
-            (snapshot, third_party_names)
+            let polled = crate::usage::polled_third_party_names(&cfg);
+            (snapshot, third_party_names, polled)
         };
         let active = snapshot.active.clone();
         let usage = crate::usage::fill_chain_snapshot_stores(
@@ -4885,6 +4923,7 @@ impl App {
             &self.third_party_streaks,
             &self.kick_blocks,
             &third_party_names,
+            &polled,
         );
         snapshot.broken.extend(key_rejected.iter().cloned());
         let active_usage = usage.get(active.as_str()).cloned();
@@ -4936,11 +4975,15 @@ impl App {
     /// [`Self::active_burn_rate`]: the Usage tab's balance row and the
     /// overview drains line read it here, so neither render pass reads
     /// `wallet_history.jsonl` while holding the config guard.
-    pub(crate) fn wallet_rate_for(&self, profile: &Profile) -> Option<crate::usage::WalletRate> {
-        let stats = profile.third_party_usage.as_ref()?;
+    pub(crate) fn wallet_rate_for(
+        &self,
+        name: &str,
+        stats: Option<&crate::providers::ThirdPartyStats>,
+    ) -> Option<crate::usage::WalletRate> {
+        let stats = stats?;
         crate::usage::funded_wallet_rate(
             self.wallet_cache
-                .get(profile.name.as_str())
+                .get(name)
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]),
             &stats.rows,
@@ -5063,82 +5106,112 @@ impl App {
             // it. Shared with `finish_bootstrap` so its startup switch one-shot
             // only runs when this TUI is the fetcher.
             h.fetch_lease,
+            // The TUI's Usage tab and chain render read the third-party store,
+            // so its stand-down hydration keeps the display superset.
+            // Pinned by construction, not a test: no test drives this call site
+            // (`spawn_refresher` builds its own state under `cfg!(test)`).
+            true,
         );
     }
 
+    /// Build the per-frame readings snapshot. The picker's per-name
+    /// classification is read under a transient config guard, DROPPED before
+    /// any store lock is taken (the stores rank BELOW `Config`, so holding both
+    /// would invert the order the debug build asserts on); the four stores are
+    /// then locked once each, in rank order, and released.
+    pub(crate) fn readings_snapshot(&self) -> ReadingsSnapshot {
+        let third_party: HashMap<String, bool> = {
+            let cfg = self.config();
+            cfg.profiles
+                .iter()
+                .map(|p| (p.name.to_string(), p.usage_cache_is_third_party()))
+                .collect()
+        };
+        // ThirdPartyUsage 270, ThirdPartyStatus 280, Usage 300, UsageStatus 350.
+        // A poisoned lock still holds the last good figure: read through it, or
+        // one panic while a store is held blanks every reading for the rest of
+        // the session.
+        let third_party_usage = self
+            .third_party_usage_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let third_party_status = self
+            .third_party_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let usage_store = self
+            .usage_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let status_store = self
+            .usage_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut usage = HashMap::new();
+        let mut fetch_status = HashMap::new();
+        for (name, tp) in &third_party {
+            // The same picker `apply_usage` assigned: a third-party name takes
+            // its provider stats' `to_usage_info()`, any other name the OAuth
+            // store's entry. `None` removes the entry (a provider that stopped
+            // publishing windows reads as no reading, not a frozen one).
+            if let Some(info) = crate::fallback::picked_usage(
+                *tp,
+                usage_store.get(name),
+                third_party_usage.get(name),
+            ) {
+                usage.insert(name.clone(), info);
+            }
+            // Fetch status follows the picker's side too.
+            let status = if *tp {
+                third_party_status.get(name).copied()
+            } else if status_store.contains_key(name) {
+                status_store.get(name).copied()
+            } else {
+                third_party_status.get(name).copied()
+            };
+            if let Some(s) = status {
+                fetch_status.insert(name.clone(), s);
+            }
+        }
+        ReadingsSnapshot {
+            usage,
+            fetch_status,
+            third_party: third_party_usage,
+            oauth: usage_store,
+            stale: self.stale_cues.clone(),
+        }
+    }
+
     pub(crate) fn apply_usage(&mut self) {
-        // On poisoned lock keep the prior value — a blank map would blind auto-switch permanently.
-        // Third-party stores BEFORE OAuth stores: ranks 270/280 < 300/350.
-        let bells;
-        let history_names;
-        let wallet_names;
-        {
-            let third_party_map = self.third_party_usage_store.lock().ok();
-            let third_party_status_map = self.third_party_status.lock().ok();
-            let info_map = self.usage_store.lock().ok();
-            let status_map = self.usage_status.lock().ok();
-            let mut cfg = self.config();
+        // The per-frame snapshot builder doubles as the per-tick reader: the
+        // bell, history/wallet re-read sets and the stale map all derive from
+        // its one picker pass, never a second one.
+        let readings = self.readings_snapshot();
+        let (bells, history_names, wallet_names, stale_map) = {
+            let cfg = self.config();
             let now = now_ms();
             let interval_ms = cfg.state.refresh_interval_ms;
             let refresh_spent_accounts = cfg.state.refresh_spent_accounts;
-            for p in &mut cfg.profiles {
-                // The TUI's per-account reading is the picker's whole record,
-                // the same dichotomy the walk's picker and the disk readers
-                // key on (`usage_cache_is_third_party`): a third-party account
-                // (pure or hybrid) takes its provider stats' `to_usage_info()`
-                // — never the OAuth leg's entry, so a stale OAuth reading under
-                // a logged-out hybrid's name cannot survive, and no OAuth plan
-                // or spend reaches a hybrid's `Profile.usage`. Assign only when
-                // the store the classification needs is present — a poisoned
-                // lock keeps the prior reading.
-                let side_ok = if p.usage_cache_is_third_party() {
-                    third_party_map.is_some()
-                } else {
-                    info_map.is_some()
-                };
-                if side_ok {
-                    p.usage = crate::fallback::picked_usage(
-                        p.usage_cache_is_third_party(),
-                        info_map.as_ref().and_then(|s| s.get(p.name.as_str())),
-                        third_party_map
-                            .as_ref()
-                            .and_then(|s| s.get(p.name.as_str())),
-                    );
-                }
-                // Fetch_status follows the picker's side too, so the TUI's
-                // freshness (the startup one-shot gate and the status pill)
-                // agrees with the scheduler's `decision_fresh_any`: a
-                // third-party-classified account reads its third-party status;
-                // every other account is OAuth-first with the third-party
-                // fallback.
-                if p.usage_cache_is_third_party() {
-                    if let Some(s) = third_party_status_map.as_ref() {
-                        p.fetch_status = s.get(p.name.as_str()).copied();
-                    }
-                } else if let Some(s) = status_map.as_ref()
-                    && s.contains_key(p.name.as_str())
-                {
-                    p.fetch_status = s.get(p.name.as_str()).copied();
-                } else if let Some(s) = third_party_status_map.as_ref() {
-                    p.fetch_status = s.get(p.name.as_str()).copied();
-                }
-                if let Some(s) = third_party_map.as_ref()
-                    && s.contains_key(p.name.as_str())
-                {
-                    p.third_party_usage = s.get(p.name.as_str()).cloned();
-                }
-
+            let mut stale_map = HashMap::new();
+            let mut bells = Vec::new();
+            let mut history_names = Vec::new();
+            let mut wallet_names = Vec::new();
+            for p in &cfg.profiles {
+                let name = p.name.to_string();
                 // #74 degraded cue: cache age past the derived threshold reads
                 // stale, independent of fetch_status. Same threshold, same
                 // maxed-window exemption, and same age source as
                 // `status.json`'s `age_stale` arm — the exemption reads the
                 // DISK cache (`load_profile_cache`), never the live store,
                 // because the two can diverge on a spent account the
-                // scheduler dropped from its due set: reading the store there
-                // would publish the exact disagreement the exemption exists
-                // to prevent. OAuth goes through the one age contract
-                // (`oauth_age`), the same one `status.json` and the MCP payloads
-                // read; third-party figures keep the cache mtime.
+                // scheduler dropped from its due set. OAuth goes through the
+                // one age contract (`oauth_age`), the same one `status.json`
+                // and the MCP payloads read; third-party figures keep the
+                // cache mtime.
                 let oauth_usage = if p.usage_cache_is_third_party() {
                     None
                 } else {
@@ -5159,42 +5232,27 @@ impl App {
                             .is_some_and(crate::profile_json::publishes_a_live_window),
                     )
                 };
-                p.usage_stale = !spent_skipped && past_threshold;
+                let stale = !spent_skipped && past_threshold;
+                stale_map.insert(name.clone(), stale);
+                // The same reading the daemon's bell judges: a lapsed 5h
+                // window is no figure, and an aged one is not fresh.
+                let util = readings
+                    .usage_of(&name)
+                    .and_then(|u| u.five_hour.as_ref())
+                    .filter(|w| crate::profile_json::window_row_is_live(w))
+                    .map(|u| u.utilization);
+                let fresh = readings.status_of(&name) == Some(FetchStatus::Fresh) && !stale;
+                bells.push((name.clone(), p.bell_threshold, util, fresh));
+                if readings.usage.contains_key(&name) {
+                    history_names.push(name.clone());
+                }
+                if p.usage_cache_is_third_party() {
+                    wallet_names.push(name);
+                }
             }
-
-            bells = cfg
-                .profiles
-                .iter()
-                .map(|p| {
-                    // The same reading the daemon's bell judges: a lapsed 5h
-                    // window is no figure, and an aged one is not fresh.
-                    let util = p
-                        .usage
-                        .as_ref()
-                        .and_then(|u| u.five_hour.as_ref())
-                        .filter(|w| crate::profile_json::window_row_is_live(w))
-                        .map(|u| u.utilization);
-                    let fresh = p.fetch_status == Some(FetchStatus::Fresh) && !p.usage_stale;
-                    (p.name.to_string(), p.bell_threshold, util, fresh)
-                })
-                .collect::<Vec<_>>();
-
-            // Collect while cfg is still alive.
-            history_names = cfg
-                .profiles
-                .iter()
-                .filter(|p| p.usage.is_some())
-                .map(|p| p.name.to_string())
-                .collect::<Vec<_>>();
-            // Only third-party profiles carry a wallet series, so the refresh
-            // walk below stats no OAuth profile's absent file.
-            wallet_names = cfg
-                .profiles
-                .iter()
-                .filter(|p| p.usage_cache_is_third_party())
-                .map(|p| p.name.to_string())
-                .collect::<Vec<_>>();
-        }
+            (bells, history_names, wallet_names, stale_map)
+        };
+        self.stale_cues = stale_map;
         for (name, threshold, util, fresh) in bells {
             if let Some(message) = self.bell_fired.observe(&name, threshold, util, fresh) {
                 self.toast(ToastKind::Warning, message);
@@ -5260,14 +5318,46 @@ impl App {
             // token mutexes — TOKENS/THIRD_PARTY rank OUTSIDE CONFIG, so writing
             // them while config is held inverts the global lock order (same shape
             // as `refresh_tokens`).
-            let (tokens, third_party, names, broken_seed) = {
+            let (tokens, third_party, third_party_seed_names, names, broken_seed) = {
                 let cfg = self.config();
                 let tokens = collect_tokens(&cfg);
                 let third_party = collect_third_party_entries(&cfg.profiles);
+                let third_party_seed_names = collect_third_party_seed_names(&cfg);
                 let names: Vec<String> = cfg.profiles.iter().map(|p| p.name.to_string()).collect();
                 let broken_seed = Self::durable_key_rejected_seed(&cfg);
-                (tokens, third_party, names, broken_seed)
+                (
+                    tokens,
+                    third_party,
+                    third_party_seed_names,
+                    names,
+                    broken_seed,
+                )
             };
+            // Seed from disk the display-superset names the store lacks (a
+            // profile added since the last load). A name the store already
+            // holds keeps its live reading, status and cadence stamp: the disk
+            // seed would rewind them to the cache's. The seed writes the
+            // READING only — no status and no `last_fetched` stamp at this site
+            // (6836c1a6's reload wrote neither), so a new name's first fetch is
+            // due on the next tick, never deferred by a seeded stamp.
+            let unseeded: Vec<String> = {
+                let store = self
+                    .third_party_usage_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                third_party_seed_names
+                    .into_iter()
+                    .filter(|name| !store.contains_key(name))
+                    .collect()
+            };
+            bootstrap_third_party(
+                &self.third_party_usage_store,
+                &self.third_party_status,
+                &self.last_fetched,
+                &unseeded,
+                &[],
+                self.refresh_interval.load(Ordering::Relaxed),
+            );
             #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
             {
                 *self
@@ -5518,6 +5608,43 @@ impl App {
 
 // ── Startup reconciliation ────────────────────────────────────────────────────
 
+/// Seed the OAuth and third-party stores from their disk caches with the
+/// display superset (disabled + keyless third-party included; status and
+/// stamp for the third-party work list only, [`bootstrap_third_party`]).
+/// Called from [`reconcile_startup`] on every arm that leaves the drain
+/// nothing to resolve (no active profile, `Clean`, and a `Shell` or
+/// `NeedsPrompt` verdict whose resolution is the banner alone), so the first
+/// frame shows cached bars; never in `App::new`, which is before reconcile.
+/// Runs once: `startup_seeded` limits it to a single call — from
+/// [`reconcile_startup`] on the arms above, else from [`maybe_spawn_bootstrap`]
+/// at the gate.
+fn seed_startup_stores(app: &App) {
+    let (seed_names, third_party, third_party_work) = {
+        let cfg = app.config();
+        (
+            collect_oauth_seed_names(&cfg),
+            collect_third_party_seed_names(&cfg),
+            collect_third_party_entries(&cfg.profiles),
+        )
+    };
+    let interval_ms = app.refresh_interval.load(Ordering::Relaxed);
+    bootstrap_fetch(
+        &app.usage_store,
+        &app.usage_status,
+        &app.last_fetched,
+        &seed_names,
+        interval_ms,
+    );
+    bootstrap_third_party(
+        &app.third_party_usage_store,
+        &app.third_party_status,
+        &app.last_fetched,
+        &third_party,
+        &third_party_work,
+        interval_ms,
+    );
+}
+
 /// Startup credential reconciliation, non-blocking. Judges the live
 /// `~/.claude/.credentials.json` through the SAME cascade the 1Hz poll uses
 /// ([`reconcile_decision`]): against the install source, never the
@@ -5534,6 +5661,8 @@ impl App {
 pub(super) fn reconcile_startup(app: &mut App) {
     let Some(active) = app.config().state.active_profile.as_ref().cloned() else {
         let _ = app.startup_sender.send(StartupSignal::ReconcileDone);
+        seed_startup_stores(app);
+        app.startup_seeded = true;
         return;
     };
 
@@ -5542,6 +5671,19 @@ pub(super) fn reconcile_startup(app: &mut App) {
     if matches!(verdict, DivergenceVerdict::Clean) {
         let mut cfg = app.config();
         let _ = snapshot_active_credentials(&mut cfg);
+        // Drop the config guard before seeding: the stores rank BELOW config,
+        // so seeding under the guard would invert the lock order.
+        drop(cfg);
+        seed_startup_stores(app);
+        app.startup_seeded = true;
+    } else if divergence_resolves_to_banner(app, &active) {
+        // The drain's `resolve_or_note_divergence` will only flag the banner,
+        // so nothing it does can change what the seed reads. A default that
+        // acts (an overwrite, or a modal it opens) may delete or replace a
+        // profile's caches first: `maybe_spawn_bootstrap` seeds after it, at
+        // the point the worker's gate opens.
+        seed_startup_stores(app);
+        app.startup_seeded = true;
     }
     let _ = app
         .startup_sender
@@ -17755,42 +17897,24 @@ fn commit_rename(app: &mut App) {
 /// cannot accuse the new endpoint with the old provider's streak. The OAuth
 /// fetch status joins them because the render merges it over the third-party
 /// one — either left standing would still read as the stale verdict. The
-/// config handle's `Profile.fetch_status` copy retires with them: that copy
-/// is the render's read, and only the next tick's `apply_usage` refreshes it
-/// from the cleared stores, so the pre-tick frame would flash the retired
-/// pill without it. The handle write is unconditional: a poison-skipped
-/// clear keeps its store entry, but that entry is dead weight — `apply_usage`
-/// reads these stores with `.lock().ok()` and skips a poisoned one, so the
-/// next tick can never re-copy it. `None` here is the stable outcome in
-/// every poison placement; a gated write would strand the stale pill on the
-/// handle indefinitely where the skipped store is the merge's third-party
-/// fallback (the OAuth arm's cleared entry misses `contains_key`, the
-/// poisoned fallback reads as `None`, and nothing rewrites the field).
+/// store clears only: the per-frame snapshot derives its readings from these
+/// stores on the next frame, so no handle write is needed.
 fn clear_profile_status_chrome(app: &App, name: &ProfileName) {
-    if let Ok(mut m) = app.third_party_status.lock() {
-        m.remove(name.as_str());
-    }
-    if let Ok(mut m) = app.third_party_streaks.lock() {
-        m.remove(name.as_str());
-    }
-    if let Ok(mut m) = app.usage_status.lock() {
-        m.remove(name.as_str());
-    }
-    // All three store guards are dropped above, so this keeps the documented
-    // order (stores 280/290/350 before Config 400). The write is the outcome
-    // the store→handle sync in `apply_usage` would derive from the cleared
-    // stores (OAuth entry, else third-party entry, else None) — written in
-    // place, since re-reading the stores under the config guard would invert
-    // that order. And unconditional: a poison-skipped clear leaves its entry
-    // in a store `apply_usage` skips (`.lock().ok()`), so the entry is dead
-    // weight and `None` is stable in every placement — a gated write would
-    // strand the stale pill where the skipped store is the merge's
-    // third-party fallback (the OAuth arm misses, the poisoned arm reads as
-    // `None`, nothing rewrites the handle).
-    let mut cfg = app.config();
-    if let Some(p) = cfg.find_mut(name) {
-        p.fetch_status = None;
-    }
+    // Read through a poisoned lock: a skip would leave the stale verdict
+    // behind, and the per-frame snapshot reads these stores back next frame,
+    // so a clear that silently no-ops strands the pill it was meant to retire.
+    app.third_party_status
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(name.as_str());
+    app.third_party_streaks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(name.as_str());
+    app.usage_status
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(name.as_str());
 }
 
 fn commit_endpoint(app: &mut App) {
@@ -20358,9 +20482,17 @@ fn update_banner(app: &mut App) {
     // The evidence is the HARD cap, not the configurable soft line: `Off` (what
     // clears the active in the first place) keys on the cap, and a soft-blocked
     // member still serves — calling it spent would be a lie the code disagrees with.
+    let readings = app.readings_snapshot();
     let cfg = app.config();
     let no_active = !cfg.profiles.is_empty() && cfg.state.active_profile.is_none();
-    let any_spent = no_active && cfg.profiles.iter().any(crate::fallback::is_exhausted_hard);
+    // The spent test reads only accounts clauth polls: a display-only provider
+    // account (disabled or keyless) keeps its cached reading for the frame but
+    // never counts as spent evidence.
+    let any_spent = no_active
+        && cfg.profiles.iter().any(|p| {
+            crate::usage::reading_is_polled(p)
+                && crate::fallback::is_exhausted_hard(p, readings.usage_of(&p.name))
+        });
     drop(cfg);
 
     // Divergence outranks the compact-size nudge (both WARNING): a live-login
@@ -20510,6 +20642,14 @@ fn maybe_spawn_bootstrap(app: &mut App) {
     }
     app.bootstrap_started = true;
     app.bootstrap_active.store(true, Ordering::SeqCst);
+    // The seed runs synchronously at the point the worker's gate first opens:
+    // on the acting-default arms (an overwrite, or a modal that just settled)
+    // `reconcile_startup` left the seed here, so the other accounts' cached
+    // bars land on this frame instead of whenever the worker finishes.
+    if !app.startup_seeded {
+        seed_startup_stores(app);
+        app.startup_seeded = true;
+    }
     app.spawn_bootstrap();
 }
 
@@ -20644,8 +20784,7 @@ fn resolve_or_note_divergence(app: &mut App, active: &str) {
     if note_divergence(app, active) {
         return;
     }
-    let default = app.config().state.default_divergence;
-    if let Some(choice) = default {
+    if let Some(choice) = startup_default(app, active) {
         // The default IS the resolution, so drop the banner it would otherwise
         // paint for the tick between resolving and the next poll's re-classify.
         app.divergence_pending = None;
@@ -20665,10 +20804,7 @@ fn note_divergence(app: &mut App, active: &str) -> bool {
     {
         return p.sibling.is_some();
     }
-    let sibling = {
-        let cfg = app.config();
-        crate::actions::identify_live_login_owner(&cfg).filter(|owner| owner != active)
-    };
+    let sibling = live_login_sibling_owner(app, active);
     let sibling_owned = sibling.is_some();
     app.divergence_pending = Some(DivergenceNotice {
         active: active.to_string(),
@@ -20676,6 +20812,32 @@ fn note_divergence(app: &mut App, active: &str) -> bool {
         fingerprint,
     });
     sibling_owned
+}
+
+/// The stored profile other than `active` that owns the live login, if any.
+fn live_login_sibling_owner(app: &App, active: &str) -> Option<ProfileName> {
+    let cfg = app.config();
+    crate::actions::identify_live_login_owner(&cfg).filter(|owner| owner != active)
+}
+
+/// The configured `default_divergence` that actually acts at startup, or `None`
+/// when the resolution is the banner alone: unset, or a sibling owns the live
+/// login (the owner gate skips the default). ONE resolver so the seed's
+/// predicate ([`divergence_resolves_to_banner`]) and the drain's action
+/// ([`resolve_or_note_divergence`]) cannot drift apart when the gate changes.
+fn startup_default(app: &App, active: &str) -> Option<crate::profile::DivergenceChoice> {
+    if live_login_sibling_owner(app, active).is_some() {
+        return None;
+    }
+    app.config().state.default_divergence
+}
+
+/// Whether [`resolve_or_note_divergence`] will resolve a divergence on
+/// `active` by flagging the banner alone: no `default_divergence` is
+/// configured, or a sibling owns the live login (the owner gate skips the
+/// default).
+fn divergence_resolves_to_banner(app: &App, active: &str) -> bool {
+    startup_default(app, active).is_none()
 }
 
 /// SipHash of the live access token — a cheap identity for "which login sits in

@@ -1481,6 +1481,7 @@ fn backoff_gate_gives_up_when_the_retry_window_closes() {
 /// uncapped sibling should surface.
 #[test]
 fn uncapped_spenders_excludes_disabled_includes_enabled_sibling() {
+    let _home = HomeSandbox::new();
     let mut disabled = blank_profile(&crate::profile::ProfileName::from("off"));
     disabled.max_auto_spend = Some(5.0);
     disabled.disabled = true;
@@ -1506,6 +1507,256 @@ fn uncapped_spenders_excludes_disabled_includes_enabled_sibling() {
         names.contains(&"on"),
         "an enabled uncapped sibling must still be named"
     );
+}
+
+/// A last-resort sink whose `usage_cache.json` plan is canceled catches no
+/// spend: the boot warning reads the canceled verdict off disk (the daemon has
+/// no live store yet at boot), so the capped spender is named.
+#[test]
+fn uncapped_spenders_names_a_spender_whose_only_sink_is_canceled_on_disk() {
+    use crate::usage::{PlanInfo, UsageInfo};
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["spender", "sink"]);
+    let mut spender = blank_profile(&crate::profile::ProfileName::from("spender"));
+    spender.max_auto_spend = Some(5.0);
+    let mut sink = blank_profile(&crate::profile::ProfileName::from("sink"));
+    sink.last_resort = true;
+    crate::profile_cache::write_profile_cache(
+        &sink.name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(PlanInfo {
+                subscription_status: Some("canceled".to_string()),
+                ..PlanInfo::default()
+            }),
+            ..UsageInfo::default()
+        },
+    );
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["spender".into(), "sink".into()],
+            spend_budget_switching: true,
+            switch_off_when_budget_spent: false,
+            ..AppState::default()
+        },
+        profiles: vec![spender, sink],
+    };
+
+    assert_eq!(
+        super::uncapped_spenders(&config),
+        vec!["spender"],
+        "a canceled last-resort sink stops nothing, so the spender is uncapped"
+    );
+}
+
+/// A hybrid last-resort sink serves through its provider key, which a canceled
+/// OAuth plan does not stop: its picked reading is the provider's (no plan), so
+/// the boot warning counts it as a sink, as the TUI's member card does, and
+/// names no spender.
+#[test]
+fn uncapped_spenders_counts_a_hybrid_sink_whose_oauth_plan_is_canceled() {
+    use crate::usage::{PlanInfo, UsageInfo};
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["spender", "sink"]);
+    let mut spender = blank_profile(&crate::profile::ProfileName::from("spender"));
+    spender.max_auto_spend = Some(5.0);
+    let mut sink = profile_with_creds("sink", "a-access");
+    sink.base_url = Some("https://api.deepseek.com/anthropic".into());
+    sink.api_key = Some("k".into());
+    sink.provider = Some(crate::providers::Provider::DeepSeek);
+    sink.last_resort = true;
+    assert!(
+        sink.usage_cache_is_third_party(),
+        "fixture: the hybrid's figures live in its provider cache"
+    );
+    crate::profile_cache::write_profile_cache(
+        &sink.name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(PlanInfo {
+                subscription_status: Some("canceled".to_string()),
+                ..PlanInfo::default()
+            }),
+            ..UsageInfo::default()
+        },
+    );
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["spender".into(), "sink".into()],
+            spend_budget_switching: true,
+            switch_off_when_budget_spent: false,
+            ..AppState::default()
+        },
+        profiles: vec![spender, sink],
+    };
+
+    assert_eq!(
+        super::uncapped_spenders(&config),
+        Vec::<&str>::new(),
+        "the hybrid sink still catches the spend, so nothing is uncapped"
+    );
+}
+
+/// `fetch_status` of each profile in a `status.json` body built the way
+/// `write_status` builds it, off the daemon's own live stores.
+fn published_fetch_status(daemon: &Daemon) -> Vec<(String, serde_json::Value)> {
+    let snap = daemon.live_stores().snapshot();
+    let live = snap.signals();
+    let cfg = daemon.config.lock().unwrap().clone();
+    let interval = daemon.refresh_interval.load(Ordering::Relaxed);
+    let body = super::status_json::build_status(&cfg, interval, Some(&live), true);
+    let v = serde_json::to_value(&body).unwrap();
+    v["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["name"].as_str().unwrap().to_string(),
+                p["fetch_status"].clone(),
+            )
+        })
+        .collect()
+}
+
+/// A disabled provider account gets no boot seed at all (the daemon's boot seed
+/// is the work list, and nothing polls a disabled account), so `status.json`
+/// keeps the daemonless arms for it — a durable auth-expired verdict for its key
+/// publishes `AuthExpired`, and a keyless one's just-written cache derives
+/// `Fresh`.
+#[test]
+fn the_boot_seed_leaves_a_disabled_accounts_published_status_to_its_durable_verdict() {
+    use crate::profile::ProfileName;
+    let _home = HomeSandbox::new();
+    let provider = |n: &str, keyed: bool| {
+        let mut p = blank_profile(&ProfileName::from(n));
+        p.base_url = Some("https://api.deepseek.com/anthropic".into());
+        if keyed {
+            p.api_key = Some("k".into());
+        }
+        p.provider = Some(crate::providers::Provider::DeepSeek);
+        p.disabled = true;
+        p
+    };
+    // The work-list positive: an ENABLED keyed account with the same durable
+    // auth-expired record and fresh cache publishes the boot-seeded `Fresh`
+    // (nothing polls it into a live verdict; the durable one must lose).
+    let mut on = blank_profile(&ProfileName::from("on"));
+    on.base_url = Some("https://api.deepseek.com/anthropic".into());
+    on.api_key = Some("k".into());
+    on.provider = Some(crate::providers::Provider::DeepSeek);
+    let profiles = vec![provider("dx", true), provider("kl", false), on.clone()];
+    let fp = crate::usage::profile_credential_fingerprint(&profiles[0]).expect("fingerprint");
+    let on_fp = crate::usage::profile_credential_fingerprint(&on).expect("on fingerprint");
+    let config = persist(profiles, None, 90_000);
+    for n in ["dx", "kl", "on"] {
+        crate::profile_cache::write_profile_cache(
+            &ProfileName::from(n),
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            &crate::testutil::stats_with_bars(vec![
+                crate::testutil::bar("5h", 47.0),
+                crate::testutil::bar("7d", 23.0),
+            ]),
+        );
+    }
+    crate::profile_cache::write_auth_expired(&ProfileName::from("dx"), fp);
+    crate::profile_cache::write_auth_expired(&ProfileName::from("on"), on_fp);
+    let daemon = daemon_for(config);
+    daemon.boot();
+    daemon.shutting_down.store(true, Ordering::SeqCst);
+
+    assert_eq!(
+        published_fetch_status(&daemon),
+        vec![
+            ("dx".to_string(), serde_json::json!("AuthExpired")),
+            ("kl".to_string(), serde_json::json!("Fresh")),
+            ("on".to_string(), serde_json::json!("Fresh")),
+        ],
+        "a disabled account publishes its durable verdict, never a boot-seeded live status; an enabled one gets the boot-seeded Fresh over the same durable record"
+    );
+}
+
+/// The derived arm ages: a disabled account's cache, fresh at boot, publishes
+/// `Cached` once it is older than one interval, because no boot-seeded `Fresh`
+/// status outranks the derivation for a name nothing polls.
+#[test]
+fn a_disabled_accounts_published_status_ages_to_cached_after_boot() {
+    use crate::profile::ProfileName;
+    let _home = HomeSandbox::new();
+    let mut p = blank_profile(&ProfileName::from("dx"));
+    p.base_url = Some("https://api.deepseek.com/anthropic".into());
+    p.api_key = Some("k".into());
+    p.provider = Some(crate::providers::Provider::DeepSeek);
+    p.disabled = true;
+    let config = persist(vec![p], None, 90_000);
+    crate::profile_cache::write_profile_cache(
+        &ProfileName::from("dx"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 47.0)]),
+    );
+    let daemon = daemon_for(config);
+    daemon.boot();
+    daemon.shutting_down.store(true, Ordering::SeqCst);
+    let path = crate::profile::profile_dir(&ProfileName::from("dx"))
+        .unwrap()
+        .join(crate::profile_cache::THIRD_PARTY_CACHE_FILE);
+    set_mtime(&path, SystemTime::now() - Duration::from_secs(2 * 3600));
+
+    assert_eq!(
+        published_fetch_status(&daemon),
+        vec![("dx".to_string(), serde_json::json!("Cached"))],
+        "a two-hour-old cache publishes Cached, not the boot's Fresh"
+    );
+}
+
+/// The daemon has no display reader of its provider store (`status.json` reads
+/// provider figures off disk), so the boot seed is the work list, not the
+/// display superset: a keyless provider chain member's cache never enters the
+/// store, and the daemon scan picks exactly what 6836c1a6 picked — the keyless
+/// member, whose absent reading reads as headroom.
+#[test]
+fn the_daemon_scan_ignores_a_keyless_provider_members_cached_reading() {
+    for (label, chain, ok_age) in [
+        ("S1 chain[act,kl]", vec!["act", "kl"], 0u64),
+        (
+            "S3 chain[act,kl,ok] ok-aged",
+            vec!["act", "kl", "ok"],
+            7200u64,
+        ),
+    ] {
+        let _home = HomeSandbox::new();
+        crate::testutil::keyless_walk_fixture(&chain, "act", ok_age, 97.0);
+        let d = daemon_for(crate::profile::load_config().expect("load config"));
+        d.boot();
+        d.shutting_down.store(true, Ordering::SeqCst);
+        assert!(
+            d.third_party_usage_store
+                .lock()
+                .unwrap()
+                .get("kl")
+                .is_none(),
+            "{label}: the boot seed is the work list, never the display superset"
+        );
+        crate::usage::scan_auto_switch(
+            &d.config,
+            &d.usage_store,
+            &d.third_party_usage_store,
+            &d.usage_status,
+            &d.third_party_status,
+            &d.third_party_streaks,
+            &d.third_party_broken,
+            &d.poll_streaks,
+            &d.kick_blocks,
+            &d.activity,
+            &d.pending_switch,
+            &d.pending_switch_off,
+        );
+        assert_eq!(
+            queued_targets(&d),
+            vec!["kl".to_string()],
+            "{label}: the daemon scan"
+        );
+    }
 }
 
 /// The standby arm tightens the tree BEFORE it parks, never after the takeover.
@@ -2160,6 +2411,61 @@ fn the_status_writer_reads_the_schedulers_own_streak_store() {
     assert!(
         stale,
         "the writer must read the scheduler's own streak store"
+    );
+}
+
+/// The published auto-start queue reads the canceled verdict off the daemon's
+/// own OAuth store: `live_stores()` clones the scheduler's `usage_store` Arc
+/// into the snapshot, so a canceled plan held only there (no cache on disk)
+/// drops the account and the survivor closes up.
+#[test]
+fn the_status_writer_drops_a_canceled_account_off_the_schedulers_own_usage_store() {
+    use crate::usage::{PlanInfo, UsageInfo};
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["a", "b"]);
+    let queued = |name: &str| {
+        let mut p = profile_with_creds(name, &format!("{name}-access"));
+        p.auto_start = true;
+        p
+    };
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b")],
+    };
+    let daemon = daemon_for(config);
+    daemon.usage_store.lock().unwrap().insert(
+        "a".to_string(),
+        UsageInfo {
+            plan: Some(PlanInfo {
+                subscription_status: Some("canceled".to_string()),
+                ..PlanInfo::default()
+            }),
+            ..UsageInfo::default()
+        },
+    );
+
+    let snapshot = daemon.live_stores().snapshot();
+    let live = snapshot.signals();
+    let cfg_snap = daemon.config.lock().unwrap().clone();
+    let body = super::status_json::build_status(&cfg_snap, 300_000, Some(&live), false);
+    let positions: Vec<(&str, Option<usize>)> = body
+        .profiles
+        .iter()
+        .map(|p| {
+            (
+                p.name.as_str(),
+                p.auto_start_queue.as_ref().map(|q| q.position),
+            )
+        })
+        .collect();
+    assert_eq!(
+        positions,
+        vec![("a", None), ("b", Some(1))],
+        "the canceled account leaves the published queue and `b` closes up to 1"
     );
 }
 

@@ -6,7 +6,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{ListItem, Paragraph};
 
-use super::super::app::{App, CodexRow, MainItemKind};
+use super::super::app::{App, CodexRow, MainItemKind, ReadingsSnapshot};
 use super::super::theme;
 use super::chain::reason_marker;
 use super::format::{
@@ -36,7 +36,7 @@ const TIMER_SLOT: usize = 5;
 /// it is the scrollable, interactive list, so it wins the vertical budget.
 const ACCOUNTS_MIN: u16 = 7;
 
-pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &ReadingsSnapshot) {
     // The chain panel's inner width is independent of the vertical split (both
     // panels span the full body width), so build its lines first and size the
     // panel to fit them, capped; members that do not fit collapse into
@@ -45,7 +45,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let chain_inner_w = section_box("", false, false, probe.width)
         .inner(probe)
         .width as usize;
-    let (full_lines, member_count) = fallback_flow_lines(app, chain_inner_w);
+    let (full_lines, member_count) = fallback_flow_lines(app, chain_inner_w, readings);
     let chain_height = chain_panel_height(full_lines.len(), area.height);
     // The panel is capped, so its inner height is the budget the member list
     // must fit: when members are hidden, the last row names how many.
@@ -58,7 +58,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ])
     .areas(area);
 
-    draw_overview_accounts(frame, accounts_area, app);
+    draw_overview_accounts(frame, accounts_area, app, readings);
     draw_fallback_overview(frame, chain_area, chain_lines);
 }
 
@@ -142,7 +142,12 @@ fn harness_counts(app: &App) -> String {
     terms.join(" · ")
 }
 
-fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_overview_accounts(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    readings: &ReadingsSnapshot,
+) {
     // Sole interactive content panel on this screen — always focused.
     let focused = true;
     let block = section_box_meta(
@@ -174,7 +179,7 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let [header_area, list_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
 
-    let widths = OverviewWidths::new(list_area.width, app);
+    let widths = OverviewWidths::new(list_area.width, app, readings);
     let header = overview_header(&widths, any_deepseek(app));
     frame.render_widget(Paragraph::new(header).style(theme::base()), header_area);
 
@@ -200,7 +205,7 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let selected = index == sel;
         let line = match item {
             MainItemKind::Profile(idx) => {
-                render_overview_row(app, *idx, &widths, selected, focused)
+                render_overview_row(app, *idx, &widths, selected, focused, readings)
             }
             MainItemKind::Codex(idx) => render_codex_row(&codex[*idx], &widths, selected),
         };
@@ -279,7 +284,7 @@ const SEVEN_DAY_WIDE_AT: usize = 102;
 const GAP_MIN: usize = 2;
 
 impl OverviewWidths {
-    fn new(width: u16, app: &App) -> Self {
+    fn new(width: u16, app: &App, readings: &ReadingsSnapshot) -> Self {
         let total = width as usize;
         let max_name = app
             .config()
@@ -341,7 +346,7 @@ impl OverviewWidths {
             .profiles
             .iter()
             .filter(|p| p.provider == Some(Provider::DeepSeek))
-            .filter_map(|p| p.third_party_usage.as_ref())
+            .filter_map(|p| readings.stats_of(&p.name))
             .flat_map(|s| s.rows.iter())
             .filter(|r| crate::providers::is_balance_row(&r.label))
             .filter_map(|r| r.value.rsplit_once(' ').map(|(a, _)| a.chars().count()))
@@ -584,6 +589,7 @@ fn render_overview_row(
     widths: &OverviewWidths,
     selected: bool,
     focused: bool,
+    readings: &ReadingsSnapshot,
 ) -> Line<'static> {
     let cfg = app.config();
     let Some(profile) = cfg.profiles.get(idx) else {
@@ -595,7 +601,7 @@ fn render_overview_row(
     // Overview rows only: the refresh countdown carries the profile's
     // fetch-state cue (amber = last-known numbers, red = failed) so staleness
     // reads off the timer instead of the bar brackets.
-    let cue = fetch_cue_color(profile);
+    let cue = fetch_cue_color(profile, readings.status_of(&profile.name));
     let cursor = if selected && focused {
         Span::styled("❯ ", theme::accent().bold())
     } else {
@@ -661,7 +667,7 @@ fn render_overview_row(
     // out on the next switch, so it outranks a bell. The active dot outranks
     // the peak marker — naming which account a bare `claude` authenticates as
     // beats a schedule the Usage tab's pricing row already names.
-    if crate::fallback::is_canceled(profile) {
+    if crate::fallback::is_canceled_from_info(readings.usage_of(&profile.name)) {
         spans.push(Span::styled("⊖", hue(theme::danger())));
         spans.push(Span::raw(" "));
     } else if cfg.is_auth_broken(&profile.name) {
@@ -706,7 +712,7 @@ fn render_overview_row(
     spans.push(Span::styled(nt, ns));
     spans.push(Span::raw(np));
     spans.push(gap(widths));
-    let label = account_type_label(profile);
+    let label = account_type_label(profile, readings.usage_of(&profile.name));
     // Read before the tag: a no-data dash is not a tier, and the row must not
     // animate one. A lone glyph color-cycling beside the static faint dashes in
     // the same row reads as live data, which is the opposite of what it means.
@@ -739,13 +745,13 @@ fn render_overview_row(
     // OAuth windows come from `usage`; an api-key/provider profile carries
     // `usage` only when it was seeded from its provider windows, and where it
     // is absent the 5h/7d windows are synthesized from the matching bars.
-    let (five_window, seven_window) = overview_windows(profile);
+    let (five_window, seven_window) = overview_windows(profile, readings);
     // Drain-color each reset countdown by the window's burn rate — see
     // `drain_rate` for where that rate comes from per window.
     let reset_style = |label, window: Option<&UsageWindow>| {
         let window = window?;
         drain_reset_style(
-            drain_rate(app, &profile.name, profile, label, window),
+            drain_rate(app, &profile.name, profile, label, window, readings),
             window_rate_unit(label),
             window,
         )
@@ -769,9 +775,9 @@ fn render_overview_row(
     };
     let five_spans = if profile.provider == Some(Provider::DeepSeek) {
         flatten(deepseek_balance_cell(
-            profile,
             widths.five_hour,
             widths.deepseek_amount_w,
+            readings.stats_of(&profile.name),
         ))
     } else {
         flatten(window_summary_spans_bracketed(
@@ -854,10 +860,7 @@ fn any_deepseek(app: &App) -> bool {
 /// balance row. The wallet set is the shared
 /// [`crate::providers::funded_wallets`] selection, so this column and the MCP
 /// roster's rank drop the same zero-amount wallets.
-fn deepseek_balances_to_show(profile: &Profile) -> Vec<String> {
-    let Some(stats) = profile.third_party_usage.as_ref() else {
-        return Vec::new();
-    };
+fn deepseek_balances_to_show(stats: &crate::providers::ThirdPartyStats) -> Vec<String> {
     let mut wallets = crate::providers::funded_wallets(&stats.rows);
     let no_funded = wallets.is_empty();
     if no_funded {
@@ -877,8 +880,15 @@ fn deepseek_balances_to_show(profile: &Profile) -> Vec<String> {
 /// DeepSeek rows so currencies line up under each other; the longest amount
 /// gets exactly one space before its currency. Width is exact so the column
 /// boundary holds.
-fn deepseek_balance_cell(profile: &Profile, width: usize, amount_w: usize) -> Vec<Span<'static>> {
-    let balances = deepseek_balances_to_show(profile);
+fn deepseek_balance_cell(
+    width: usize,
+    amount_w: usize,
+    stats: Option<&crate::providers::ThirdPartyStats>,
+) -> Vec<Span<'static>> {
+    let Some(stats) = stats else {
+        return vec![Span::styled(NO_DATA.to_string(), theme::faint())];
+    };
+    let balances = deepseek_balances_to_show(stats);
     if balances.is_empty() {
         return vec![Span::styled(NO_DATA.to_string(), theme::faint())];
     };
@@ -920,11 +930,14 @@ fn deepseek_balance_cell(profile: &Profile, width: usize, amount_w: usize) -> Ve
 /// the third-party bar whose label matches (`5h` / `7d`) —
 /// the same labels `zai` decodes from its window codes. `None` per slot when no
 /// source exists (renders `—`).
-fn overview_windows(profile: &Profile) -> (Option<UsageWindow>, Option<UsageWindow>) {
-    if let Some(usage) = profile.usage.as_ref() {
+fn overview_windows(
+    profile: &Profile,
+    readings: &ReadingsSnapshot,
+) -> (Option<UsageWindow>, Option<UsageWindow>) {
+    if let Some(usage) = readings.usage_of(&profile.name) {
         return (usage.five_hour.clone(), usage.weekly_window().cloned());
     }
-    let Some(bars) = profile.third_party_usage.as_ref().map(|s| &s.bars) else {
+    let Some(bars) = readings.stats_of(&profile.name).map(|s| &s.bars) else {
         return (None, None);
     };
     let window_for = |label: &str| {
@@ -957,7 +970,11 @@ fn draw_fallback_overview(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'st
 
 const GAUGE_W: usize = 12;
 
-fn fallback_flow_lines(app: &App, width: usize) -> (Vec<Line<'static>>, usize) {
+fn fallback_flow_lines(
+    app: &App,
+    width: usize,
+    readings: &ReadingsSnapshot,
+) -> (Vec<Line<'static>>, usize) {
     // Switch-grade kick blocks feed the blocked-reason markers; read BEFORE the
     // Config lock (rank order: KickBlockState 230 < Config 400).
     let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
@@ -1060,6 +1077,8 @@ fn fallback_flow_lines(app: &App, width: usize) -> (Vec<Line<'static>>, usize) {
                     p,
                     kick_lifts.get(name.as_str()).copied(),
                     &key_rejected,
+                    readings.usage_of(&p.name),
+                    readings.status_of(&p.name),
                 )
             });
             let switch_eta = switch_to
@@ -1078,6 +1097,10 @@ fn fallback_flow_lines(app: &App, width: usize) -> (Vec<Line<'static>>, usize) {
                     figure_inline,
                     reason,
                     switch_eta,
+                    pct: readings
+                        .usage_of(name.as_str())
+                        .and_then(|u| u.five_hour.as_ref())
+                        .map(|w| w.utilization),
                 },
             )
         })
@@ -1148,7 +1171,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> (Vec<Line<'static>>, usize) {
     if let Some(active) = cfg.state.active_profile.as_ref().and_then(|n| cfg.find(n))
         && active.usage_cache_is_third_party()
         && !active.is_disabled()
-        && let Some(rate) = app.wallet_rate_for(active)
+        && let Some(rate) = app.wallet_rate_for(&active.name, readings.stats_of(&active.name))
     {
         let secs = (rate.amount / rate.per_day * 86_400.0) as i64;
         lines.push(Line::from(vec![
@@ -1180,7 +1203,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> (Vec<Line<'static>>, usize) {
     // equivalent), name whichever one resumes first. Mutually exclusive with the
     // projection — `burn_rate_eta` returns `None` once the active crosses its
     // own threshold, which is a precondition for `soonest_resume` to return.
-    if let Some((name, eta)) = soonest_resume(&cfg, &key_rejected) {
+    if let Some((name, eta)) = soonest_resume(&cfg, &key_rejected, &readings.usage) {
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
@@ -1287,6 +1310,8 @@ struct ChainRowCtx {
     figure_inline: bool,
     reason: Option<BlockedReason>,
     switch_eta: Option<i64>,
+    /// The member's 5h utilization off the per-frame snapshot.
+    pct: Option<f64>,
 }
 
 fn chain_row(cfg: &AppConfig, name: &crate::profile::ProfileName, ctx: ChainRowCtx) -> ChainRow {
@@ -1299,6 +1324,7 @@ fn chain_row(cfg: &AppConfig, name: &crate::profile::ProfileName, ctx: ChainRowC
         figure_inline,
         reason,
         switch_eta,
+        pct,
     } = ctx;
     let active = cfg.is_active(name);
     let rail = if index == 0 && last == 0 {
@@ -1329,11 +1355,6 @@ fn chain_row(cfg: &AppConfig, name: &crate::profile::ProfileName, ctx: ChainRowC
         None => spans.push(Span::styled("missing", theme::danger())),
         Some(profile) => {
             let threshold = threshold_for(profile);
-            let pct = profile
-                .usage
-                .as_ref()
-                .and_then(|u| u.five_hour.as_ref())
-                .map(|w| w.utilization);
             spans.extend(gauge_spans(pct, threshold, gauge_w));
             let (figure, figure_style) = match pct {
                 Some(v) => (
@@ -1464,10 +1485,11 @@ fn drain_rate(
     profile: &Profile,
     label: &str,
     window: &UsageWindow,
+    readings: &ReadingsSnapshot,
 ) -> Option<f64> {
     if label == LABEL_5H
         && !profile.usage_cache_is_third_party()
-        && let Some(usage) = profile.usage.as_ref()
+        && let Some(usage) = readings.usage_of(&profile.name)
     {
         return app.active_burn_rate(name, usage);
     }

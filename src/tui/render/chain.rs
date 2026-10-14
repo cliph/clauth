@@ -20,8 +20,8 @@ use std::collections::HashSet;
 
 use super::super::app::{
     App, CardEdit, ChainItemKind, FALLBACK_ROWS, FallbackFocus, FallbackRow, InputState,
-    PREFERRED_DAY_PRESETS, WEEKDAYS_ALL, chain_candidates, chain_items, member_days,
-    parse_max_spend, parse_weekly_override, preferred_days_preset,
+    PREFERRED_DAY_PRESETS, ReadingsSnapshot, WEEKDAYS_ALL, chain_candidates, chain_items,
+    member_days, parse_max_spend, parse_weekly_override, preferred_days_preset,
 };
 use super::super::theme;
 use super::format::{ResetFmt, fixed_split, relative_age, reset_pill, reset_resume, truncate};
@@ -46,15 +46,15 @@ use chrono::Weekday;
 /// Wide enough to read a threshold tick.
 const GAUGE_W: usize = 22;
 
-pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &ReadingsSnapshot) {
     let (selector, detail) = master_detail(area, chain_items(app).len());
     // The live key-rejected set, read once per frame (never per candidate)
     // before either pane locks the config guard.
     let key_rejected = app.key_rejected_names();
 
     let chain_focused = app.fallback_focus == FallbackFocus::Chain;
-    draw_chain_selector(frame, selector, app, chain_focused, &key_rejected);
-    draw_chain_detail(frame, detail, app, &key_rejected);
+    draw_chain_selector(frame, selector, app, chain_focused, &key_rejected, readings);
+    draw_chain_detail(frame, detail, app, &key_rejected, readings);
 }
 
 fn draw_chain_selector(
@@ -63,6 +63,7 @@ fn draw_chain_selector(
     app: &App,
     focused: bool,
     key_rejected: &HashSet<crate::profile::ProfileName>,
+    readings: &ReadingsSnapshot,
 ) {
     let items = chain_items(app);
     // Switch-grade kick blocks the chip flags — read before the Config lock
@@ -120,6 +121,8 @@ fn draw_chain_selector(
                                     p,
                                     kick_lifts.get(name.as_str()).copied(),
                                     key_rejected,
+                                    readings.usage_of(&p.name),
+                                    readings.status_of(&p.name),
                                 )
                             });
                             let rail_w = rail.width();
@@ -181,6 +184,7 @@ fn draw_chain_detail(
     area: Rect,
     app: &App,
     key_rejected: &HashSet<crate::profile::ProfileName>,
+    readings: &ReadingsSnapshot,
 ) {
     let detail_focused = app.fallback_focus == FallbackFocus::Detail;
     let inner_w = section_box("", detail_focused, false, area.width)
@@ -259,13 +263,21 @@ fn draw_chain_detail(
                     sessions: app.live_sessions.member(&name),
                 },
                 key_rejected,
+                readings,
             );
             // Publish each row's focused block end: the drawn span plus the
             // hint the row gains when it becomes focused (V2).
             if let Some(profile) = cfg.find(&name) {
                 for (j, row) in FALLBACK_ROWS.iter().enumerate() {
-                    let tip_len =
-                        member_focused_tip_len(*row, profile, &cfg, &name, key_rejected, inner_w);
+                    let tip_len = member_focused_tip_len(
+                        *row,
+                        profile,
+                        &cfg,
+                        &name,
+                        key_rejected,
+                        inner_w,
+                        readings,
+                    );
                     let selected = detail_focused && j == app.fallback_detail_cursor;
                     member_tips.push(tip_len);
                     member_block_ends.push(if selected {
@@ -671,6 +683,7 @@ fn member_row_hint(
     cfg: &AppConfig,
     name: &crate::profile::ProfileName,
     key_rejected: &HashSet<crate::profile::ProfileName>,
+    readings: &ReadingsSnapshot,
 ) -> Option<String> {
     match row {
         FallbackRow::Threshold => {
@@ -727,10 +740,16 @@ fn member_row_hint(
         }
         FallbackRow::MaxSpend => {
             let ceiling = profile.max_auto_spend.unwrap_or(0.0);
-            if spend_is_uncapped(cfg, ceiling, key_rejected) {
+            if spend_is_uncapped(cfg, ceiling, key_rejected, |n| {
+                crate::fallback::is_canceled_from_usage(n, &readings.usage)
+            }) {
                 None // always drawn, so not a focused-only addition
             } else {
-                Some(max_spend_hint(cfg, name, ceiling))
+                Some(max_spend_hint(
+                    cfg,
+                    ceiling,
+                    readings.usage_of(&profile.name),
+                ))
             }
         }
         _ => None,
@@ -747,8 +766,9 @@ fn member_focused_tip_len(
     name: &crate::profile::ProfileName,
     key_rejected: &HashSet<crate::profile::ProfileName>,
     width: usize,
+    readings: &ReadingsSnapshot,
 ) -> usize {
-    member_row_hint(row, profile, cfg, name, key_rejected)
+    member_row_hint(row, profile, cfg, name, key_rejected, readings)
         .map(|h| help_tooltip_lines(&h, width).len())
         .unwrap_or(0)
 }
@@ -761,6 +781,7 @@ fn member_detail(
     name: &crate::profile::ProfileName,
     card: MemberCard<'_>,
     key_rejected: &HashSet<crate::profile::ProfileName>,
+    readings: &ReadingsSnapshot,
 ) -> (Vec<Line<'static>>, RowSpans, Option<String>) {
     let MemberCard {
         focused,
@@ -787,9 +808,8 @@ fn member_detail(
     };
 
     let threshold = threshold_for(profile);
-    let pct = profile
-        .usage
-        .as_ref()
+    let pct = readings
+        .usage_of(&profile.name)
         .and_then(|u| u.five_hour.as_ref())
         .map(|w| w.utilization);
     let cursor = row_cursor.min(FALLBACK_ROWS.len() - 1);
@@ -804,10 +824,24 @@ fn member_detail(
     // `health_blocked_reason`), so the pills can't disagree with the marker.
     let fmt = ResetFmt::from_state(&cfg.state);
     let mut pills: Vec<(Vec<Span<'static>>, String)> = Vec::new();
-    if let Some(reason) = blocked_reason(cfg, profile, kick_lift, key_rejected) {
+    if let Some(reason) = blocked_reason(
+        cfg,
+        profile,
+        kick_lift,
+        key_rejected,
+        readings.usage_of(&profile.name),
+        readings.status_of(&profile.name),
+    ) {
         pills.push((reason_pill_spans(&reason, fmt), reason_fix(&reason, name)));
         if reason == BlockedReason::Disabled
-            && let Some(health) = health_blocked_reason(cfg, profile, kick_lift, key_rejected)
+            && let Some(health) = health_blocked_reason(
+                cfg,
+                profile,
+                kick_lift,
+                key_rejected,
+                readings.usage_of(&profile.name),
+                readings.status_of(&profile.name),
+            )
         {
             pills.push((reason_pill_spans(&health, fmt), reason_fix(&health, name)));
         }
@@ -933,7 +967,8 @@ fn member_detail(
             match row_editing {
                 Some(input) => lines.extend(threshold_range_tooltip(input, width)),
                 None if selected => lines.extend(help_tooltip_lines(
-                    &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
+                    &member_row_hint(*row, profile, cfg, name, key_rejected, readings)
+                        .unwrap_or_default(),
                     width,
                 )),
                 None => {}
@@ -946,7 +981,8 @@ fn member_detail(
             match row_editing {
                 Some(input) => lines.extend(weekly_override_range_tooltip(input, width)),
                 None if selected => lines.extend(help_tooltip_lines(
-                    &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
+                    &member_row_hint(*row, profile, cfg, name, key_rejected, readings)
+                        .unwrap_or_default(),
                     width,
                 )),
                 None => {}
@@ -957,25 +993,29 @@ fn member_detail(
         // sentence.
         if *row == FallbackRow::CheckWeekly && selected {
             lines.extend(help_tooltip_lines(
-                &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
+                &member_row_hint(*row, profile, cfg, name, key_rejected, readings)
+                    .unwrap_or_default(),
                 width,
             ));
         }
         if *row == FallbackRow::CheckScoped && selected {
             lines.extend(help_tooltip_lines(
-                &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
+                &member_row_hint(*row, profile, cfg, name, key_rejected, readings)
+                    .unwrap_or_default(),
                 width,
             ));
         }
         if *row == FallbackRow::LastResort && selected {
             lines.extend(help_tooltip_lines(
-                &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
+                &member_row_hint(*row, profile, cfg, name, key_rejected, readings)
+                    .unwrap_or_default(),
                 width,
             ));
         }
         if *row == FallbackRow::Preferred && selected {
             lines.extend(help_tooltip_lines(
-                &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
+                &member_row_hint(*row, profile, cfg, name, key_rejected, readings)
+                    .unwrap_or_default(),
                 width,
             ));
         }
@@ -997,7 +1037,8 @@ fn member_detail(
                     key("↑ ↓")
                 )
             } else {
-                member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default()
+                member_row_hint(*row, profile, cfg, name, key_rejected, readings)
+                    .unwrap_or_default()
             };
             lines.extend(help_tooltip_lines(&hint, width));
         }
@@ -1013,14 +1054,18 @@ fn member_detail(
                 // An uncapped config warns whether or not the row is selected:
                 // it is the one state where the ceiling does not bound the bill,
                 // so it must not hide until someone arrows onto the field.
-                None if spend_is_uncapped(cfg, ceiling, key_rejected) => {
+                None if spend_is_uncapped(cfg, ceiling, key_rejected, |n| {
+                    crate::fallback::is_canceled_from_usage(n, &readings.usage)
+                }) =>
+                {
                     lines.extend(invalid_tooltip_lines(
                         &format!("nothing stops the spending: {}", uncapped_spend_fix()),
                         width,
                     ))
                 }
                 None if selected => lines.extend(help_tooltip_lines(
-                    &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
+                    &member_row_hint(*row, profile, cfg, name, key_rejected, readings)
+                        .unwrap_or_default(),
                     width,
                 )),
                 None => {}
@@ -1035,7 +1080,7 @@ fn member_detail(
     // renders under whichever member happens to be selected — pinned as a
     // footnote below the scroll content rather than scrolled with it (on a pane
     // too short to pin, the helper inlines it as the content's last line).
-    let footnote = soonest_resume(cfg, key_rejected).map(|(resume_name, eta)| {
+    let footnote = soonest_resume(cfg, key_rejected, &readings.usage).map(|(resume_name, eta)| {
         format!(
             "resumes: {resume_name} {}",
             reset_resume(eta, ResetFmt::from_state(&cfg.state))
@@ -1160,17 +1205,18 @@ fn max_spend_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static
 /// nothing — that is the reading this line exists to stop. `spend_room` fails
 /// closed on money (unknown spend never reads as $0), so each of its refusals
 /// gets its own copy instead of one $0-implying fallback.
-fn max_spend_hint(cfg: &AppConfig, name: &crate::profile::ProfileName, ceiling: f64) -> String {
+fn max_spend_hint(
+    cfg: &AppConfig,
+    ceiling: f64,
+    usage: Option<&crate::usage::UsageInfo>,
+) -> String {
     if !cfg.state.spend_budget_switching {
         return "turn on allow extra usage in config before this does anything".to_string();
     }
     if ceiling <= 0.0 {
         return "never spends here; type a ceiling to allow it".to_string();
     }
-    let spend = cfg
-        .find(name)
-        .and_then(|p| p.usage.as_ref())
-        .and_then(|u| u.spend.as_ref());
+    let spend = usage.and_then(|u| u.spend.as_ref());
     match spend {
         Some(spend) if !spend.enabled => "this account isn't set up for paid usage".to_string(),
         // A live figure only when spend is known AND some room remains; unknown

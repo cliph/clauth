@@ -19,7 +19,7 @@ pub(crate) enum DivergenceChoice {
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::logline::logline;
 use crate::providers::{Provider, ThirdPartyStats};
-use crate::usage::{FetchStatus, UsageInfo, WalletSample};
+use crate::usage::{UsageInfo, WalletSample};
 
 /// A slot that reads like its inner value but writes only through the
 /// witness-gated [`SlotOps::set`]. `active_profile` and `credentials` are
@@ -421,19 +421,8 @@ pub(crate) struct Profile {
     /// on; `None` means the account renders no usage until a console login.
     pub(crate) console: Option<ConsoleCredential>,
     pub(crate) credentials: LockedSlot<Option<ClaudeCredentials>>,
-    pub(crate) usage: Option<UsageInfo>,
-    pub(crate) fetch_status: Option<FetchStatus>,
-    /// Cache age past [`crate::profile_json::stale_after_ms`] — the Usage tab's
-    /// degraded cue (#74). Fed by `tui::app::apply_usage` from the same age
-    /// source `status.json`'s `stale` arm reads (the body's `fetched_at` for
-    /// OAuth, the cache mtime for third-party), keyed to the live refresh
-    /// interval; a fact orthogonal to `fetch_status`, so a `cached` pill and
-    /// this cue can coexist.
-    pub(crate) usage_stale: bool,
     /// Recognised third-party provider (derived from base_url).
     pub(crate) provider: Option<Provider>,
-    /// Provider-specific usage data (e.g. DeepSeek balance).
-    pub(crate) third_party_usage: Option<ThirdPartyStats>,
 }
 
 impl Profile {
@@ -459,11 +448,7 @@ impl Profile {
             disabled: false,
             console: None,
             credentials: slot(None),
-            usage: None,
-            fetch_status: None,
-            usage_stale: false,
             provider,
-            third_party_usage: None,
         }
     }
 
@@ -3504,30 +3489,6 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
     );
 
     let provider = base_url.as_deref().and_then(Provider::from_base_url);
-    // Seed third-party usage from disk for every account whose figures live in
-    // that cache — the predicate is named there so no reader has to restate it.
-    let third_party_usage = if usage_cache_is_third_party(
-        provider,
-        base_url.as_deref(),
-        config.api_key.as_deref(),
-        credentials.is_some(),
-        &config.env,
-    ) {
-        crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
-            name,
-            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-        )
-    } else {
-        None
-    };
-    // A third-party account's windows ARE its usage snapshot, so seed `usage`
-    // from them at the same boundary. Every OAuth account keeps `None` here and
-    // is filled by the usage store as before — this load has no OAuth cache to
-    // read, and `third_party_usage` is `Some` only where that store never had an
-    // entry to begin with, so the two can't overwrite each other.
-    let usage = third_party_usage
-        .as_ref()
-        .and_then(crate::providers::ThirdPartyStats::to_usage_info);
 
     let profile = Profile {
         name: name.clone(),
@@ -3564,11 +3525,7 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
         disabled: config.disabled,
         console: console_credential(&config.console),
         credentials: slot(credentials),
-        usage,
-        fetch_status: None,
-        usage_stale: false,
         provider,
-        third_party_usage,
     };
 
     maybe_rewrite_config_toml(&config_path, &raw_config, &profile);

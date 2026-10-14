@@ -59,7 +59,7 @@ use crate::usage::{
     ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, LegKey, NextRefreshPerProfile,
     PendingSwitch, PendingSwitchOff, PollStreaks, RefetchQueue, StatusStore,
     SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
-    ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageStore, bootstrap_fetch,
+    ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageInfo, UsageStore, bootstrap_fetch,
     bootstrap_third_party, collect_oauth_seed_names, collect_third_party_entries, collect_tokens,
     spawn_refresher,
 };
@@ -551,6 +551,16 @@ fn uncapped_spenders(config: &crate::profile::AppConfig) -> Vec<&str> {
                 config,
                 p.max_auto_spend.unwrap_or(0.0),
                 &key_rejected,
+                // Boot-time one-shot with no live store yet: the picked disk
+                // reading is the canceled source, the one the TUI card reads. A
+                // third-party-classified sink's picked reading is its provider
+                // stats, which carry no plan, so its OAuth plan never cancels it.
+                |n| {
+                    config
+                        .find(n)
+                        .is_some_and(|p| !p.usage_cache_is_third_party())
+                        && crate::profile_json::is_canceled_cached(n)
+                },
             )
         })
         .map(|p| p.name.as_str())
@@ -879,6 +889,9 @@ pub(crate) struct LiveStores {
     pub(crate) pending_switch: PendingSwitch,
     pub(crate) auto_start_queue: crate::usage::AutoStartQueueState,
     pub(crate) kick_blocks: KickBlocks,
+    /// The OAuth usage store, for the canceled-exclusion the queue membership
+    /// rule reads (the daemon's own context).
+    pub(crate) usage_store: UsageStore,
     /// The gateway supervisor's published slot.
     pub(crate) gateway: gateway::GatewayHandle,
     /// The per-proxy supervisors' published slots.
@@ -899,6 +912,7 @@ impl Default for LiveStores {
             pending_switch: Arc::new(RankedMutex::new(Default::default())),
             auto_start_queue: Arc::new(RankedMutex::new(Default::default())),
             kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+            usage_store: Arc::new(RankedMutex::new(HashMap::new())),
             gateway: gateway::new_handle(),
             proxies: proxies::new_slots(),
         }
@@ -916,6 +930,7 @@ pub(crate) struct LiveSnapshot {
     pending_switch: Option<String>,
     queue_anchor: Option<i64>,
     queue_blocked: Vec<ProfileName>,
+    usage: HashMap<String, UsageInfo>,
     gateway: Option<gateway::GatewaySlot>,
     proxies: Vec<proxies::ProxySlot>,
 }
@@ -975,6 +990,11 @@ impl LiveStores {
                 .keys()
                 .map(|k| k.as_str().into())
                 .collect();
+        let usage = self
+            .usage_store
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
         LiveSnapshot {
             status,
             third_party_status,
@@ -984,6 +1004,7 @@ impl LiveStores {
             pending_switch,
             queue_anchor,
             queue_blocked,
+            usage,
             gateway: gateway::published(&self.gateway),
             proxies: proxies::slots(&self.proxies),
         }
@@ -1001,6 +1022,7 @@ impl LiveSnapshot {
             pending_switch: self.pending_switch.as_deref(),
             queue_anchor: self.queue_anchor,
             queue_blocked: &self.queue_blocked,
+            usage: &self.usage,
             gateway: self.gateway.as_ref(),
             proxies: Some(&self.proxies),
         }
@@ -1139,15 +1161,25 @@ impl Daemon {
             let _ = link_profile_credentials(&active);
         }
 
-        let (seed_names, third_party) = {
+        let (seed_names, third_party, third_party_work) = {
             #[allow(
                 clippy::expect_used,
                 reason = "config mutex poisoning is unrecoverable"
             )]
             let cfg = self.config.lock().expect("config mutex poisoned");
+            let third_party_work = collect_third_party_entries(&cfg.profiles);
+            // The daemon has no display reader of its provider store
+            // (`status.json` reads provider figures off disk), so the boot seed
+            // is the work list — a display-only name's cache buys nothing here
+            // and must not reach the daemon's walk.
+            let third_party: Vec<String> = third_party_work
+                .iter()
+                .map(|e| e.name.to_string())
+                .collect();
             (
                 collect_oauth_seed_names(&cfg),
-                collect_third_party_entries(&cfg.profiles),
+                third_party,
+                third_party_work,
             )
         };
         let interval = self.refresh_interval.load(Ordering::Relaxed);
@@ -1163,6 +1195,7 @@ impl Daemon {
             &self.third_party_status,
             &self.last_fetched,
             &third_party,
+            &third_party_work,
             interval,
         );
         self.spawn_scheduler();
@@ -1203,6 +1236,12 @@ impl Daemon {
             // scheduler; the tick thread's clone keeps the flock held for the
             // process lifetime.
             Arc::new(FetchLease::new()),
+            // The daemon has no display reader of its provider store
+            // (`status.json` reads provider figures off disk), so its stand-down
+            // hydration seeds the work list, never the display superset.
+            // Pinned by construction, not a test: no test drives this call site
+            // (`spawn_refresher` builds its own state under `cfg!(test)`).
+            false,
         );
     }
 
@@ -1303,6 +1342,7 @@ impl Daemon {
             pending_switch: Arc::clone(&self.pending_switch),
             auto_start_queue: Arc::clone(&self.auto_start_queue),
             kick_blocks: Arc::clone(&self.kick_blocks),
+            usage_store: Arc::clone(&self.usage_store),
             gateway: Arc::clone(&self.gateway),
             proxies: Arc::clone(&self.proxies),
         }

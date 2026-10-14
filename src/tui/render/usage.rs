@@ -10,7 +10,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::{App, NoteBuffer, StatusFocus};
+use super::super::app::{App, NoteBuffer, ReadingsSnapshot, StatusFocus};
 use super::super::theme;
 use super::format::{
     ResetFmt, activity_verb, is_past_reset, reset_in_secs_at, reset_phrase, spinner_frame,
@@ -94,7 +94,7 @@ struct HeaderState {
     queue_slot: Option<QueueSlot>,
 }
 
-pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &ReadingsSnapshot) {
     let items = app.config().profiles.len();
     let (selector, detail) = master_detail(area, items);
 
@@ -105,7 +105,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         app.profile_cursor,
         app.usage_detail_focus == StatusFocus::List,
     );
-    draw_usage_detail(frame, detail, app);
+    draw_usage_detail(frame, detail, app, readings);
 }
 
 /// Which reading source the shown profile's stuck judgment took — the one that
@@ -141,7 +141,7 @@ fn effective_rate_limit(
     }
 }
 
-fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App, readings: &ReadingsSnapshot) {
     // Streak snapshot up front: POLL_STREAK (220) ranks below CONFIG
     // (400), so it can't be taken while `cfg` is held below.
     let streaks: HashMap<String, StreakCounts> = app
@@ -240,12 +240,24 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             DiagFlags {
                 auth_broken: cfg.is_auth_broken(&profile.name),
                 auto_start: profile.auto_start,
-                weekly_hard: crate::fallback::weekly_hard_blocked(profile),
-                budget_spent: crate::fallback::budget_spent_blocking(&cfg, profile),
-                spend_uncapped: crate::fallback::spend_is_uncapped(&cfg, ceiling, &key_rejected),
+                weekly_hard: crate::fallback::weekly_hard_blocked(readings.usage_of(&profile.name)),
+                budget_spent: crate::fallback::budget_spent_blocking(
+                    &cfg,
+                    profile,
+                    readings.usage_of(&profile.name),
+                ),
+                spend_uncapped: crate::fallback::spend_is_uncapped(
+                    &cfg,
+                    ceiling,
+                    &key_rejected,
+                    |n| crate::fallback::is_canceled_from_usage(n, &readings.usage),
+                ),
             }
         },
-        queue_slot: QueueView::new(&cfg, &kick_lifts, queue_anchor).slot(&profile.name),
+        queue_slot: QueueView::new(&cfg, &kick_lifts, queue_anchor, |n| {
+            crate::fallback::is_canceled_from_usage(n, &readings.oauth)
+        })
+        .slot(&profile.name),
         peak: app.peak_state_for(profile),
     };
 
@@ -287,6 +299,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         inner.width,
         &header,
         app,
+        readings,
         show_estimates,
         show_pace,
         reset_fmt,
@@ -320,17 +333,22 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one frame's full context: profile, header, app, snapshot"
+)]
 fn build_usage_lines(
     profile: &Profile,
     inner_w: u16,
     header: &HeaderState,
     app: &App,
+    readings: &ReadingsSnapshot,
     show_estimates: bool,
     show_pace: bool,
     reset_fmt: ResetFmt,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.extend(header_lines(profile, header, inner_w));
+    lines.extend(header_lines(profile, header, inner_w, readings));
     lines.push(Line::from(""));
 
     // Notes close the pane (cloudy's placement): below the usage bars and the
@@ -345,16 +363,17 @@ fn build_usage_lines(
     // Accounts whose usage figures live in the third-party cache — a recognised
     // provider or a generic api-key endpoint — render via the third-party
     // rows/bars path, the shared cache selector (`usage_cache_is_third_party`,
-    // the same predicate the profile load seeds `third_party_usage` with);
+    // the same predicate the snapshot builder picked each name with);
     // OAuth accounts — including OAuth run against a custom base_url — fall
     // through to their live window bars.
     if profile.usage_cache_is_third_party() {
         // In-memory series only (`app.wallet_cache`) — the same no-disk-read
         // discipline the 5h rate's `history_cache` read keeps one branch up.
-        let wallet_rate = app.wallet_rate_for(profile);
+        let wallet_rate = app.wallet_rate_for(&profile.name, readings.stats_of(&profile.name));
         lines.extend(build_tp_rows(
             profile,
             inner_w,
+            readings,
             show_estimates,
             show_pace,
             reset_fmt,
@@ -363,14 +382,20 @@ fn build_usage_lines(
         return with_notes(lines);
     }
 
-    if profile.usage.is_none() {
-        lines.extend(oauth_empty_lines(oauth_empty_msg(profile), inner_w));
+    let Some(usage) = readings.usage_of(&profile.name) else {
+        lines.extend(oauth_empty_lines(
+            oauth_empty_msg(profile, readings.status_of(&profile.name)),
+            inner_w,
+        ));
         return with_notes(lines);
-    }
+    };
 
-    let mut stats = collect_stats(profile, reset_fmt);
+    let mut stats = collect_stats(usage, reset_fmt);
     if stats.is_empty() {
-        lines.extend(oauth_empty_lines(oauth_empty_msg(profile), inner_w));
+        lines.extend(oauth_empty_lines(
+            oauth_empty_msg(profile, readings.status_of(&profile.name)),
+            inner_w,
+        ));
         return with_notes(lines);
     }
 
@@ -384,7 +409,7 @@ fn build_usage_lines(
     // derived from `resets_at` in `collect_stats` — rotation-proof, where a
     // history slope would jump on every account rotation.
     let mut window_rates: HashMap<String, Option<f64>> = HashMap::new();
-    if let Some(u) = profile.usage.as_ref() {
+    if let Some(u) = readings.usage_of(&profile.name) {
         let five_h: Vec<_> = u
             .windows()
             .into_iter()
@@ -733,10 +758,7 @@ fn fmt_window_dollars(d: &WindowDollars) -> String {
     }
 }
 
-fn collect_stats(profile: &Profile, reset_fmt: ResetFmt) -> Vec<Stat> {
-    let Some(usage) = profile.usage.as_ref() else {
-        return Vec::new();
-    };
+fn collect_stats(usage: &crate::usage::UsageInfo, reset_fmt: ResetFmt) -> Vec<Stat> {
     let now_secs = now_epoch_secs();
     let mut stats: Vec<Stat> = Vec::new();
     for (label, w) in usage.windows() {
@@ -908,21 +930,25 @@ fn bar_spans(
     spans
 }
 
-fn header_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Line<'static>> {
-    let plan = profile
-        .third_party_usage
-        .as_ref()
+fn header_lines(
+    profile: &Profile,
+    header: &HeaderState,
+    inner_w: u16,
+    readings: &ReadingsSnapshot,
+) -> Vec<Line<'static>> {
+    let plan = readings
+        .stats_of(&profile.name)
         .and_then(|s| s.plan.clone())
         // Forked exactly as the BODY below is, so the header cannot name a
         // different account kind than the bars under it. `is_oauth()` is the
         // wrong test here: it keys on `base_url` alone, so a hybrid (OAuth pair
         // plus a custom endpoint) reads "api" directly above the live Anthropic
-        // windows its own `usage` fed.
+        // windows its own picked reading fed.
         .or_else(|| {
             if profile.usage_cache_is_third_party() {
                 Some("api".to_string())
             } else {
-                account_tier(profile).and_then(|t| t.display())
+                account_tier(profile, readings.usage_of(&profile.name)).and_then(|t| t.display())
             }
         });
     // No tier known yet takes the house no-data dash: a bare "Claude" here read
@@ -937,7 +963,7 @@ fn header_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
     let mut plan_spans = vec![plan_key, plan_span];
     if profile.auto_start {
         plan_spans.extend(kick_spans(
-            &kick_text(profile, header),
+            &kick_text(profile, header, readings),
             left_w,
             inner_w as usize,
         ));
@@ -946,7 +972,7 @@ fn header_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
     if let Some(peak) = header.peak {
         lines.push(pricing_line(peak));
     }
-    lines.extend(status_lines(profile, header, inner_w));
+    lines.extend(status_lines(profile, header, inner_w, readings));
     lines
 }
 
@@ -986,11 +1012,10 @@ fn pricing_line(peak: crate::pricing::PeakState) -> Line<'static> {
 /// slot (toggle off, or the profile is excluded from the queue) it is the
 /// account's own reset alone — the lapsed-leg kick fires the moment that
 /// reset passes.
-fn kick_text(profile: &Profile, header: &HeaderState) -> String {
+fn kick_text(profile: &Profile, header: &HeaderState, readings: &ReadingsSnapshot) -> String {
     let now = now_epoch_secs();
-    let own_reset_in = profile
-        .usage
-        .as_ref()
+    let own_reset_in = readings
+        .usage_of(&profile.name)
         .and_then(|u| u.five_hour.as_ref())
         .and_then(|w| reset_in_secs_at(w, now))
         .filter(|secs| *secs > 0);
@@ -1049,7 +1074,12 @@ struct DiagRow {
 ///
 /// Render-only: reads the fallback engine's own predicates via `header.diag`,
 /// never a second opinion, so a hint can't claim a state the engine won't act on.
-fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Line<'static>> {
+fn status_lines(
+    profile: &Profile,
+    header: &HeaderState,
+    inner_w: u16,
+    readings: &ReadingsSnapshot,
+) -> Vec<Line<'static>> {
     if !matches!(header.activity, ProfileActivity::Idle) {
         let frame = spinner_frame(header.tick);
         let verb = activity_verb(header.activity);
@@ -1088,9 +1118,8 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
     //    `blocked_reason` ranks it first for the same reason. Sourced from the
     //    profile's cached plan (no config lock needed), so it's checked inline
     //    rather than via `DiagFlags`.
-    if profile
-        .usage
-        .as_ref()
+    if readings
+        .usage_of(&profile.name)
         .and_then(|u| u.plan.as_ref())
         .is_some_and(|p| p.is_canceled())
     {
@@ -1189,7 +1218,7 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
     //    connected into the same rail as the rows above once 2+ hints stack.
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut fetch_hint: Option<UsageDiag> = None;
-    match profile.fetch_status {
+    match readings.status_of(&profile.name) {
         _ if (profile.base_url.is_some() || profile.provider.is_some())
             && !crate::usage::third_party_credentialed(profile)
             && profile
@@ -1217,7 +1246,7 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
             ]);
             // The hint rides only when figures render — without them the body
             // already names the fix, and one pane must not say it twice.
-            if profile.third_party_usage.is_some() {
+            if readings.stats_of(&profile.name).is_some() {
                 fetch_hint = Some(UsageDiag::NoKey);
             }
         }
@@ -1337,9 +1366,8 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
                 // the maxed window's own bar line, so the pill stays bare. A
                 // genuinely quiet account with no maxed window falls through to
                 // "up to date".
-                let resumes = profile
-                    .usage
-                    .as_ref()
+                let resumes = readings
+                    .usage_of(&profile.name)
                     .and_then(|u| crate::usage::spent_resume_in_secs(u, now));
                 match resumes {
                     Some(_) => {
@@ -1374,7 +1402,7 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
     // panicked worker records Failed); a `◌ refresh in Ns` can still follow
     // it after a failed cache write or a lowered interval, and that line
     // reads honestly: old numbers, refresh coming.
-    if profile.usage_stale {
+    if readings.stale_of(&profile.name) {
         let mut merged = pill(
             "stale".to_string(),
             theme::warning().add_modifier(Modifier::BOLD),
@@ -1540,14 +1568,14 @@ fn ordinal(n: u32) -> String {
 /// scheduled (`collect_tokens` skips it), a disabled one is likewise skipped, and
 /// a terminal `Failed` already tried — mirror `build_tp_rows`, never spin on
 /// "loading" forever (issue #2).
-fn oauth_empty_msg(profile: &Profile) -> &'static str {
+fn oauth_empty_msg(profile: &Profile, status: Option<FetchStatus>) -> &'static str {
     let has_oauth = profile
         .credentials
         .as_ref()
         .is_some_and(|c| c.claude_ai_oauth.is_some());
     if !has_oauth {
         "not logged in, use + login on the setup tab"
-    } else if profile.is_disabled() || profile.fetch_status == Some(FetchStatus::Failed) {
+    } else if profile.is_disabled() || status == Some(FetchStatus::Failed) {
         // Disabled: never scheduled, so with no seeded cache no fetch will land.
         "no usage available"
     } else {
@@ -1577,6 +1605,7 @@ fn oauth_empty_lines(msg: &str, inner_w: u16) -> Vec<Line<'static>> {
 fn build_tp_rows(
     profile: &Profile,
     inner_w: u16,
+    readings: &ReadingsSnapshot,
     show_estimates: bool,
     show_pace: bool,
     reset_fmt: ResetFmt,
@@ -1584,7 +1613,7 @@ fn build_tp_rows(
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    let Some(stats) = profile.third_party_usage.as_ref() else {
+    let Some(stats) = readings.stats_of(&profile.name) else {
         // No data yet. "loading" only while a fetch is pending or in flight; a
         // terminal Failed status means we tried and the provider has nothing to
         // show, and a RateLimited one means the provider throttled us with
@@ -1593,7 +1622,7 @@ fn build_tp_rows(
         let msg = if profile.is_disabled() {
             "no usage available"
         } else {
-            match profile.fetch_status {
+            match readings.status_of(&profile.name) {
                 Some(FetchStatus::Failed) => "no usage available",
                 Some(FetchStatus::RateLimited) => "rate limited, retrying",
                 // The ways a provider's usage credential can be unusable read

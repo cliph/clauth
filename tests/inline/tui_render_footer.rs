@@ -38,11 +38,7 @@ fn the_usage_hints_advertise_the_note_key() {
         disabled: false,
         console: None,
         credentials: None,
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     };
     let with_account = App::new(crate::profile::AppConfig {
         state: crate::profile::AppState::default(),

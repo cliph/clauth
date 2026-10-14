@@ -2,6 +2,11 @@
 //! Fallback tab (issue #10 follow-up), driven by `crate::fallback::soonest_resume`.
 
 use super::*;
+
+fn snap_with_usage(mut s: ReadingsSnapshot, name: &str, u: UsageInfo) -> ReadingsSnapshot {
+    s.usage.insert(name.to_string(), u);
+    s
+}
 use crate::profile::{AppState, Profile, ProfileName};
 use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
 use ratatui::Terminal;
@@ -13,56 +18,94 @@ fn reset_in(secs: i64) -> String {
     epoch_secs_to_iso(now_epoch_secs() + secs)
 }
 
-fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
-    Profile {
-        name: name.into(),
-        base_url: None,
-        api_key: None,
-        auto_start: false,
-        env: BTreeMap::new(),
-        models: Default::default(),
-        fallback_threshold: Some(threshold),
-        weekly_threshold: None,
-        last_resort: false,
-        preferred: false,
-        preferred_days: Vec::new(),
-        rolling_token: false,
-        max_auto_spend: None,
-        check_weekly: true,
-        check_scoped: true,
-        bell_threshold: None,
-        disabled: false,
-        console: None,
-        credentials: None,
-        usage: Some(UsageInfo {
-            five_hour: Some(UsageWindow {
-                utilization: util,
-                resets_at: Some(reset_in(reset_secs)),
-            }),
-            ..UsageInfo::default()
+fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, ReadingsSnapshot) {
+    let usage = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: util,
+            resets_at: Some(reset_in(reset_secs)),
         }),
-        fetch_status: None,
-        provider: None,
-        third_party_usage: None,
-        usage_stale: false,
-    }
+        ..UsageInfo::default()
+    };
+    (
+        Profile {
+            name: name.into(),
+            base_url: None,
+            api_key: None,
+            auto_start: false,
+            env: BTreeMap::new(),
+            models: Default::default(),
+            fallback_threshold: Some(threshold),
+            weekly_threshold: None,
+            last_resort: false,
+            preferred: false,
+            preferred_days: Vec::new(),
+            rolling_token: false,
+            max_auto_spend: None,
+            check_weekly: true,
+            check_scoped: true,
+            bell_threshold: None,
+            disabled: false,
+            console: None,
+            credentials: None,
+            provider: None,
+        },
+        snap_with_usage(ReadingsSnapshot::default(), name, usage),
+    )
 }
 
-fn config_with(profiles: Vec<Profile>, active: Option<&str>, chain: Vec<&str>) -> AppConfig {
-    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
-    AppConfig {
+fn config_with(
+    profiles: Vec<(Profile, ReadingsSnapshot)>,
+    active: Option<&str>,
+    chain: Vec<&str>,
+) -> (AppConfig, ReadingsSnapshot) {
+    let names: Vec<ProfileName> = profiles.iter().map(|(p, _)| p.name.clone()).collect();
+    let mut readings = ReadingsSnapshot::default();
+    for (_p, r) in &profiles {
+        for (k, v) in &r.usage {
+            readings.usage.insert(k.clone(), v.clone());
+        }
+        for (k, v) in &r.fetch_status {
+            readings.fetch_status.insert(k.clone(), *v);
+        }
+        for (k, v) in &r.third_party {
+            readings.third_party.insert(k.clone(), v.clone());
+        }
+    }
+    let config = AppConfig {
         state: AppState {
             active_profile: active.map(Into::into),
             profiles: names,
             fallback_chain: chain.into_iter().map(Into::into).collect(),
             ..AppState::default()
         },
-        profiles,
-    }
+        profiles: profiles.into_iter().map(|(p, _)| p).collect(),
+    };
+    (config, readings)
 }
 
 fn line_text(line: &Line<'static>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+/// Seed the app's stores from a `ReadingsSnapshot`, so a full-pane render
+/// (which reads `app.readings_snapshot()`) shows the fixture's readings. The
+/// chain fixtures are OAuth-only, so the picked `usage`/`fetch_status` maps
+/// round-trip into the OAuth stores unchanged.
+fn seed_stores(app: &App, readings: &ReadingsSnapshot) {
+    app.usage_store
+        .lock()
+        .unwrap()
+        .extend(readings.usage.clone());
+    app.usage_status
+        .lock()
+        .unwrap()
+        .extend(readings.fetch_status.clone());
+}
+
+fn app_with_readings(cfg: AppConfig, readings: &ReadingsSnapshot) -> App {
+    let app = App::new(cfg);
+    seed_stores(&app, readings);
+    app
 }
 
 /// `QueueView` is the one resolver every chip goes through: membership from
@@ -73,7 +116,7 @@ fn line_text(line: &Line<'static>) -> String {
 fn auto_start_queue_view_resolves_slots_from_config_and_anchor() {
     use crate::profile::{ClaudeCredentials, OAuthToken};
     let opted = |name: &str| {
-        let mut p = profile(name, 95.0, 10.0, 3600);
+        let (mut p, p_readings) = profile(name, 95.0, 10.0, 3600);
         p.auto_start = true;
         p.credentials = Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
@@ -85,9 +128,9 @@ fn auto_start_queue_view_resolves_slots_from_config_and_anchor() {
                 ..crate::profile::OAuthToken::default_extra()
             }),
         });
-        p
+        (p, p_readings)
     };
-    let mut cfg = config_with(
+    let (mut cfg, _readings) = config_with(
         vec![opted("a"), opted("b"), profile("c", 95.0, 0.0, 3600)],
         Some("a"),
         vec!["a", "b"],
@@ -95,7 +138,7 @@ fn auto_start_queue_view_resolves_slots_from_config_and_anchor() {
     cfg.state.auto_start_queue = true;
 
     let none = std::collections::HashMap::new();
-    let view = super::super::panes::QueueView::new(&cfg, &none, None);
+    let view = super::super::panes::QueueView::new(&cfg, &none, None, |_| false);
     let slot = view.slot("a").expect("an opted-in member holds a slot");
     assert_eq!((slot.position, slot.total), (1, 2));
     assert_eq!(view.slot("b").map(|s| s.position), Some(2));
@@ -107,13 +150,13 @@ fn auto_start_queue_view_resolves_slots_from_config_and_anchor() {
 
     // A switch-grade-blocked member holds no slot, and the queue re-sizes.
     let lifts = std::collections::HashMap::from([("a".to_string(), 0i64)]);
-    let view = super::super::panes::QueueView::new(&cfg, &lifts, None);
+    let view = super::super::panes::QueueView::new(&cfg, &lifts, None, |_| false);
     assert_eq!(view.slot("a"), None, "blocked: no slot");
     assert_eq!(view.slot("b").map(|s| (s.position, s.total)), Some((1, 1)));
 
     // The toggle off is a real off switch on this surface too.
     cfg.state.auto_start_queue = false;
-    let view = super::super::panes::QueueView::new(&cfg, &none, None);
+    let view = super::super::panes::QueueView::new(&cfg, &none, None, |_| false);
     assert_eq!(view.slot("a"), None);
 }
 
@@ -125,9 +168,13 @@ fn auto_start_queue_view_resolves_slots_from_config_and_anchor() {
 // selected, naming the soonest-resuming one (b resets sooner than a).
 #[test]
 fn all_exhausted_shows_resumes_hint_under_any_selected_member() {
-    let a = profile("a", 95.0, 100.0, 3600);
-    let b = profile("b", 95.0, 100.0, 1800);
-    let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
+    let (a, a_readings) = profile("a", 95.0, 100.0, 3600);
+    let (b, b_readings) = profile("b", 95.0, 100.0, 1800);
+    let (cfg, readings) = config_with(
+        vec![(a, a_readings), (b, b_readings)],
+        Some("a"),
+        vec!["a", "b"],
+    );
 
     let on_a = member_detail(
         &cfg,
@@ -137,6 +184,7 @@ fn all_exhausted_shows_resumes_hint_under_any_selected_member() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     )
     .2;
     let hint_a = on_a.expect("resumes hint renders while viewing member a");
@@ -150,6 +198,7 @@ fn all_exhausted_shows_resumes_hint_under_any_selected_member() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     )
     .2;
     let hint_b = on_b.expect("resumes hint renders while viewing member b");
@@ -159,9 +208,13 @@ fn all_exhausted_shows_resumes_hint_under_any_selected_member() {
 // b still has headroom — chain isn't fully exhausted, caption stays hidden.
 #[test]
 fn partially_exhausted_chain_hides_resumes_hint() {
-    let a = profile("a", 95.0, 100.0, 3600);
-    let b = profile("b", 95.0, 20.0, 3600);
-    let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
+    let (a, a_readings) = profile("a", 95.0, 100.0, 3600);
+    let (b, b_readings) = profile("b", 95.0, 20.0, 3600);
+    let (cfg, readings) = config_with(
+        vec![(a, a_readings), (b, b_readings)],
+        Some("a"),
+        vec!["a", "b"],
+    );
 
     let footnote = member_detail(
         &cfg,
@@ -171,6 +224,7 @@ fn partially_exhausted_chain_hides_resumes_hint() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     )
     .2;
     assert!(
@@ -192,12 +246,13 @@ fn detail_of(row: &str) -> &str {
 /// Render the Fallback body (not the full app frame) at `(w, h)`.
 fn render_chain(app: &App, w: u16, h: u16) -> Vec<String> {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app, &app.readings_snapshot()))
+        .unwrap();
     crate::testutil::buffer_rows(term.backend().buffer())
 }
 
 /// A two-member fully-exhausted chain: both at 100%, `a` resets later than `b`.
-fn exhausted_cfg() -> AppConfig {
+fn exhausted_cfg() -> (AppConfig, ReadingsSnapshot) {
     config_with(
         vec![
             profile("a", 95.0, 100.0, 3600),
@@ -219,7 +274,8 @@ fn exhausted_cfg() -> AppConfig {
 fn the_pinned_resumes_footnote_renders_at_every_height_for_every_member() {
     let _home = crate::testutil::HomeSandbox::new();
     for (w, h) in [(100u16, 14u16), (100u16, 24u16)] {
-        let mut app = App::new(exhausted_cfg());
+        let (cfg, readings) = exhausted_cfg();
+        let mut app = app_with_readings(cfg, &readings);
         app.fallback_focus = FallbackFocus::Detail;
         for cursor in 0..2 {
             app.chain_cursor = cursor;
@@ -257,7 +313,8 @@ fn the_pinned_resumes_footnote_renders_at_every_height_for_every_member() {
 fn the_pinned_footnote_scrollbar_spans_only_the_scroll_area() {
     let _home = crate::testutil::HomeSandbox::new();
     let (w, h) = (100u16, 14u16);
-    let mut app = App::new(exhausted_cfg());
+    let (cfg, readings) = exhausted_cfg();
+    let mut app = app_with_readings(cfg, &readings);
     app.fallback_focus = FallbackFocus::Detail;
     app.chain_cursor = 0;
     let rows = render_chain(&app, w, h);
@@ -292,7 +349,7 @@ fn the_pinned_footnote_scrollbar_spans_only_the_scroll_area() {
 #[test]
 fn the_member_card_reserves_no_footnote_without_a_resume() {
     let _home = crate::testutil::HomeSandbox::new();
-    let cfg = config_with(
+    let (cfg, readings) = config_with(
         vec![
             profile("a", 95.0, 100.0, 3600),
             profile("b", 95.0, 20.0, 3600),
@@ -301,7 +358,7 @@ fn the_member_card_reserves_no_footnote_without_a_resume() {
         vec!["a", "b"],
     );
     for (w, h) in [(100u16, 14u16), (100u16, 24u16)] {
-        let mut app = App::new(cfg.clone());
+        let mut app = app_with_readings(cfg.clone(), &readings);
         app.fallback_focus = FallbackFocus::Detail;
         app.chain_cursor = 0;
         let rows = render_chain(&app, w, h);
@@ -374,7 +431,8 @@ fn the_short_pane_footnote_drops_the_margin_then_inlines_reachably() {
 
     // body 6 → detail interior 4 → Pinned { scroll: 3, margin: 0 }: the
     // footnote pins on the last interior row with NO blank row above it.
-    let mut app = App::new(exhausted_cfg());
+    let (cfg, readings) = exhausted_cfg();
+    let mut app = app_with_readings(cfg, &readings);
     app.fallback_focus = FallbackFocus::Detail;
     app.chain_cursor = 0;
     let rows = render_chain(&app, 100, 6);
@@ -393,7 +451,8 @@ fn the_short_pane_footnote_drops_the_margin_then_inlines_reachably() {
     );
 
     // body 5 → detail interior 3 → Inline: walking to the last row reaches it.
-    let mut app = App::new(exhausted_cfg());
+    let (cfg, readings) = exhausted_cfg();
+    let mut app = app_with_readings(cfg, &readings);
     app.fallback_focus = FallbackFocus::Detail;
     app.chain_cursor = 0;
     app.fallback_detail_cursor = FALLBACK_ROWS.len() - 1; // the last row
@@ -411,9 +470,13 @@ fn the_short_pane_footnote_drops_the_margin_then_inlines_reachably() {
 // indented continuation lines instead of clipping it off the pane edge.
 #[test]
 fn last_resort_hint_wraps_on_a_narrow_pane() {
-    let a = profile("a", 95.0, 20.0, 3600);
-    let b = profile("b", 95.0, 20.0, 3600);
-    let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
+    let (a, a_readings) = profile("a", 95.0, 20.0, 3600);
+    let (b, b_readings) = profile("b", 95.0, 20.0, 3600);
+    let (cfg, readings) = config_with(
+        vec![(a, a_readings), (b, b_readings)],
+        Some("a"),
+        vec!["a", "b"],
+    );
 
     // Focused on the `last resort` row at 28 cols.
     let lr = FALLBACK_ROWS
@@ -430,6 +493,7 @@ fn last_resort_hint_wraps_on_a_narrow_pane() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     )
     .0;
     let texts: Vec<String> = lines.iter().map(line_text).collect();
@@ -454,10 +518,14 @@ fn last_resort_hint_wraps_on_a_narrow_pane() {
 // The last-resort hint names the member the exclusive mark would move from.
 #[test]
 fn last_resort_hint_names_the_currently_marked_member() {
-    let a = profile("a", 95.0, 20.0, 3600);
-    let mut b = profile("b", 95.0, 20.0, 3600);
+    let (a, a_readings) = profile("a", 95.0, 20.0, 3600);
+    let (mut b, b_readings) = profile("b", 95.0, 20.0, 3600);
     b.last_resort = true;
-    let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
+    let (cfg, readings) = config_with(
+        vec![(a, a_readings), (b, b_readings)],
+        Some("a"),
+        vec!["a", "b"],
+    );
 
     let lines = member_detail(
         &cfg,
@@ -469,6 +537,7 @@ fn last_resort_hint_names_the_currently_marked_member() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     )
     .0;
     let hint = lines
@@ -484,10 +553,10 @@ fn last_resort_hint_names_the_currently_marked_member() {
 // would take the toggle for the answer.
 #[test]
 fn preferred_hint_names_the_day_list_when_one_is_set() {
-    let mut a = profile("a", 95.0, 20.0, 3600);
+    let (mut a, a_readings) = profile("a", 95.0, 20.0, 3600);
     a.preferred = false;
     a.preferred_days = vec![chrono::Weekday::Sat, chrono::Weekday::Sun];
-    let cfg = config_with(vec![a], Some("a"), vec!["a"]);
+    let (cfg, readings) = config_with(vec![(a, a_readings)], Some("a"), vec!["a"]);
     let row = FALLBACK_ROWS
         .iter()
         .position(|r| *r == FallbackRow::Preferred)
@@ -503,6 +572,7 @@ fn preferred_hint_names_the_day_list_when_one_is_set() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     )
     .0;
     assert_eq!(
@@ -518,11 +588,11 @@ fn preferred_hint_names_the_day_list_when_one_is_set() {
 // to the other side; the reason lives on the card's own `preferred days` row.
 #[test]
 fn preferred_hint_drops_a_day_list_the_account_cannot_serve() {
-    let mut a = profile("a", 95.0, 20.0, 3600);
+    let (mut a, a_readings) = profile("a", 95.0, 20.0, 3600);
     a.preferred = true;
     a.preferred_days = vec![chrono::Weekday::Sat];
     a.disabled = true;
-    let cfg = config_with(vec![a], Some("a"), vec!["a"]);
+    let (cfg, readings) = config_with(vec![(a, a_readings)], Some("a"), vec!["a"]);
     let row = FALLBACK_ROWS
         .iter()
         .position(|r| *r == FallbackRow::Preferred)
@@ -538,6 +608,7 @@ fn preferred_hint_drops_a_day_list_the_account_cannot_serve() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     )
     .0;
     let hint = lines
@@ -556,11 +627,15 @@ fn preferred_hint_drops_a_day_list_the_account_cannot_serve() {
 // would read as every day.
 #[test]
 fn preferred_hint_says_which_days_are_left_when_another_account_claims() {
-    let mut a = profile("a", 95.0, 20.0, 3600);
+    let (mut a, a_readings) = profile("a", 95.0, 20.0, 3600);
     a.preferred = true;
-    let mut b = profile("b", 95.0, 20.0, 3600);
+    let (mut b, b_readings) = profile("b", 95.0, 20.0, 3600);
     b.preferred_days = vec![chrono::Weekday::Sat, chrono::Weekday::Sun];
-    let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
+    let (cfg, readings) = config_with(
+        vec![(a, a_readings), (b, b_readings)],
+        Some("a"),
+        vec!["a", "b"],
+    );
     let row = FALLBACK_ROWS
         .iter()
         .position(|r| *r == FallbackRow::Preferred)
@@ -576,6 +651,7 @@ fn preferred_hint_says_which_days_are_left_when_another_account_claims() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     )
     .0;
     let hint = lines
@@ -591,10 +667,10 @@ fn preferred_hint_says_which_days_are_left_when_another_account_claims() {
 // read as standing down for the other five.
 #[test]
 fn preferred_hint_adds_the_unclaimed_days_when_the_flag_is_also_on() {
-    let mut a = profile("a", 95.0, 20.0, 3600);
+    let (mut a, a_readings) = profile("a", 95.0, 20.0, 3600);
     a.preferred = true;
     a.preferred_days = vec![chrono::Weekday::Sat, chrono::Weekday::Sun];
-    let cfg = config_with(vec![a], Some("a"), vec!["a"]);
+    let (cfg, readings) = config_with(vec![(a, a_readings)], Some("a"), vec!["a"]);
     let row = FALLBACK_ROWS
         .iter()
         .position(|r| *r == FallbackRow::Preferred)
@@ -610,6 +686,7 @@ fn preferred_hint_adds_the_unclaimed_days_when_the_flag_is_also_on() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     )
     .0;
     // "The rest" would be false the moment another member's list names one of
@@ -624,8 +701,8 @@ fn preferred_hint_adds_the_unclaimed_days_when_the_flag_is_also_on() {
 // CURRENT walk behavior for this account, flipping wording with the gate.
 #[test]
 fn usage_gate_rows_hint_the_current_state() {
-    let texts = |p: Profile, cursor: usize| -> Vec<String> {
-        let cfg = config_with(vec![p], Some("a"), vec!["a"]);
+    let texts = |(p, p_readings): (Profile, ReadingsSnapshot), cursor: usize| -> Vec<String> {
+        let (cfg, readings) = config_with(vec![(p, p_readings)], Some("a"), vec!["a"]);
         member_detail(
             &cfg,
             &crate::profile::ProfileName::from("a"),
@@ -636,6 +713,7 @@ fn usage_gate_rows_hint_the_current_state() {
                 ..Default::default()
             },
             &HashSet::new(),
+            &readings,
         )
         .0
         .iter()
@@ -651,18 +729,18 @@ fn usage_gate_rows_hint_the_current_state() {
             .any(|t| t.contains("out of rotation") && t.contains("weekly usage")),
         "{on:?}"
     );
-    let mut p = profile("a", 95.0, 20.0, 3600);
+    let (mut p, p_readings) = profile("a", 95.0, 20.0, 3600);
     p.check_weekly = false;
-    let off = texts(p, 2);
+    let off = texts((p, p_readings), 2);
     assert!(off.iter().any(|t| t.contains("isn't checked")), "{off:?}");
 
     // FALLBACK_ROWS[3] == CheckScoped.
     let on = texts(profile("a", 95.0, 20.0, 3600), 3);
     assert!(on.iter().any(|t| t.contains("scoped gate")), "{on:?}");
     assert!(on.iter().any(|t| t.contains("per-model week")), "{on:?}");
-    let mut p = profile("a", 95.0, 20.0, 3600);
+    let (mut p, p_readings) = profile("a", 95.0, 20.0, 3600);
     p.check_scoped = false;
-    let off = texts(p, 3);
+    let off = texts((p, p_readings), 3);
     assert!(
         off.iter()
             .any(|t| t.contains("stays in rotation for other models")),
@@ -674,10 +752,10 @@ fn usage_gate_rows_hint_the_current_state() {
 // label; the gate off drops it (chip and walk must not drift).
 #[test]
 fn scoped_spent_pill_names_the_window_and_respects_the_gate() {
-    let scoped = |check_scoped: bool| -> Profile {
-        let mut p = profile("a", 95.0, 20.0, 3600);
+    let scoped = |check_scoped: bool| -> (Profile, ReadingsSnapshot) {
+        let (mut p, mut p_readings) = profile("a", 95.0, 20.0, 3600);
         p.check_scoped = check_scoped;
-        if let Some(u) = p.usage.as_mut() {
+        if let Some(u) = p_readings.usage.get_mut("a") {
             u.seven_day = Some(UsageWindow {
                 utilization: 40.0,
                 resets_at: Some(reset_in(5 * 86_400)),
@@ -690,10 +768,10 @@ fn scoped_spent_pill_names_the_window_and_respects_the_gate() {
                 },
             }];
         }
-        p
+        (p, p_readings)
     };
 
-    let cfg = config_with(vec![scoped(true)], Some("a"), vec!["a"]);
+    let (cfg, readings) = config_with(vec![scoped(true)], Some("a"), vec!["a"]);
     let lines = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
@@ -702,6 +780,7 @@ fn scoped_spent_pill_names_the_window_and_respects_the_gate() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     )
     .0;
     let pill = lines
@@ -711,7 +790,7 @@ fn scoped_spent_pill_names_the_window_and_respects_the_gate() {
         .expect("scoped pill renders");
     assert!(pill.contains("other models ok"), "{pill}");
 
-    let cfg = config_with(vec![scoped(false)], Some("a"), vec!["a"]);
+    let (cfg, readings) = config_with(vec![scoped(false)], Some("a"), vec!["a"]);
     let lines = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
@@ -720,6 +799,7 @@ fn scoped_spent_pill_names_the_window_and_respects_the_gate() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     )
     .0;
     assert!(
@@ -736,15 +816,15 @@ fn scoped_spent_pill_names_the_window_and_respects_the_gate() {
 fn max_spend_hint_covers_every_spend_state() {
     use crate::usage::SpendInfo;
     let hint = |budget_on: bool, ceiling: Option<f64>, spend: Option<SpendInfo>| -> String {
-        let mut a = profile("a", 95.0, 40.0, 7200);
+        let (mut a, mut a_readings) = profile("a", 95.0, 40.0, 7200);
         a.max_auto_spend = ceiling;
-        a.usage.as_mut().unwrap().spend = spend;
-        let mut cfg = config_with(vec![a], Some("a"), vec!["a"]);
+        a_readings.usage.get_mut("a").unwrap().spend = spend;
+        let (mut cfg, readings) = config_with(vec![(a, a_readings)], Some("a"), vec!["a"]);
         cfg.state.spend_budget_switching = budget_on;
         max_spend_hint(
             &cfg,
-            &crate::profile::ProfileName::from("a"),
             cfg.profiles[0].max_auto_spend.unwrap_or(0.0),
+            readings.usage.get("a"),
         )
     };
     let billing = |enabled: bool, used: Option<f64>| SpendInfo {
@@ -793,8 +873,8 @@ fn value_col(key: &str, rendered: &str) -> usize {
 // width, so every interactive row opens its value at the same column.
 #[test]
 fn last_resort_value_aligns_with_other_rows() {
-    let a = profile("a", 95.0, 20.0, 3600);
-    let cfg = config_with(vec![a], Some("a"), vec!["a"]);
+    let (a, a_readings) = profile("a", 95.0, 20.0, 3600);
+    let (cfg, readings) = config_with(vec![(a, a_readings)], Some("a"), vec!["a"]);
     let texts: Vec<String> = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
@@ -805,6 +885,7 @@ fn last_resort_value_aligns_with_other_rows() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     )
     .0
     .iter()
@@ -852,7 +933,7 @@ fn last_resort_value_aligns_with_other_rows() {
 /// ceiling renders as money, with the cents, since it is money.
 #[test]
 fn max_spend_row_renders_off_at_zero_and_dollars_when_set() {
-    let cfg = config_with(vec![profile("a", 95.0, 20.0, 3600)], Some("a"), vec!["a"]);
+    let (cfg, readings) = config_with(vec![profile("a", 95.0, 20.0, 3600)], Some("a"), vec!["a"]);
     let row = |c: &crate::profile::AppConfig| -> String {
         member_detail(
             c,
@@ -864,6 +945,7 @@ fn max_spend_row_renders_off_at_zero_and_dollars_when_set() {
                 ..Default::default()
             },
             &HashSet::new(),
+            &readings,
         )
         .0
         .iter()
@@ -878,7 +960,8 @@ fn max_spend_row_renders_off_at_zero_and_dollars_when_set() {
     );
     assert!(!row(&cfg).contains('$'), "no dollar figure when off");
 
-    let mut armed = config_with(vec![profile("a", 95.0, 20.0, 3600)], Some("a"), vec!["a"]);
+    let (mut armed, _readings) =
+        config_with(vec![profile("a", 95.0, 20.0, 3600)], Some("a"), vec!["a"]);
     armed.profiles[0].max_auto_spend = Some(25.0);
     assert!(
         row(&armed).contains("$25.00"),
@@ -916,14 +999,15 @@ fn disabled_and_canceled_share_the_marker_shape_and_split_on_hue() {
 fn disabled_chain_member_dims_its_name_and_takes_the_blocked_reason_marker() {
     let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let mut a = profile("xqzacct", 95.0, 10.0, 3600);
+    let (mut a, a_readings) = profile("xqzacct", 95.0, 10.0, 3600);
     a.disabled = true;
-    let cfg = config_with(vec![a], None, vec!["xqzacct"]);
+    let (cfg, _readings) = config_with(vec![(a, a_readings)], None, vec!["xqzacct"]);
     let app = App::new(cfg);
 
     let (w, h) = (100u16, 14u16);
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+        .unwrap();
     let buf = term.backend().buffer();
     let rows = crate::testutil::buffer_rows(buf);
 
@@ -992,20 +1076,27 @@ fn blocked_reason_ranks_disabled_above_canceled_and_auth_broken() {
     use crate::usage::PlanInfo;
 
     // Canceled subscription AND a broken login AND a maxed 5h window at once.
-    let mut a = profile("acct", 50.0, 100.0, 3600);
+    let (mut a, mut a_readings) = profile("acct", 50.0, 100.0, 3600);
     a.disabled = true;
-    a.usage.as_mut().unwrap().plan = Some(PlanInfo {
+    a_readings.usage.get_mut("acct").unwrap().plan = Some(PlanInfo {
         subscription_status: Some("canceled".to_string()),
         ..PlanInfo::default()
     });
-    let mut cfg = config_with(vec![a], Some("other"), vec!["acct"]);
+    let (mut cfg, readings) = config_with(vec![(a, a_readings)], Some("other"), vec!["acct"]);
     cfg.state.auth_broken.push("acct".into());
 
     let p = cfg
         .find(&crate::profile::ProfileName::from("acct"))
         .unwrap();
     assert_eq!(
-        blocked_reason(&cfg, p, None, &HashSet::new()),
+        blocked_reason(
+            &cfg,
+            p,
+            None,
+            &HashSet::new(),
+            readings.usage.get(p.name.as_str()),
+            readings.status_of(p.name.as_str())
+        ),
         Some(BlockedReason::Disabled),
         "disabled ranks first, above canceled and auth broken"
     );
@@ -1021,6 +1112,20 @@ fn blocked_reason_ranks_disabled_above_canceled_and_auth_broken() {
                 .unwrap(),
             None,
             &HashSet::new(),
+            readings.usage.get(
+                enabled
+                    .find(&crate::profile::ProfileName::from("acct"))
+                    .unwrap()
+                    .name
+                    .as_str()
+            ),
+            readings.status_of(
+                enabled
+                    .find(&crate::profile::ProfileName::from("acct"))
+                    .unwrap()
+                    .name
+                    .as_str()
+            )
         ),
         Some(BlockedReason::Canceled),
         "without the disabled bit the canceled rung wins"
@@ -1036,9 +1141,9 @@ fn blocked_reason_ranks_disabled_above_canceled_and_auth_broken() {
 fn blocked_reason_never_reports_disabled_for_the_active_profile() {
     use crate::fallback::{BlockedReason, blocked_reason};
 
-    let mut a = profile("acct", 95.0, 10.0, 3600);
+    let (mut a, a_readings) = profile("acct", 95.0, 10.0, 3600);
     a.disabled = true;
-    let cfg = config_with(vec![a], Some("acct"), vec!["acct"]);
+    let (cfg, readings) = config_with(vec![(a, a_readings)], Some("acct"), vec!["acct"]);
     assert_eq!(
         blocked_reason(
             &cfg,
@@ -1046,6 +1151,18 @@ fn blocked_reason_never_reports_disabled_for_the_active_profile() {
                 .unwrap(),
             None,
             &HashSet::new(),
+            readings.usage.get(
+                cfg.find(&crate::profile::ProfileName::from("acct"))
+                    .unwrap()
+                    .name
+                    .as_str()
+            ),
+            readings.status_of(
+                cfg.find(&crate::profile::ProfileName::from("acct"))
+                    .unwrap()
+                    .name
+                    .as_str()
+            )
         ),
         None,
         "a disabled ACTIVE member has headroom and reports no block"
@@ -1062,6 +1179,20 @@ fn blocked_reason_never_reports_disabled_for_the_active_profile() {
                 .unwrap(),
             None,
             &HashSet::new(),
+            readings.usage.get(
+                inactive
+                    .find(&crate::profile::ProfileName::from("acct"))
+                    .unwrap()
+                    .name
+                    .as_str()
+            ),
+            readings.status_of(
+                inactive
+                    .find(&crate::profile::ProfileName::from("acct"))
+                    .unwrap()
+                    .name
+                    .as_str()
+            )
         ),
         Some(BlockedReason::Disabled),
         "a disabled NON-active member reports the block"
@@ -1074,7 +1205,7 @@ fn blocked_reason_never_reports_disabled_for_the_active_profile() {
 // the card, naming the block with its utilization % and reset countdown.
 #[test]
 fn blocked_member_shows_the_worst_reason_pill() {
-    let cfg = config_with(vec![profile("a", 95.0, 97.0, 7200)], Some("a"), vec!["a"]);
+    let (cfg, readings) = config_with(vec![profile("a", 95.0, 97.0, 7200)], Some("a"), vec!["a"]);
     let lines = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
@@ -1083,6 +1214,7 @@ fn blocked_member_shows_the_worst_reason_pill() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     )
     .0;
     let pill = line_text(&lines[0]);
@@ -1105,7 +1237,7 @@ fn blocked_member_shows_the_worst_reason_pill() {
 // let clauth start it — shows the `claude code blocked` pill driven by `kick_lift`.
 #[test]
 fn kick_rejected_member_shows_the_claude_code_blocked_pill() {
-    let cfg = config_with(vec![profile("a", 95.0, 40.0, 7200)], Some("a"), vec!["a"]);
+    let (cfg, readings) = config_with(vec![profile("a", 95.0, 40.0, 7200)], Some("a"), vec!["a"]);
     let until = now_epoch_secs() + 7200;
     let lines = member_detail(
         &cfg,
@@ -1116,6 +1248,7 @@ fn kick_rejected_member_shows_the_claude_code_blocked_pill() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     )
     .0;
     let pill = line_text(&lines[0]);
@@ -1153,7 +1286,7 @@ fn canceled_member_shows_the_short_shared_label() {
 // restates it).
 #[test]
 fn headroom_member_shows_no_reason_pill() {
-    let cfg = config_with(vec![profile("a", 95.0, 40.0, 7200)], Some("a"), vec!["a"]);
+    let (cfg, readings) = config_with(vec![profile("a", 95.0, 40.0, 7200)], Some("a"), vec!["a"]);
     let lines = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
@@ -1162,6 +1295,7 @@ fn headroom_member_shows_no_reason_pill() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     )
     .0;
     let first = line_text(&lines[0]);
@@ -1191,7 +1325,7 @@ fn headroom_member_shows_no_reason_pill() {
 /// `member_detail_rows_start_clears_the_session_block_at_every_height`.
 #[test]
 fn member_detail_rows_start_indexes_the_first_fallback_row_at_every_header_height() {
-    let at_width = |cfg: &AppConfig, width: usize| -> (usize, usize) {
+    let at_width = |cfg: &AppConfig, readings: &ReadingsSnapshot, width: usize| -> (usize, usize) {
         let (lines, spans, _) = member_detail(
             cfg,
             &crate::profile::ProfileName::from("a"),
@@ -1200,6 +1334,7 @@ fn member_detail_rows_start_indexes_the_first_fallback_row_at_every_header_heigh
                 ..Default::default()
             },
             &HashSet::new(),
+            readings,
         );
         let first_row_at = lines
             .iter()
@@ -1207,26 +1342,28 @@ fn member_detail_rows_start_indexes_the_first_fallback_row_at_every_header_heigh
             .expect("the first FALLBACK_ROWS row renders");
         (spans[0].start, first_row_at)
     };
-    let start_and_first_row = |cfg: &AppConfig| at_width(cfg, 60);
+    let start_and_first_row =
+        |cfg: &AppConfig, readings: &ReadingsSnapshot| at_width(cfg, readings, 60);
 
     // 0 pills: gauge + headroom + blank only.
-    let healthy = config_with(vec![profile("a", 95.0, 10.0, 7200)], Some("a"), vec!["a"]);
-    let (start, row) = start_and_first_row(&healthy);
+    let (healthy, readings) =
+        config_with(vec![profile("a", 95.0, 10.0, 7200)], Some("a"), vec!["a"]);
+    let (start, row) = start_and_first_row(&healthy, &readings);
     assert_eq!(start, row, "no pill: rows_start indexes the first row");
     assert_eq!(start, 3, "gauge + headroom + blank");
 
     // 1 pill: adds the pill row, its `└` fix line, and the separating blank.
-    let one = config_with(vec![profile("a", 95.0, 100.0, 7200)], Some("a"), vec!["a"]);
-    let (start, row) = start_and_first_row(&one);
+    let (one, readings) = config_with(vec![profile("a", 95.0, 100.0, 7200)], Some("a"), vec!["a"]);
+    let (start, row) = start_and_first_row(&one, &readings);
     assert_eq!(start, row, "1 pill: rows_start indexes the first row");
     assert_eq!(start, 6, "pill + hint + blank on top of the 3 base rows");
 
     // 2 pills: disabled AND auth-broken stack, each with its own fix line.
-    let mut d = profile("a", 95.0, 10.0, 7200);
+    let (mut d, d_readings) = profile("a", 95.0, 10.0, 7200);
     d.disabled = true;
-    let mut two = config_with(vec![d], Some("other"), vec!["a"]);
+    let (mut two, readings) = config_with(vec![(d, d_readings)], Some("other"), vec!["a"]);
     two.state.auth_broken.push("a".into());
-    let (start, row) = start_and_first_row(&two);
+    let (start, row) = start_and_first_row(&two, &readings);
     assert_eq!(start, row, "2 pills: rows_start indexes the first row");
     assert_eq!(
         start, 8,
@@ -1237,7 +1374,7 @@ fn member_detail_rows_start_indexes_the_first_fallback_row_at_every_header_heigh
     // line now wraps. This is what makes `rows_start` load-bearing rather than a
     // function of the pill count — and it is what stops the caret test's
     // "wrapped" cases from being duplicates of its wide ones.
-    let (narrow_start, narrow_row) = at_width(&two, 30);
+    let (narrow_start, narrow_row) = at_width(&two, &readings, 30);
     assert_eq!(
         narrow_start, narrow_row,
         "wrapped: rows_start still indexes the first row"
@@ -1265,8 +1402,8 @@ fn member_detail_rows_start_indexes_the_first_fallback_row_at_every_header_heigh
 #[test]
 fn typed_threshold_caret_lands_on_the_rotate_at_row_at_every_header_height() {
     let _home = crate::testutil::HomeSandbox::new();
-    let check = |cfg: AppConfig, label: &str, w: u16, h: u16| {
-        let mut app = App::new(cfg);
+    let check = |(cfg, readings): (AppConfig, ReadingsSnapshot), label: &str, w: u16, h: u16| {
+        let mut app = app_with_readings(cfg, &readings);
         app.fallback_focus = FallbackFocus::Detail;
         app.fallback_detail_cursor = FALLBACK_ROWS
             .iter()
@@ -1277,7 +1414,8 @@ fn typed_threshold_caret_lands_on_the_rotate_at_row_at_every_header_height() {
             state: CardEdit::Threshold(InputState::new("80")),
         });
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+        term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+            .unwrap();
         let caret = term
             .get_cursor_position()
             .expect("a typed field places the native caret");
@@ -1298,11 +1436,11 @@ fn typed_threshold_caret_lands_on_the_rotate_at_row_at_every_header_height() {
     let one_pill = || config_with(vec![profile("a", 95.0, 100.0, 7200)], Some("a"), vec!["a"]);
     // 2 pills: disabled AND auth-broken, each with its own fix line.
     let two_pills = || {
-        let mut d = profile("a", 95.0, 10.0, 7200);
+        let (mut d, d_readings) = profile("a", 95.0, 10.0, 7200);
         d.disabled = true;
-        let mut two = config_with(vec![d], Some("other"), vec!["a"]);
+        let (mut two, readings) = config_with(vec![(d, d_readings)], Some("other"), vec!["a"]);
         two.state.auth_broken.push("a".into());
-        two
+        (two, readings)
     };
 
     check(healthy(), "0 pills", 120, 30);
@@ -1326,9 +1464,9 @@ fn typed_threshold_caret_lands_on_the_rotate_at_row_at_every_header_height() {
 #[test]
 fn typed_threshold_row_scrolls_into_view_and_carries_the_caret() {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut d = profile("a", 95.0, 10.0, 7200);
+    let (mut d, d_readings) = profile("a", 95.0, 10.0, 7200);
     d.disabled = true;
-    let mut cfg = config_with(vec![d], Some("other"), vec!["a"]);
+    let (mut cfg, _readings) = config_with(vec![(d, d_readings)], Some("other"), vec!["a"]);
     cfg.state.auth_broken.push("a".into());
 
     let mut app = App::new(cfg);
@@ -1347,7 +1485,8 @@ fn typed_threshold_row_scrolls_into_view_and_carries_the_caret() {
     // exactly that clip).
     let (w, h) = (26u16, 17u16);
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+        .unwrap();
 
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let rendered_at = rows
@@ -1378,9 +1517,10 @@ fn typed_threshold_row_scrolls_into_view_and_carries_the_caret() {
 fn typed_max_spend_caret_lands_on_its_row_under_a_wrapped_day_list() {
     let _home = crate::testutil::HomeSandbox::new();
     use chrono::Weekday::*;
-    let mut a = profile("a", 95.0, 10.0, 7200);
+    let (mut a, a_readings) = profile("a", 95.0, 10.0, 7200);
     a.preferred_days = vec![Mon, Tue, Wed, Thu, Fri, Sat];
-    let mut app = App::new(config_with(vec![a], Some("a"), vec!["a"]));
+    let (config, _readings) = config_with(vec![(a, a_readings)], Some("a"), vec!["a"]);
+    let mut app = App::new(config);
     app.fallback_focus = FallbackFocus::Detail;
     app.fallback_detail_cursor = FALLBACK_ROWS
         .iter()
@@ -1392,7 +1532,8 @@ fn typed_max_spend_caret_lands_on_its_row_under_a_wrapped_day_list() {
     });
 
     let mut term = Terminal::new(TestBackend::new(60, 40)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+        .unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let day_row = rows
         .iter()
@@ -1424,8 +1565,8 @@ fn typed_max_spend_caret_lands_on_its_row_under_a_wrapped_day_list() {
 fn remove_row_stays_reachable_on_a_40x24_pane() {
     let _home = crate::testutil::HomeSandbox::new();
     // One blocked member: the pill block + fix line eat header rows.
-    let cfg = config_with(vec![profile("a", 95.0, 100.0, 7200)], Some("a"), vec!["a"]);
-    let mut app = App::new(cfg);
+    let (cfg, readings) = config_with(vec![profile("a", 95.0, 100.0, 7200)], Some("a"), vec!["a"]);
+    let mut app = app_with_readings(cfg, &readings);
     app.fallback_focus = FallbackFocus::Detail;
     app.fallback_detail_cursor = FALLBACK_ROWS
         .iter()
@@ -1433,7 +1574,8 @@ fn remove_row_stays_reachable_on_a_40x24_pane() {
         .unwrap();
 
     let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+        .unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     assert!(
         rows.iter().any(|r| r.contains("remove")),
@@ -1448,9 +1590,9 @@ fn remove_row_stays_reachable_on_a_40x24_pane() {
 /// showed only the exclusion and the dead login was invisible tab-wide.
 #[test]
 fn member_detail_stacks_the_health_pill_under_disabled() {
-    let mut d = profile("a", 95.0, 10.0, 7200);
+    let (mut d, d_readings) = profile("a", 95.0, 10.0, 7200);
     d.disabled = true;
-    let mut cfg = config_with(vec![d], Some("other"), vec!["a"]);
+    let (mut cfg, readings) = config_with(vec![(d, d_readings)], Some("other"), vec!["a"]);
     cfg.state.auth_broken.push("a".into());
 
     // Both pills on one `├│└` rail, each with its own fix line. The first row
@@ -1464,6 +1606,7 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     );
     let block: Vec<String> = lines.iter().take(4).map(line_text).collect();
     assert_eq!(
@@ -1478,9 +1621,9 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
     );
 
     // An ENABLED but auth-broken member is unchanged: one pill, lone `└`.
-    let mut e = profile("a", 95.0, 10.0, 7200);
+    let (mut e, e_readings) = profile("a", 95.0, 10.0, 7200);
     e.disabled = false;
-    let mut enabled = config_with(vec![e], Some("other"), vec!["a"]);
+    let (mut enabled, readings) = config_with(vec![(e, e_readings)], Some("other"), vec!["a"]);
     enabled.state.auth_broken.push("a".into());
     let (lines, _, _) = member_detail(
         &enabled,
@@ -1490,6 +1633,7 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     );
     assert_eq!(
         lines.iter().take(2).map(line_text).collect::<Vec<_>>(),
@@ -1515,12 +1659,13 @@ fn selector_rail_shows_hash_n_at_constant_width() {
     let names: Vec<String> = (b'a'..=b'j').map(|c| format!("m{}", c as char)).collect();
     let profiles: Vec<_> = names.iter().map(|n| profile(n, 95.0, 10.0, 7200)).collect();
     let chain: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-    let cfg = config_with(profiles, None, chain);
+    let (cfg, _readings) = config_with(profiles, None, chain);
     let app = App::new(cfg);
 
     let (w, h) = (100u16, 20u16);
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+        .unwrap();
     // Both panes share every physical row and the detail card repeats the
     // selected member's name in its TITLE (on a border row, which carries no
     // `││` seam to split on) — so identify selector rows by the rail's own `#`
@@ -1647,7 +1792,8 @@ fn span_style(line: &Line<'static>, needle: &str) -> Option<ratatui::style::Styl
 #[test]
 fn max_spend_dims_when_spend_budget_is_off() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let mut cfg = config_with(vec![profile("a", 95.0, 40.0, 3600)], Some("a"), vec!["a"]);
+    let (mut cfg, readings) =
+        config_with(vec![profile("a", 95.0, 40.0, 3600)], Some("a"), vec!["a"]);
     cfg.profiles[0].max_auto_spend = Some(25.0);
 
     let off = member_detail(
@@ -1660,6 +1806,7 @@ fn max_spend_dims_when_spend_budget_is_off() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     )
     .0;
     let off_val = off
@@ -1683,6 +1830,7 @@ fn max_spend_dims_when_spend_budget_is_off() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     )
     .0;
     let on_val = on
@@ -1701,8 +1849,8 @@ fn max_spend_dims_when_spend_budget_is_off() {
 // dimmed (inert) while the member's weekly gate is off.
 #[test]
 fn weekly_at_row_distinguishes_default_override_and_gated_off() {
-    let row_texts = |p: Profile| -> Vec<String> {
-        let cfg = config_with(vec![p], Some("a"), vec!["a"]);
+    let row_texts = |(p, p_readings): (Profile, ReadingsSnapshot)| -> Vec<String> {
+        let (cfg, readings) = config_with(vec![(p, p_readings)], Some("a"), vec!["a"]);
         member_detail(
             &cfg,
             &crate::profile::ProfileName::from("a"),
@@ -1713,6 +1861,7 @@ fn weekly_at_row_distinguishes_default_override_and_gated_off() {
                 ..Default::default()
             },
             &HashSet::new(),
+            &readings,
         )
         .0
         .iter()
@@ -1738,9 +1887,9 @@ fn weekly_at_row_distinguishes_default_override_and_gated_off() {
         "{unset:?}"
     );
 
-    let mut p = profile("a", 95.0, 20.0, 3600);
+    let (mut p, p_readings) = profile("a", 95.0, 20.0, 3600);
     p.weekly_threshold = Some(90.0);
-    let set = row_texts(p);
+    let set = row_texts((p, p_readings));
     let row = set
         .iter()
         .find(|t| t.contains("weekly at"))
@@ -1754,9 +1903,9 @@ fn weekly_at_row_distinguishes_default_override_and_gated_off() {
         "{set:?}"
     );
 
-    let mut p = profile("a", 95.0, 20.0, 3600);
+    let (mut p, p_readings) = profile("a", 95.0, 20.0, 3600);
     p.check_weekly = false;
-    let gated = row_texts(p);
+    let gated = row_texts((p, p_readings));
     assert!(
         gated
             .iter()
@@ -1770,8 +1919,8 @@ fn weekly_at_row_distinguishes_default_override_and_gated_off() {
 // unconditionally (it used to always render once a value was set).
 #[test]
 fn weekly_at_default_reminder_only_shows_when_value_differs_from_default() {
-    let row_texts = |p: Profile| -> Vec<String> {
-        let cfg = config_with(vec![p], Some("a"), vec!["a"]);
+    let row_texts = |(p, p_readings): (Profile, ReadingsSnapshot)| -> Vec<String> {
+        let (cfg, readings) = config_with(vec![(p, p_readings)], Some("a"), vec!["a"]);
         member_detail(
             &cfg,
             &crate::profile::ProfileName::from("a"),
@@ -1782,6 +1931,7 @@ fn weekly_at_default_reminder_only_shows_when_value_differs_from_default() {
                 ..Default::default()
             },
             &HashSet::new(),
+            &readings,
         )
         .0
         .iter()
@@ -1791,9 +1941,9 @@ fn weekly_at_default_reminder_only_shows_when_value_differs_from_default() {
 
     // Chain-wide default is 98% (`DEFAULT_WEEKLY_SWITCH_PCT`); an override set
     // to exactly that value must not carry the reminder.
-    let mut at_default = profile("a", 95.0, 20.0, 3600);
+    let (mut at_default, at_default_readings) = profile("a", 95.0, 20.0, 3600);
     at_default.weekly_threshold = Some(98.0);
-    let lines = row_texts(at_default);
+    let lines = row_texts((at_default, at_default_readings));
     let row = lines
         .iter()
         .find(|t| t.contains("weekly at"))
@@ -1804,9 +1954,9 @@ fn weekly_at_default_reminder_only_shows_when_value_differs_from_default() {
         "no reminder when the override equals the chain default: {row}"
     );
 
-    let mut off_default = profile("a", 95.0, 20.0, 3600);
+    let (mut off_default, off_default_readings) = profile("a", 95.0, 20.0, 3600);
     off_default.weekly_threshold = Some(90.0);
-    let lines = row_texts(off_default);
+    let lines = row_texts((off_default, off_default_readings));
     let row = lines
         .iter()
         .find(|t| t.contains("weekly at"))
@@ -1887,14 +2037,15 @@ fn live_row(
 #[test]
 fn a_chain_row_carries_no_live_session_tally() {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut app = App::new(config_with(
+    let (config, _readings) = config_with(
         vec![
             profile("busy", 95.0, 10.0, 3600),
             profile("idle", 95.0, 10.0, 3600),
         ],
         None,
         vec!["busy", "idle"],
-    ));
+    );
+    let mut app = App::new(config);
     app.live_sessions = crate::live_sessions::LiveTally::of([
         live_row("4242-0", "busy", true, None),
         live_row("4242-1", "busy", false, None),
@@ -1927,7 +2078,8 @@ fn a_chain_row_carries_no_live_session_tally() {
 /// a glyph that got appended past the pane and clipped.
 fn chain_selector_pane(app: &App, w: u16, h: u16) -> Vec<String> {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app, &app.readings_snapshot()))
+        .unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let pane_w = rows
         .iter()
@@ -2098,7 +2250,7 @@ fn the_session_block_is_absent_when_nothing_is_live() {
 /// row they point at.
 #[test]
 fn the_member_card_places_the_session_block_above_the_five_hour_gauge() {
-    let cfg = config_with(vec![profile("a", 95.0, 10.0, 3600)], None, vec!["a"]);
+    let (cfg, readings) = config_with(vec![profile("a", 95.0, 10.0, 3600)], None, vec!["a"]);
     let sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "a", true, None)])
         .member(&crate::profile::ProfileName::from("a"));
 
@@ -2111,6 +2263,7 @@ fn the_member_card_places_the_session_block_above_the_five_hour_gauge() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     );
     let texts = card_texts(&lines);
 
@@ -2132,7 +2285,7 @@ fn the_member_card_places_the_session_block_above_the_five_hour_gauge() {
 fn the_five_hour_figure_drops_to_its_own_line_when_the_gauge_leaves_no_room() {
     // The expected rows spell the full tier's toggle glyphs (`─●` / `○─`).
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let cfg = config_with(vec![profile("a", 95.0, 49.0, 3600)], None, vec!["a"]);
+    let (cfg, readings) = config_with(vec![profile("a", 95.0, 49.0, 3600)], None, vec!["a"]);
     let (lines, _, _) = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
@@ -2141,6 +2294,7 @@ fn the_five_hour_figure_drops_to_its_own_line_when_the_gauge_leaves_no_room() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     );
     let texts = card_texts(&lines);
     assert_eq!(
@@ -2171,7 +2325,7 @@ fn the_five_hour_figure_drops_to_its_own_line_when_the_gauge_leaves_no_room() {
 #[test]
 fn the_member_card_toggle_rows_read_on_off_on_the_compatible_tier() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
-    let cfg = config_with(vec![profile("a", 95.0, 49.0, 3600)], None, vec!["a"]);
+    let (cfg, readings) = config_with(vec![profile("a", 95.0, 49.0, 3600)], None, vec!["a"]);
     let (lines, _, _) = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
@@ -2180,6 +2334,7 @@ fn the_member_card_toggle_rows_read_on_off_on_the_compatible_tier() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     );
     assert_eq!(
         &card_texts(&lines)[6..10],
@@ -2199,11 +2354,9 @@ fn the_member_card_toggle_rows_read_on_off_on_the_compatible_tier() {
 #[test]
 fn the_fallback_tab_reads_the_apps_live_session_tally() {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut app = App::new(config_with(
-        vec![profile("busy", 95.0, 10.0, 3600)],
-        None,
-        vec!["busy"],
-    ));
+    let (config, _readings) =
+        config_with(vec![profile("busy", 95.0, 10.0, 3600)], None, vec!["busy"]);
+    let mut app = App::new(config);
     app.live_sessions =
         crate::live_sessions::LiveTally::of([live_row("4242-0", "busy", true, None)]);
 
@@ -2223,7 +2376,8 @@ fn the_fallback_tab_reads_the_apps_live_session_tally() {
     );
 
     let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
-    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app, &app.readings_snapshot()))
+        .unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     // The padded key cell, not the bare word: `live` is short enough that a
     // frame-wide search for it would match any prose on the screen.
@@ -2244,17 +2398,18 @@ fn the_fallback_tab_reads_the_apps_live_session_tally() {
 /// — the fixture both marker pins run on. `blockedname` is 11 chars so it
 /// overruns the narrow pane's name budget while `hot` still fits it.
 fn marker_app() -> App {
-    let mut off = profile("blockedname", 95.0, 10.0, 7200);
+    let (mut off, off_readings) = profile("blockedname", 95.0, 10.0, 7200);
     off.disabled = true;
-    App::new(config_with(
+    let (cfg, readings) = config_with(
         vec![
             profile("ok", 95.0, 10.0, 7200),
-            off,
+            (off, off_readings),
             profile("hot", 50.0, 99.0, 7200),
         ],
         Some("ok"),
         vec!["ok", "blockedname", "hot"],
-    ))
+    );
+    app_with_readings(cfg, &readings)
 }
 
 /// The blocked-reason marker owns the row's LAST content column, and nothing
@@ -2328,7 +2483,7 @@ fn a_narrow_pane_clamps_a_marked_members_name_rather_than_dropping_its_marker() 
 /// fixture across a `relative_age` boundary mid-test.
 #[test]
 fn member_detail_rows_start_clears_the_session_block_at_every_height() {
-    let cfg = config_with(vec![profile("a", 95.0, 10.0, 7200)], None, vec!["a"]);
+    let (cfg, readings) = config_with(vec![profile("a", 95.0, 10.0, 7200)], None, vec!["a"]);
     let start_and_first_row =
         |sessions: crate::live_sessions::MemberSessions, width: usize| -> (usize, usize, usize) {
             let (lines, spans, _) = member_detail(
@@ -2340,6 +2495,7 @@ fn member_detail_rows_start_clears_the_session_block_at_every_height() {
                     ..Default::default()
                 },
                 &HashSet::new(),
+                &readings,
             );
             let first_row_at = lines
                 .iter()
@@ -2403,6 +2559,7 @@ fn preferred_days_line(cfg: &AppConfig) -> Line<'static> {
             ..Default::default()
         },
         &HashSet::new(),
+        &ReadingsSnapshot::default(),
     )
     .0;
     lines
@@ -2432,9 +2589,9 @@ fn preferred_days_row_lights_the_held_rung_never_included() {
         (vec![Sun, Sat], "", &["weekends"]),
     ];
     for (set, tail, held) in cases {
-        let mut a = profile("a", 95.0, 20.0, 3600);
+        let (mut a, a_readings) = profile("a", 95.0, 20.0, 3600);
         a.preferred_days = set;
-        let cfg = config_with(vec![a], Some("a"), vec!["a"]);
+        let (cfg, _readings) = config_with(vec![(a, a_readings)], Some("a"), vec!["a"]);
         let line = preferred_days_line(&cfg);
         assert_eq!(line_text(&line), format!("{RUN}{tail}"), "{held:?}");
         let styled: Vec<(&str, Option<ratatui::style::Color>)> = line
@@ -2500,6 +2657,7 @@ fn preferred_days_row_hint_names_the_blocker_then_the_list_state() {
                 ..Default::default()
             },
             &HashSet::new(),
+            &ReadingsSnapshot::default(),
         )
         .0;
         hint_after(&lines, "preferred days")
@@ -2507,20 +2665,25 @@ fn preferred_days_row_hint_names_the_blocker_then_the_list_state() {
     const SAYS: &str =
         "work returns to this account on the days set here · ↵ picks days one by one";
 
-    let empty = config_with(vec![profile("a", 95.0, 20.0, 3600)], Some("a"), vec!["a"]);
+    let (empty, _readings) =
+        config_with(vec![profile("a", 95.0, 20.0, 3600)], Some("a"), vec!["a"]);
     assert_eq!(hint_under(&empty, None).as_deref(), Some(SAYS), "no list");
 
-    let mut set = profile("a", 95.0, 20.0, 3600);
+    let (mut set, set_readings) = profile("a", 95.0, 20.0, 3600);
     set.preferred_days = vec![Sat, Sun];
-    let set = config_with(vec![set], Some("a"), vec!["a"]);
+    let (set, _readings) = config_with(vec![(set, set_readings)], Some("a"), vec!["a"]);
     assert_eq!(hint_under(&set, None).as_deref(), Some(SAYS), "a list");
 
     // Another member's list naming other days leaves this one's claim whole.
-    let mut beside = profile("a", 95.0, 20.0, 3600);
+    let (mut beside, beside_readings) = profile("a", 95.0, 20.0, 3600);
     beside.preferred_days = vec![Sat, Sun];
-    let mut b = profile("b", 95.0, 20.0, 3600);
+    let (mut b, b_readings) = profile("b", 95.0, 20.0, 3600);
     b.preferred_days = vec![Fri];
-    let beside = config_with(vec![beside, b], Some("a"), vec!["a", "b"]);
+    let (beside, _readings) = config_with(
+        vec![(beside, beside_readings), (b, b_readings)],
+        Some("a"),
+        vec!["a", "b"],
+    );
     assert_eq!(
         hint_under(&beside, None).as_deref(),
         Some(SAYS),
@@ -2528,12 +2691,16 @@ fn preferred_days_row_hint_names_the_blocker_then_the_list_state() {
     );
 
     // A list on an account the walk skips claims nothing, so it shares no day.
-    let mut beside_dead = profile("a", 95.0, 20.0, 3600);
+    let (mut beside_dead, beside_dead_readings) = profile("a", 95.0, 20.0, 3600);
     beside_dead.preferred_days = vec![Sat, Sun];
-    let mut b = profile("b", 95.0, 20.0, 3600);
+    let (mut b, b_readings) = profile("b", 95.0, 20.0, 3600);
     b.disabled = true;
     b.preferred_days = vec![Fri, Sat];
-    let beside_dead = config_with(vec![beside_dead, b], Some("a"), vec!["a", "b"]);
+    let (beside_dead, _readings) = config_with(
+        vec![(beside_dead, beside_dead_readings), (b, b_readings)],
+        Some("a"),
+        vec!["a", "b"],
+    );
     assert_eq!(
         hint_under(&beside_dead, None).as_deref(),
         Some(SAYS),
@@ -2542,11 +2709,15 @@ fn preferred_days_row_hint_names_the_blocker_then_the_list_state() {
 
     // A day both lists name returns work to whichever claimant reads clear
     // first, so the plain statement would promise this account those days.
-    let mut shared = profile("a", 95.0, 20.0, 3600);
+    let (mut shared, shared_readings) = profile("a", 95.0, 20.0, 3600);
     shared.preferred_days = vec![Sat, Sun];
-    let mut b = profile("b", 95.0, 20.0, 3600);
+    let (mut b, b_readings) = profile("b", 95.0, 20.0, 3600);
     b.preferred_days = vec![Fri, Sat];
-    let shared = config_with(vec![shared, b], Some("a"), vec!["a", "b"]);
+    let (shared, _readings) = config_with(
+        vec![(shared, shared_readings), (b, b_readings)],
+        Some("a"),
+        vec!["a", "b"],
+    );
     assert_eq!(
         hint_under(&shared, None).as_deref(),
         Some(
@@ -2556,17 +2727,21 @@ fn preferred_days_row_hint_names_the_blocker_then_the_list_state() {
         "a day another list shares"
     );
 
-    let mut dead = profile("a", 95.0, 20.0, 3600);
+    let (mut dead, dead_readings) = profile("a", 95.0, 20.0, 3600);
     dead.disabled = true;
     dead.preferred_days = vec![Sat];
-    let dead = config_with(vec![dead], Some("other"), vec!["a"]);
+    let (dead, _readings) = config_with(vec![(dead, dead_readings)], Some("other"), vec!["a"]);
     const DEAD: &str =
         "a day list here would claim nothing: the account is disabled · ↵ picks days one by one";
     assert_eq!(hint_under(&dead, None).as_deref(), Some(DEAD));
 
-    let mut dead_empty = profile("a", 95.0, 20.0, 3600);
+    let (mut dead_empty, dead_empty_readings) = profile("a", 95.0, 20.0, 3600);
     dead_empty.disabled = true;
-    let dead_empty = config_with(vec![dead_empty], Some("other"), vec!["a"]);
+    let (dead_empty, _readings) = config_with(
+        vec![(dead_empty, dead_empty_readings)],
+        Some("other"),
+        vec!["a"],
+    );
     assert_eq!(
         hint_under(&dead_empty, None).as_deref(),
         Some(DEAD),
@@ -2647,15 +2822,15 @@ fn the_day_picker_row_marks_picks_and_carries_its_caret_in_a_slot() {
 fn the_add_picker_names_a_carried_day_list_before_the_add() {
     let _home = crate::testutil::HomeSandbox::new();
     use chrono::Weekday::*;
-    let mut b = profile("b", 95.0, 20.0, 3600);
+    let (mut b, b_readings) = profile("b", 95.0, 20.0, 3600);
     b.preferred_days = vec![Tue, Thu];
-    let mut c = profile("c", 95.0, 20.0, 3600);
+    let (mut c, c_readings) = profile("c", 95.0, 20.0, 3600);
     c.preferred_days = vec![Sun, Sat];
-    let cfg = config_with(
+    let (cfg, _readings) = config_with(
         vec![
             profile("a", 95.0, 20.0, 3600),
-            b,
-            c,
+            (b, b_readings),
+            (c, c_readings),
             profile("d", 95.0, 20.0, 3600),
         ],
         Some("a"),
@@ -2708,10 +2883,10 @@ fn the_add_picker_names_a_carried_day_list_before_the_add() {
 #[test]
 fn the_add_picker_names_the_blocker_before_a_carried_list() {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut b = profile("b", 95.0, 20.0, 3600);
+    let (mut b, b_readings) = profile("b", 95.0, 20.0, 3600);
     b.preferred_days = vec![chrono::Weekday::Sat, chrono::Weekday::Sun];
-    let mut cfg = config_with(
-        vec![profile("a", 95.0, 20.0, 3600), b],
+    let (mut cfg, _readings) = config_with(
+        vec![profile("a", 95.0, 20.0, 3600), (b, b_readings)],
         Some("a"),
         vec!["a"],
     );
@@ -2765,24 +2940,30 @@ fn chain_prose_styles_the_relogin_command_and_the_day_picker_keys() {
                 ..Default::default()
             },
             &HashSet::new(),
+            &ReadingsSnapshot::default(),
         )
         .0;
         lines_buffer(lines, 100)
     };
-    let plain = config_with(vec![profile("a", 95.0, 20.0, 3600)], Some("a"), vec!["a"]);
+    let (plain, _readings) =
+        config_with(vec![profile("a", 95.0, 20.0, 3600)], Some("a"), vec!["a"]);
     let card = |day_picker: Option<usize>| card_of(&plain, day_picker);
     assert_prose_part(&card(None), "· ↵ picks days one by one", "↵", true);
 
-    let mut dead = profile("a", 95.0, 20.0, 3600);
+    let (mut dead, dead_readings) = profile("a", 95.0, 20.0, 3600);
     dead.disabled = true;
-    let dead = config_with(vec![dead], Some("other"), vec!["a"]);
+    let (dead, _readings) = config_with(vec![(dead, dead_readings)], Some("other"), vec!["a"]);
     assert_prose_part(&card_of(&dead, None), "disabled · ↵ picks days", "↵", true);
 
-    let mut shared = profile("a", 95.0, 20.0, 3600);
+    let (mut shared, shared_readings) = profile("a", 95.0, 20.0, 3600);
     shared.preferred_days = vec![chrono::Weekday::Sat];
-    let mut b = profile("b", 95.0, 20.0, 3600);
+    let (mut b, b_readings) = profile("b", 95.0, 20.0, 3600);
     b.preferred_days = vec![chrono::Weekday::Sat];
-    let shared = config_with(vec![shared, b], Some("a"), vec!["a", "b"]);
+    let (shared, _readings) = config_with(
+        vec![(shared, shared_readings), (b, b_readings)],
+        Some("a"),
+        vec!["a", "b"],
+    );
     assert_prose_part(&card_of(&shared, None), "first · ↵ picks days", "↵", true);
     let picking = card(Some(0));
     for (phrase, part) in [
@@ -2802,7 +2983,7 @@ fn the_remove_value_drops_to_its_own_line_when_narrow() {
     // The expected rows spell the full tier's toggle glyphs (`─●` / `○─`).
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let a = profile("a", 95.0, 20.0, 3600);
-    let cfg = config_with(vec![a], None, vec!["a"]);
+    let (cfg, readings) = config_with(vec![a], None, vec!["a"]);
     let lines = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
@@ -2811,6 +2992,7 @@ fn the_remove_value_drops_to_its_own_line_when_narrow() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     )
     .0;
     let texts: Vec<String> = lines.iter().map(line_text).collect();
@@ -2842,8 +3024,8 @@ fn the_remove_value_drops_to_its_own_line_when_narrow() {
 fn the_add_blurb_wraps_on_a_narrow_pane() {
     let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 20.0, 3600);
-    let cfg = config_with(vec![a], None, vec!["a"]);
-    let app = App::new(cfg);
+    let (cfg, readings) = config_with(vec![a], None, vec!["a"]);
+    let app = app_with_readings(cfg, &readings);
     let detail = add_detail(&app, true, 24, &HashSet::new());
     let texts: Vec<String> = detail.lines.iter().map(line_text).collect();
     assert_eq!(
@@ -2870,7 +3052,7 @@ fn the_rotate_reminder_drops_to_its_own_line_when_narrow() {
     // The expected rows spell the full tier's toggle glyphs (`─●` / `○─`).
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let a = profile("a", 80.0, 20.0, 3600);
-    let cfg = config_with(vec![a], None, vec!["a"]);
+    let (cfg, readings) = config_with(vec![a], None, vec!["a"]);
     let lines = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
@@ -2879,6 +3061,7 @@ fn the_rotate_reminder_drops_to_its_own_line_when_narrow() {
             ..Default::default()
         },
         &HashSet::new(),
+        &readings,
     )
     .0;
     let texts: Vec<String> = lines.iter().map(line_text).collect();
@@ -2912,8 +3095,8 @@ fn the_rotate_reminder_drops_to_its_own_line_when_narrow() {
 fn an_unmarked_selector_name_clamps_to_the_pane_edge() {
     let _home = crate::testutil::HomeSandbox::new();
     let a = profile("first.last@company.example", 95.0, 20.0, 3600);
-    let cfg = config_with(vec![a], None, vec!["first.last@company.example"]);
-    let app = App::new(cfg);
+    let (cfg, readings) = config_with(vec![a], None, vec!["first.last@company.example"]);
+    let app = app_with_readings(cfg, &readings);
     assert_eq!(
         chain_selector_pane(&app, 60, 8),
         vec![

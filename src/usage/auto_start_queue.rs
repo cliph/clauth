@@ -418,11 +418,14 @@ fn span_open(series: &[(i64, i64, Option<i64>)]) -> Option<i64> {
 /// The exclusions are the ones that mean "cannot open a window", because a
 /// member that can never kick would still take a slot and thin everyone else's
 /// share of the 5h span: user-disabled, `auth_broken`, no stored OAuth pair,
-/// a canceled subscription ([`crate::fallback::is_canceled`] — its windows are
+/// a canceled subscription (its windows are
 /// gone, a kick cannot open one), and a switch-grade kick block. `blocked` is that last set, which only a
 /// caller holding the kick blocks can supply
 /// ([`crate::usage::switch_grade_kick_lifts`]); pass an empty slice where none
-/// is available.
+/// is available. `canceled` is the caller's own-context reading: the daemon's
+/// OAuth store snapshot for the election and `status.json`, the per-frame
+/// snapshot for the TUI chips, and the disk plan for the daemonless
+/// `status --json`.
 ///
 /// Empty when the queue toggle is off, which is what makes the toggle a real
 /// off switch on every surface at once: no queue, so nothing to elect, publish,
@@ -430,6 +433,7 @@ fn span_open(series: &[(i64, i64, Option<i64>)]) -> Option<i64> {
 pub(crate) fn auto_start_queue_members(
     config: &AppConfig,
     blocked: &[ProfileName],
+    canceled: impl Fn(&ProfileName) -> bool,
 ) -> Vec<ProfileName> {
     if !config.state.auto_start_queue {
         return Vec::new();
@@ -453,7 +457,7 @@ pub(crate) fn auto_start_queue_members(
                 && !p.is_disabled()
                 && p.access_token().is_some()
                 && !config.is_auth_broken(&p.name)
-                && !crate::fallback::is_canceled(p)
+                && !canceled(&p.name)
                 && !blocked.contains(&p.name)
         })
         .map(|p| &p.name)

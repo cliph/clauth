@@ -134,33 +134,32 @@ fn helpers_budget_lam_alef_per_grapheme() {
 // `fetch_cue_color`: amber = serving last-known numbers, red = failed, none =
 // live. The overview countdown carries this cue; brackets stay plain dim.
 
-fn cue_profile(status: Option<FetchStatus>) -> Profile {
-    Profile {
-        name: "p".into(),
-        base_url: None,
-        api_key: None,
-        auto_start: false,
-        env: std::collections::BTreeMap::new(),
-        models: Default::default(),
-        fallback_threshold: None,
-        weekly_threshold: None,
-        last_resort: false,
-        preferred: false,
-        preferred_days: Vec::new(),
-        rolling_token: false,
-        max_auto_spend: None,
-        check_weekly: true,
-        check_scoped: true,
-        bell_threshold: None,
-        disabled: false,
-        console: None,
-        credentials: None,
-        usage: None,
-        fetch_status: status,
-        provider: None,
-        third_party_usage: None,
-        usage_stale: false,
-    }
+fn cue_profile(status: Option<FetchStatus>) -> (Profile, Option<FetchStatus>) {
+    (
+        Profile {
+            name: "p".into(),
+            base_url: None,
+            api_key: None,
+            auto_start: false,
+            env: std::collections::BTreeMap::new(),
+            models: Default::default(),
+            fallback_threshold: None,
+            weekly_threshold: None,
+            last_resort: false,
+            preferred: false,
+            preferred_days: Vec::new(),
+            rolling_token: false,
+            max_auto_spend: None,
+            check_weekly: true,
+            check_scoped: true,
+            bell_threshold: None,
+            disabled: false,
+            console: None,
+            credentials: None,
+            provider: None,
+        },
+        status,
+    )
 }
 
 fn cue_window(util: f64) -> UsageWindow {
@@ -173,41 +172,34 @@ fn cue_window(util: f64) -> UsageWindow {
 #[test]
 fn cue_amber_on_cached_and_rate_limited() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    assert_eq!(
-        fetch_cue_color(&cue_profile(Some(FetchStatus::Cached))),
-        Some(theme::warning_color())
-    );
-    assert_eq!(
-        fetch_cue_color(&cue_profile(Some(FetchStatus::RateLimited))),
-        Some(theme::warning_color())
-    );
+    let (p, s) = cue_profile(Some(FetchStatus::Cached));
+    assert_eq!(fetch_cue_color(&p, s), Some(theme::warning_color()));
+    let (p, s) = cue_profile(Some(FetchStatus::RateLimited));
+    assert_eq!(fetch_cue_color(&p, s), Some(theme::warning_color()));
 }
 
 #[test]
 fn cue_red_on_failed() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    assert_eq!(
-        fetch_cue_color(&cue_profile(Some(FetchStatus::Failed))),
-        Some(theme::danger_color())
-    );
+    let (p, s) = cue_profile(Some(FetchStatus::Failed));
+    assert_eq!(fetch_cue_color(&p, s), Some(theme::danger_color()));
 }
 
 #[test]
 fn cue_absent_when_live_or_never_fetched() {
-    assert_eq!(
-        fetch_cue_color(&cue_profile(Some(FetchStatus::Fresh))),
-        None
-    );
-    assert_eq!(fetch_cue_color(&cue_profile(None)), None);
+    let (p, s) = cue_profile(Some(FetchStatus::Fresh));
+    assert_eq!(fetch_cue_color(&p, s), None);
+    let (p, s) = cue_profile(None);
+    assert_eq!(fetch_cue_color(&p, s), None);
 }
 
 /// API-key/provider rows have no oauth fetch leg — a stray status must not
 /// paint their brackets.
 #[test]
 fn cue_absent_for_api_key_profiles() {
-    let mut p = cue_profile(Some(FetchStatus::Failed));
+    let (mut p, s) = cue_profile(Some(FetchStatus::Failed));
     p.base_url = Some("https://api.example.com".into());
-    assert_eq!(fetch_cue_color(&p), None);
+    assert_eq!(fetch_cue_color(&p, s), None);
 }
 
 #[test]
@@ -247,7 +239,7 @@ fn account_type_label_dashes_an_unfetched_plan() {
     assert_eq!(NO_DATA, "—", "the house no-data glyph");
 
     let unfetched = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    assert_eq!(account_type_label(&unfetched), NO_DATA);
+    assert_eq!(account_type_label(&unfetched, None), NO_DATA);
 
     let mut unclassified = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
     unclassified.credentials = Some(crate::profile::ClaudeCredentials {
@@ -260,36 +252,34 @@ fn account_type_label_dashes_an_unfetched_plan() {
             ..crate::profile::OAuthToken::default_extra()
         }),
     });
-    assert_eq!(account_type_label(&unclassified), NO_DATA);
+    assert_eq!(account_type_label(&unclassified, None), NO_DATA);
 }
 
 /// The other direction: a fetched tier still loses only its `Claude ` prefix,
 /// `Free` is untouched, and an api-key profile still reads `API`.
 #[test]
 fn account_type_label_keeps_every_known_tier() {
-    let plan = |tier| {
-        Some(crate::usage::UsageInfo {
-            plan: Some(crate::usage::PlanInfo {
-                tier,
-                subscription_status: None,
-                codex_plan: None,
-                email: None,
-            }),
-            ..Default::default()
-        })
+    let plan = |tier| crate::usage::UsageInfo {
+        plan: Some(crate::usage::PlanInfo {
+            tier,
+            subscription_status: None,
+            codex_plan: None,
+            email: None,
+        }),
+        ..Default::default()
     };
 
-    let mut max = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    max.usage = plan(crate::usage::PlanTier::Max(Some(20)));
-    assert_eq!(account_type_label(&max), "Max 20x");
+    let max = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let max_usage = plan(crate::usage::PlanTier::Max(Some(20)));
+    assert_eq!(account_type_label(&max, Some(&max_usage)), "Max 20x");
 
-    let mut free = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
-    free.usage = plan(crate::usage::PlanTier::Free);
-    assert_eq!(account_type_label(&free), "Free");
+    let free = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
+    let free_usage = plan(crate::usage::PlanTier::Free);
+    assert_eq!(account_type_label(&free, Some(&free_usage)), "Free");
 
     let mut api = crate::testutil::blank_profile(&crate::profile::ProfileName::from("c"));
     api.base_url = Some("https://api.deepseek.com/anthropic".into());
-    assert_eq!(account_type_label(&api), "API");
+    assert_eq!(account_type_label(&api, None), "API");
 }
 
 // ── Reset display (issue #39) ───────────────────────────────────────────────

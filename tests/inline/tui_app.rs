@@ -20,6 +20,7 @@ fn bootstrap_busy(flag: &Arc<AtomicBool>, activity: &ActivityStore) -> bool {
 
 use super::InputState;
 use crate::fallback::parse_threshold;
+use crate::testutil::write_live_creds;
 
 #[test]
 fn delete_word_removes_run_left_of_caret() {
@@ -2687,6 +2688,176 @@ fn the_durable_auth_verdict_seeds_the_key_rejected_set_on_reload() {
     );
 }
 
+/// A reload seeds the third-party store from disk for the display-superset
+/// names it lacks (here a DISABLED account), while a name the store already
+/// holds keeps its live reading and the `RateLimited` status a fetch that
+/// wrote no cache left: the disk seed would rewind both to the cache's.
+#[test]
+fn a_reload_seeds_only_the_third_party_names_the_store_lacks() {
+    use crate::profile::{AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::testutil::{bar, set_mtime, stats_with_bars};
+    use crate::usage::FetchStatus;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let deepseek = |name: &str| {
+        let mut p = crate::testutil::blank_profile(&ProfileName::from(name));
+        p.provider = Some(Provider::DeepSeek);
+        p.api_key = Some("k".to_string());
+        p.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+        p
+    };
+    let live = deepseek("live");
+    let mut off = deepseek("off");
+    off.disabled = true;
+    // A work-list name the store lacks, added by another process with a cache on
+    // disk: the reload seed must write its reading alone, never a status or a
+    // `last_fetched` stamp (6836c1a6's reload wrote neither).
+    let work = deepseek("work");
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![live.name.clone(), off.name.clone(), work.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    crate::profile::save_profile(&live).expect("persist live");
+    crate::profile::save_profile(&off).expect("persist off");
+    crate::profile::save_profile(&work).expect("persist work");
+    for name in ["live", "off", "work"] {
+        crate::profile_cache::write_profile_cache(
+            &ProfileName::from(name),
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            &stats_with_bars(vec![bar("5h", 47.0)]),
+        );
+    }
+
+    let mut app = app_with(vec![live, off]);
+    app.third_party_usage_store
+        .lock()
+        .unwrap()
+        .insert("live".to_string(), stats_with_bars(vec![bar("5h", 10.0)]));
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("live".to_string(), FetchStatus::RateLimited);
+
+    let config_toml = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("off")
+        .join("config.toml");
+    set_mtime(&config_toml, UNIX_EPOCH + Duration::from_secs(1_000_000));
+    assert!(app.reload_if_state_changed(), "the reload branch ran");
+
+    let five = |name: &str| {
+        app.third_party_usage_store
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|s| s.bars.iter().map(|b| b.pct).collect::<Vec<_>>())
+    };
+    assert_eq!(
+        five("off"),
+        Some(vec![47.0]),
+        "the disabled account's cached bars are seeded on reload"
+    );
+    assert_eq!(
+        five("work"),
+        Some(vec![47.0]),
+        "a new work-list name's cached bars are seeded on reload"
+    );
+    assert_eq!(
+        five("live"),
+        Some(vec![10.0]),
+        "a held reading is never rewound to the disk cache"
+    );
+    assert_eq!(
+        app.third_party_status.lock().unwrap().get("live").copied(),
+        Some(FetchStatus::RateLimited),
+        "a held status is never rewound to the disk cache's"
+    );
+    let off_stamped = app
+        .last_fetched
+        .lock()
+        .unwrap()
+        .contains_key(&crate::usage::FetchLeg::ThirdParty.key(ProfileName::from("off")));
+    let off_status = app.third_party_status.lock().unwrap().get("off").copied();
+    assert_eq!(
+        (off_status, off_stamped),
+        (None, false),
+        "nothing polls the disabled account: its reading is seeded, no status or stamp"
+    );
+    let work_stamped = app
+        .last_fetched
+        .lock()
+        .unwrap()
+        .contains_key(&crate::usage::FetchLeg::ThirdParty.key(ProfileName::from("work")));
+    let work_status = app.third_party_status.lock().unwrap().get("work").copied();
+    assert_eq!(
+        (work_status, work_stamped),
+        (None, false),
+        "the reload writes a new name's reading only: no status, no stamp, so its first fetch is due on the next tick"
+    );
+}
+
+/// The frame reads the status the scheduler's freshness gate reads
+/// (`decision_fresh_any`) for an account the OAuth leg has not answered: an
+/// external edit dropped `g`'s api key, so a reload reclassifies it as OAuth,
+/// and the third-party status its last fetch left is the one both fall back to.
+#[test]
+fn a_reclassified_accounts_frame_status_falls_back_to_its_third_party_one() {
+    use crate::profile::{AppState, ProfileName};
+    use crate::testutil::set_mtime;
+    use crate::usage::FetchStatus;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let mut g = crate::testutil::blank_profile(&ProfileName::from("g"));
+    g.base_url = Some("https://example.com".to_string());
+    g.api_key = Some("k".to_string());
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![g.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    let mut app = app_with(vec![g.clone()]);
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("g".to_string(), FetchStatus::Fresh);
+
+    g.api_key = None;
+    assert!(
+        !g.usage_cache_is_third_party(),
+        "fixture: a keyless generic endpoint reads its OAuth cache"
+    );
+    crate::profile::save_profile(&g).expect("persist the keyless edit");
+    let config_toml = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("g")
+        .join("config.toml");
+    set_mtime(&config_toml, UNIX_EPOCH + Duration::from_secs(1_000_000));
+    assert!(app.reload_if_state_changed(), "the reload branch ran");
+
+    assert_eq!(
+        app.readings_snapshot().status_of("g"),
+        Some(FetchStatus::Fresh),
+        "the frame falls back to the third-party status"
+    );
+    assert!(
+        crate::usage::decision_fresh_any(
+            &app.usage_status,
+            &app.third_party_status,
+            false,
+            &ProfileName::from("g"),
+        ),
+        "the scheduler's gate reads the same fallback"
+    );
+}
+
 // ── F3: endpoint/key edits clear stale status chrome ─────────────────────────
 
 /// F3: a successful endpoint/API-key edit clears the edited profile's
@@ -2729,10 +2900,7 @@ fn commit_endpoint_clears_the_edited_profiles_stale_status_chrome() {
     // key-rejected verdict before the edit.
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("zai"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("zai"),
         Some(FetchStatus::AuthExpired),
         "precondition: the stale verdict is what the frame reads"
     );
@@ -2772,10 +2940,7 @@ fn commit_endpoint_clears_the_edited_profiles_stale_status_chrome() {
 
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("zai"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("zai"),
         None,
         "the next frame shows no stale chrome after a repaired key"
     );
@@ -2909,10 +3074,7 @@ fn a_capture_overwrite_clears_the_stale_status_chrome() {
         .insert("zai".to_string(), 9);
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("zai"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("zai"),
         Some(FetchStatus::AuthExpired),
         "precondition: the stale verdict is what the frame reads"
     );
@@ -2958,10 +3120,7 @@ fn a_capture_overwrite_clears_the_stale_status_chrome() {
     }
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("zai"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("zai"),
         None,
         "the next frame shows no stale chrome after an overwrite"
     );
@@ -3110,10 +3269,7 @@ fn a_blanked_key_clears_the_stale_status_chrome() {
         .insert("zai".to_string(), 9);
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("zai"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("zai"),
         Some(FetchStatus::AuthExpired),
         "precondition: the stale verdict is what the frame reads"
     );
@@ -3150,26 +3306,18 @@ fn a_blanked_key_clears_the_stale_status_chrome() {
     }
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("zai"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("zai"),
         None,
         "the next frame shows no stale chrome after a blanked key"
     );
 }
 
-/// R6: the endpoint re-key retires the stale `[ key rejected ]` verdict in
-/// the config handle's profile copy SAME-FRAME. The shared clear drops the
-/// three name-keyed stores, but the frame reads `Profile.fetch_status` from
-/// the config handle, and only the next 80 ms tick's `apply_usage` copies
-/// the cleared stores back — so the frame(s) drawn immediately after the
-/// commit flashed the retired pill. The clear now retires the handle copy
-/// too (the same assignment `apply_usage` derives from the cleared stores),
-/// so the frame right after the commit reads none: no `apply_usage` between
-/// the edit and the assertion.
+/// R6: the endpoint re-key retires the stale `[ key rejected ]` verdict
+/// SAME-FRAME. The shared clear drops the name-keyed status stores, and the
+/// frame's snapshot reads those stores directly, so the frame right after the
+/// commit reads none: no `apply_usage` between the edit and the assertion.
 #[test]
-fn a_rekey_retires_the_handle_fetch_status_before_the_next_tick() {
+fn a_rekey_retires_the_frames_fetch_status_before_the_next_tick() {
     use super::{ConfigRow, InputState, commit_config_field, enter_config_detail};
     use crate::profile::{AppConfig, AppState, ProfileName};
     use crate::providers::Provider;
@@ -3192,19 +3340,15 @@ fn a_rekey_retires_the_handle_fetch_status_before_the_next_tick() {
         profiles: vec![api],
     });
 
-    // The rejected-key verdict lives in the third-party status store and the
-    // tick copies it into the handle — the populated state the frame renders
-    // the `[ key rejected ]` pill from.
+    // The rejected-key verdict lives in the third-party status store, the
+    // populated state the frame renders the `[ key rejected ]` pill from.
     app.third_party_status
         .lock()
         .unwrap()
         .insert("api".to_string(), FetchStatus::AuthExpired);
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("api"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("api"),
         Some(FetchStatus::AuthExpired),
         "precondition: the stale verdict is what the frame reads"
     );
@@ -3225,26 +3369,20 @@ fn a_rekey_retires_the_handle_fetch_status_before_the_next_tick() {
         );
     }
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("api"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("api"),
         None,
         "the frame right after the re-key reads no stale [ key rejected ] pill"
     );
 }
 
-/// R8: a poison-skipped status-store clear cannot strand the stale pill on
-/// the handle. The store clears are poison-tolerant — a store lock poisoned
-/// at the clear instant keeps its entry — but that entry is dead weight:
-/// `apply_usage` reads these stores with `.lock().ok()` and skips a poisoned
-/// one, so nothing re-copies it. The unconditional handle write retires the
-/// pill the instant the credential is repaired, and the next tick's merge
-/// cannot resurrect it from the surviving entry (the healthy OAuth store's
-/// cleared entry misses the `contains_key` arm and the poisoned third-party
-/// fallback reads as `None`).
+/// R8: a poisoned status-store clear still retires the stale pill the frame
+/// reads. The clear reads through a poisoned lock — a skip would leave the
+/// stale verdict behind, and the per-frame snapshot reads these stores back on
+/// the next frame, so a clear that silently no-ops would strand the pill it
+/// was meant to retire. The read-through clear removes the surviving entry,
+/// and the next tick's merge cannot resurrect it.
 #[test]
-fn a_poison_skipped_clear_still_retires_the_handle_verdict() {
+fn a_poisoned_status_clear_still_retires_the_frames_verdict() {
     use super::{ConfigRow, InputState, commit_config_field, enter_config_detail};
     use crate::profile::{AppConfig, AppState, ProfileName};
     use crate::providers::Provider;
@@ -3270,7 +3408,7 @@ fn a_poison_skipped_clear_still_retires_the_handle_verdict() {
     // The rejected-key verdict lives in both status stores; the third-party
     // one (rank 280) is the clear we poison, the OAuth-side one (350) the
     // clear that still succeeds — the skipped clear must not be able to
-    // strand the stale pill on the handle.
+    // strand the stale pill.
     app.third_party_status
         .lock()
         .unwrap()
@@ -3281,10 +3419,7 @@ fn a_poison_skipped_clear_still_retires_the_handle_verdict() {
         .insert("api".to_string(), FetchStatus::AuthExpired);
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("api"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("api"),
         Some(FetchStatus::AuthExpired),
         "precondition: the stale verdict is what the frame reads"
     );
@@ -3323,36 +3458,28 @@ fn a_poison_skipped_clear_still_retires_the_handle_verdict() {
             "the old provider's streak cannot outlive the re-key"
         );
     }
-    // The poison-skipped store still holds its entry (`lock` recovers it
-    // through `into_inner`, the repo's documented idiom) — the dead weight
-    // the next tick's merge cannot reach.
+    // The read-through clear removed the poisoned store's entry: the stale
+    // verdict cannot survive the re-key.
     {
         let m = app
             .third_party_status
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
-            m.contains_key("api"),
-            "precondition: the poisoned store's entry survives the skipped clear"
+            !m.contains_key("api"),
+            "the poisoned store's entry goes with the re-key"
         );
     }
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("api"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("api"),
         None,
-        "the handle retires the pill even when a poisoned store keeps the stale entry"
+        "the handle retires the pill even when a poisoned store held the stale entry"
     );
-    // The next tick's merge cannot resurrect the retired pill: the healthy
-    // OAuth store's cleared entry misses the `contains_key` arm and the
-    // poisoned third-party fallback reads as `None`.
+    // The next tick's merge cannot resurrect the retired pill: the read-through
+    // clear removed the entry, so nothing re-publishes it.
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("api"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("api"),
         None,
         "the next tick does not resurrect the pill from the surviving entry"
     );
@@ -3400,10 +3527,7 @@ fn a_console_relogin_clears_the_stale_verdict() {
         .insert("qwen".to_string(), 9);
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("qwen"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("qwen"),
         Some(FetchStatus::AuthExpired),
         "precondition: the stale console verdict is what the frame reads"
     );
@@ -3445,10 +3569,7 @@ fn a_console_relogin_clears_the_stale_verdict() {
     }
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("qwen"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("qwen"),
         None,
         "the next frame shows no stale verdict after a console re-login"
     );
@@ -3517,10 +3638,7 @@ fn a_preset_apply_clears_the_old_providers_streak() {
     }
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("zai"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("zai"),
         None,
         "the next frame shows no stale chrome after a preset repoint"
     );
@@ -3635,10 +3753,7 @@ fn a_divergence_overwrite_clears_the_stale_status_chrome() {
         .insert("work".to_string(), FetchStatus::AuthExpired);
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("work"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("work"),
         Some(FetchStatus::AuthExpired),
         "precondition: the stale verdict is what the frame reads"
     );
@@ -3669,10 +3784,7 @@ fn a_divergence_overwrite_clears_the_stale_status_chrome() {
     }
     app.apply_usage();
     assert_eq!(
-        app.config()
-            .find(&ProfileName::from("work"))
-            .unwrap()
-            .fetch_status,
+        app.readings_snapshot().status_of("work"),
         None,
         "the next frame shows no stale chrome after a divergence overwrite"
     );
@@ -6904,15 +7016,6 @@ fn creds_ra(refresh: &str, access: &str) -> crate::profile::ClaudeCredentials {
     }
 }
 
-/// Write a plain (diverged) `~/.claude/.credentials.json` carrying `creds`.
-fn write_live_creds(creds: &crate::profile::ClaudeCredentials) {
-    let path = crate::profile::claude_dir()
-        .expect("claude dir")
-        .join(".credentials.json");
-    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir .claude");
-    std::fs::write(&path, serde_json::to_vec(creds).expect("ser live")).expect("write live");
-}
-
 /// Force the 1Hz divergence poll to run now, bypassing its interval throttle.
 fn force_poll(app: &mut App) {
     app.last_divergence_check = None;
@@ -8108,6 +8211,95 @@ fn divergence_poll_ignores_a_logged_out_shell() {
     );
 }
 
+/// The logged-out shell with NO `default_divergence`: nothing can clear the
+/// banner a wrongly-filed NeedsPrompt verdict would flag, so this nag shape
+/// pins the shell arm where the Overwrite twin cannot (its default clears the
+/// banner before the test can see it).
+#[test]
+fn divergence_poll_leaves_a_shell_without_a_default_unnagged() {
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    // CC's logged-out shell: both tokens blanked. Still classifies Diverged.
+    write_live_creds(&creds_ra("", ""));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            profiles: vec!["work".into()],
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+
+    force_poll(&mut app);
+    assert!(
+        app.divergence_pending.is_none(),
+        "an empty shell is nothing to resolve — no nag banner, even with no default to clear it"
+    );
+    assert!(app.modals.is_empty(), "and certainly no modal");
+    let stored: crate::profile::ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir(&crate::profile::ProfileName::from("work"))
+            .expect("work dir")
+            .join("credentials.json"),
+    )
+    .expect("read work store");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("rt-work"),
+        "blank tokens are never captured over the stored login"
+    );
+}
+
+/// The logged-out shell with a `NewProfile` default: that default acts by
+/// opening a capture modal, so this no-modal shape pins the shell arm where
+/// the Overwrite twin cannot (its default never opens a modal).
+#[test]
+fn divergence_poll_never_opens_a_capture_modal_for_a_shell() {
+    use crate::profile::{AppConfig, AppState, DivergenceChoice, Profile, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_profile(&work).expect("save work");
+    // CC's logged-out shell: both tokens blanked. Still classifies Diverged.
+    write_live_creds(&creds_ra("", ""));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some("work".into()),
+            profiles: vec!["work".into()],
+            default_divergence: Some(DivergenceChoice::NewProfile),
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+
+    force_poll(&mut app);
+    assert!(
+        app.divergence_pending.is_none(),
+        "an empty shell is nothing to resolve — no nag banner"
+    );
+    assert!(
+        app.modals.is_empty(),
+        "the NewProfile default must never open a capture modal over blank tokens"
+    );
+    let stored: crate::profile::ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir(&crate::profile::ProfileName::from("work"))
+            .expect("work dir")
+            .join("credentials.json"),
+    )
+    .expect("read work store");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("rt-work"),
+        "blank tokens are never captured over the stored login"
+    );
+}
+
 /// A clauth-owned symlink in the live slot is never "unsaved credentials": a
 /// long-lived `session-token.json` for the active profile flips its install
 /// source, so the live symlink classifies Diverged though re-pointing it loses
@@ -8414,6 +8606,326 @@ fn divergence_picker_saves_the_login_into_a_chosen_profile() {
         Some("spare"),
         "the chosen profile becomes active so the divergence is resolved"
     );
+}
+
+/// Persist `profiles` and `state` (its profile list filled from them), each
+/// OAuth profile with a `usage_cache.json` at `five`, then build the app the
+/// way `run_loop` does: `load_config` off the sandbox disk, then construction.
+fn startup_from_disk(
+    profiles: &[(&crate::profile::Profile, Option<f64>)],
+    state: crate::profile::AppState,
+) -> App {
+    use crate::profile::{AppState, save_app_state, save_profile};
+    for (p, _) in profiles {
+        save_profile(p).expect("save profile");
+    }
+    save_app_state(&AppState {
+        profiles: profiles.iter().map(|(p, _)| p.name.clone()).collect(),
+        ..state
+    })
+    .expect("save state");
+    for (p, five) in profiles {
+        if let Some(five) = five {
+            crate::profile_cache::write_profile_cache(
+                &p.name,
+                crate::profile_cache::USAGE_CACHE_FILE,
+                &crate::usage::UsageInfo {
+                    five_hour: Some(crate::usage::UsageWindow {
+                        utilization: *five,
+                        resets_at: None,
+                    }),
+                    fetched_at: Some(crate::usage::now_ms()),
+                    ..crate::usage::UsageInfo::default()
+                },
+            );
+        }
+    }
+    App::new(crate::profile::load_config().expect("load config off disk"))
+}
+
+/// The picked 5h figure the frame reads for `name`.
+fn frame_five(app: &App, name: &str) -> Option<f64> {
+    app.readings_snapshot()
+        .usage_of(name)
+        .and_then(|u| u.five_hour.as_ref())
+        .map(|w| w.utilization)
+}
+
+/// cloudy's "after reconcile": a startup `default_divergence` that opens the
+/// target picker seeds nothing before the pick settles. Adopting the live login
+/// into `spare` deletes spare's caches, so the gate's seed after it finds
+/// none: `spare` shows none of the displaced login's bars, and carries no
+/// stamp, so its first fetch is due on the scheduler's first tick. `work`'s
+/// 30%, seeded by that same gate seed, shows the seed ran.
+#[test]
+fn a_startup_adoption_shows_none_of_the_displaced_logins_cached_bars() {
+    use super::{Modal, handle_key, run_confirm_action};
+    use crate::profile::{AppState, DivergenceChoice, Profile, ProfileName};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    let mut spare = Profile::new("spare".to_string(), None, None);
+    spare.credentials = Some(login_creds("rt-spare"));
+    let mut app = startup_from_disk(
+        &[(&work, Some(30.0)), (&spare, Some(64.0))],
+        AppState {
+            active_profile: Some("work".into()),
+            default_divergence: Some(DivergenceChoice::NewProfile),
+            ..AppState::default()
+        },
+    );
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+
+    super::reconcile_startup(&mut app);
+    super::drain_startup_signals(&mut app);
+    let Some(Modal::DivergenceTarget(form)) = app.modals.last() else {
+        panic!("expected the target picker, got {:?}", app.modals.last());
+    };
+    assert_eq!(
+        form.targets,
+        vec!["spare".to_string()],
+        "fixture: one target"
+    );
+    handle_key(&mut app, key(KeyCode::Down));
+    handle_key(&mut app, key(KeyCode::Enter));
+    let Some(Modal::Confirm(state)) = app.modals.pop() else {
+        panic!("expected the adopt confirm, got {:?}", app.modals.last());
+    };
+    run_confirm_action(&mut app, state.on_confirm);
+    super::maybe_spawn_bootstrap(&mut app);
+    super::join_test_workers();
+
+    assert_eq!(
+        (frame_five(&app, "work"), frame_five(&app, "spare")),
+        (Some(30.0), None),
+        "the adopted target shows none of the displaced login's bars"
+    );
+    assert!(
+        !app.last_fetched
+            .lock()
+            .unwrap()
+            .contains_key(&crate::usage::FetchLeg::OAuth.key(ProfileName::from("spare"))),
+        "no seeded stamp delays the adopted target's first fetch"
+    );
+}
+
+/// After a startup verdict whose `default_divergence` acts (here an overwrite
+/// of the active login), `reconcile_startup` seeds nothing and the gate's
+/// synchronous seed in `maybe_spawn_bootstrap` is the only seed: it seeds the
+/// display superset, so a DISABLED provider account's cached reading reaches
+/// the frame, with no status (nothing polls it).
+#[test]
+fn the_acting_default_gate_seeds_a_disabled_provider_accounts_reading() {
+    use crate::profile::{AppState, DivergenceChoice, Profile, ProfileName};
+    use crate::usage::FetchStatus;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    let mut off = crate::testutil::blank_profile(&ProfileName::from("off"));
+    off.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    off.api_key = Some("k".to_string());
+    off.provider = Some(crate::providers::Provider::DeepSeek);
+    off.disabled = true;
+    // The work-list positive: an ENABLED provider account, so emptying the seed's
+    // work-list argument drops its status (A's R4).
+    let mut on = crate::testutil::blank_profile(&ProfileName::from("on"));
+    on.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    on.api_key = Some("k".to_string());
+    on.provider = Some(crate::providers::Provider::DeepSeek);
+    let mut app = startup_from_disk(
+        &[(&work, None), (&off, None), (&on, None)],
+        AppState {
+            active_profile: Some("work".into()),
+            default_divergence: Some(DivergenceChoice::Overwrite),
+            ..AppState::default()
+        },
+    );
+    crate::profile_cache::write_profile_cache(
+        &off.name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 47.0)]),
+    );
+    crate::profile_cache::write_profile_cache(
+        &on.name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 47.0)]),
+    );
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+
+    super::reconcile_startup(&mut app);
+    assert_eq!(
+        frame_five(&app, "off"),
+        None,
+        "fixture: an acting default leaves the seed to the gate"
+    );
+    super::drain_startup_signals(&mut app);
+    assert!(
+        app.modals.is_empty(),
+        "fixture: the overwrite opens no modal"
+    );
+    super::maybe_spawn_bootstrap(&mut app);
+    super::join_test_workers();
+
+    assert_eq!(
+        (
+            frame_five(&app, "off"),
+            app.readings_snapshot().status_of("off")
+        ),
+        (Some(47.0), None),
+        "the gate seeds the disabled account's reading, never a status"
+    );
+    assert_eq!(
+        (
+            frame_five(&app, "on"),
+            app.readings_snapshot().status_of("on")
+        ),
+        (Some(47.0), Some(FetchStatus::Fresh)),
+        "an enabled provider account gets its cached reading and a live status"
+    );
+}
+
+/// cloudy's per-arm seed ruling: the `default_divergence = Overwrite` arm opens
+/// no modal, so the startup seed runs synchronously where the worker's gate
+/// opens — right before `spawn_bootstrap`. The other account's cached bars land
+/// on the frame right after the gate, with no worker join; the overwrite only
+/// touches the active profile, so the other account's bars are safe to seed
+/// there.
+#[test]
+fn the_overwrite_arm_seeds_the_other_accounts_bars_before_the_worker_runs() {
+    use crate::profile::{AppState, DivergenceChoice, Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    let mut off = crate::testutil::blank_profile(&ProfileName::from("off"));
+    off.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    off.api_key = Some("k".to_string());
+    off.provider = Some(crate::providers::Provider::DeepSeek);
+    off.disabled = true;
+    let mut app = startup_from_disk(
+        &[(&work, None), (&off, None)],
+        AppState {
+            active_profile: Some("work".into()),
+            default_divergence: Some(DivergenceChoice::Overwrite),
+            ..AppState::default()
+        },
+    );
+    crate::profile_cache::write_profile_cache(
+        &off.name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 47.0)]),
+    );
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+
+    super::reconcile_startup(&mut app);
+    assert_eq!(
+        frame_five(&app, "off"),
+        None,
+        "fixture: an acting default leaves the seed to the gate"
+    );
+    super::drain_startup_signals(&mut app);
+    assert!(
+        app.modals.is_empty(),
+        "fixture: the overwrite opens no modal"
+    );
+    super::maybe_spawn_bootstrap(&mut app);
+    // No worker join: the seed must have run synchronously before the spawn.
+    assert_eq!(
+        (
+            frame_five(&app, "off"),
+            app.readings_snapshot().status_of("off")
+        ),
+        (Some(47.0), None),
+        "the gate's synchronous seed shows the other account's bars on the frame after tick 1"
+    );
+    super::join_test_workers();
+}
+
+/// cloudy's "polled readings only": every automatic walk (the TUI scan, the
+/// startup one-shot and the Overview projected-switch caption) reads only
+/// accounts clauth polls. A keyless provider chain member is display-only, so
+/// its cached reading keeps rendering (change 5) but never drives a switch: the
+/// walk picks exactly what 6836c1a6 picked — the keyless member, whose absent
+/// reading there read as headroom — never the exhausted reading commit 2b's
+/// display superset gave it.
+#[test]
+fn the_walk_ignores_a_keyless_provider_members_cached_reading() {
+    use crate::fallback::SwitchAction;
+    for (label, chain, ok_age) in [
+        ("S1 chain[act,kl]", vec!["act", "kl"], 0u64),
+        (
+            "S3 chain[act,kl,ok] ok-aged",
+            vec!["act", "kl", "ok"],
+            7200u64,
+        ),
+    ] {
+        let _home = crate::testutil::HomeSandbox::new();
+        crate::testutil::keyless_walk_fixture(&chain, "act", ok_age, 97.0);
+        let mut app = App::new(crate::profile::load_config().expect("load config"));
+        super::reconcile_startup(&mut app);
+        super::drain_startup_signals(&mut app);
+        super::maybe_spawn_bootstrap(&mut app);
+        super::join_test_workers();
+        app.apply_usage();
+
+        // The frame keeps the cached reading (change 5) ...
+        assert_eq!(
+            frame_five(&app, "kl"),
+            Some(97.0),
+            "{label}: the display row keeps 97%"
+        );
+        // ... while the walk reads no reading for it and picks as 6836c1a6 did.
+        assert_eq!(
+            app.auto_switch_projection(&std::collections::HashSet::new())
+                .action,
+            Some(SwitchAction::To("kl".into())),
+            "{label}: the Overview projected-switch caption"
+        );
+        crate::usage::scan_auto_switch(
+            &app.config,
+            &app.usage_store,
+            &app.third_party_usage_store,
+            &app.usage_status,
+            &app.third_party_status,
+            &app.third_party_streaks,
+            &app.third_party_broken,
+            &app.poll_streaks,
+            &app.kick_blocks,
+            &app.activity,
+            &app.pending_switch,
+            &app.pending_switch_off,
+        );
+        let pending: Vec<String> = app
+            .pending_switch
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|t| t.target.clone())
+            .collect();
+        assert_eq!(pending, vec!["kl".to_string()], "{label}: the TUI scan");
+        let (fresh, rate) = app.active_bootstrap_state();
+        assert!(fresh, "{label}: fixture: the active's reading is fresh");
+        assert_eq!(
+            crate::fallback::auto_switch_if_needed(
+                &app.config,
+                rate,
+                &app.usage_store,
+                &app.third_party_usage_store,
+                &app.usage_status,
+                &app.third_party_status,
+                &app.poll_streaks,
+                &app.third_party_streaks,
+                &app.kick_blocks,
+            )
+            .unwrap(),
+            Some(SwitchAction::To("kl".into())),
+            "{label}: the startup one-shot"
+        );
+    }
 }
 
 /// The adopt makes its target active OUTSIDE `overwrite_captured_profile`, so
@@ -10720,20 +11232,107 @@ fn all_spent_banner_needs_live_spent_window() {
     let _home = crate::testutil::HomeSandbox::new();
     use super::update_banner;
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
-    let mut spent = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    spent.usage = Some(UsageInfo {
+    let spent = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let spent_usage = UsageInfo {
         five_hour: Some(UsageWindow {
             utilization: 100.0,
             resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
         }),
         ..UsageInfo::default()
-    });
+    };
     let mut app = app_with_unlinked_profiles(vec![spent]);
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), spent_usage);
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
         "all accounts spent · switch to an account to resume"
     );
+}
+
+/// cloudy's "polled readings only": the "all accounts spent" banner reads only
+/// accounts clauth polls. A keyless or disabled provider account is display-only,
+/// so its cached spent reading never counts as spent evidence — the wording
+/// 6836c1a6 reached — where an enabled keyed provider's still does.
+#[test]
+fn all_spent_banner_ignores_a_display_only_provider_account() {
+    use super::update_banner;
+    use crate::profile::{AppState, ProfileName, save_app_state, save_profile};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    for (label, keyed, disabled, expected) in [
+        (
+            "B1 keyless provider spent",
+            false,
+            false,
+            "no active account · select one to resume",
+        ),
+        (
+            "B2 disabled keyed provider spent",
+            true,
+            true,
+            "no active account · select one to resume",
+        ),
+        (
+            "B3 enabled keyed provider spent (control)",
+            true,
+            false,
+            "all accounts spent · switch to an account to resume",
+        ),
+    ] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut ok = crate::testutil::blank_profile(&ProfileName::from("ok"));
+        ok.credentials = Some(login_creds("rt-ok"));
+        let mut tp = crate::testutil::blank_profile(&ProfileName::from("tp"));
+        tp.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+        tp.provider = Some(crate::providers::Provider::DeepSeek);
+        if keyed {
+            tp.api_key = Some("k".to_string());
+        }
+        tp.disabled = disabled;
+        save_profile(&ok).expect("save ok");
+        save_profile(&tp).expect("save tp");
+        save_app_state(&AppState {
+            active_profile: None,
+            profiles: vec!["ok".into(), "tp".into()],
+            refresh_interval_ms: 90_000,
+            ..AppState::default()
+        })
+        .expect("save state");
+        crate::profile_cache::write_profile_cache(
+            &ProfileName::from("ok"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: 10.0,
+                    resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 7200)),
+                }),
+                fetched_at: Some(crate::usage::now_ms()),
+                ..UsageInfo::default()
+            },
+        );
+        crate::profile_cache::write_profile_cache(
+            &ProfileName::from("tp"),
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            &crate::testutil::stats_with_bars(vec![
+                crate::testutil::bar_reset_in("5h", 100.0, 7200),
+                crate::testutil::bar("7d", 23.0),
+            ]),
+        );
+        let mut app = App::new(crate::profile::load_config().expect("load config"));
+        super::reconcile_startup(&mut app);
+        super::drain_startup_signals(&mut app);
+        super::maybe_spawn_bootstrap(&mut app);
+        super::join_test_workers();
+        app.apply_usage();
+        update_banner(&mut app);
+        assert_eq!(
+            app.banner.as_ref().map(|b| b.message.as_str()),
+            Some(expected),
+            "{label}"
+        );
+    }
 }
 
 /// A weekly window past the SOFT switch line but under the API's hard cap is not
@@ -10744,16 +11343,20 @@ fn all_spent_banner_ignores_a_soft_blocked_member_that_still_serves() {
     let _home = crate::testutil::HomeSandbox::new();
     use super::update_banner;
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
-    let mut soft = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    soft.usage = Some(UsageInfo {
+    let soft = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let soft_usage = UsageInfo {
         seven_day: Some(UsageWindow {
             // Past the default 98 soft line, under the 100 hard cap.
             utilization: 99.0,
             resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 86_400)),
         }),
         ..UsageInfo::default()
-    });
+    };
     let mut app = app_with_unlinked_profiles(vec![soft]);
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), soft_usage);
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
@@ -10776,14 +11379,18 @@ fn all_spent_banner_ignores_a_member_line_under_the_hard_cap() {
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let mut overridden = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     overridden.weekly_threshold = Some(90.0);
-    overridden.usage = Some(UsageInfo {
+    let overridden_usage = UsageInfo {
         seven_day: Some(UsageWindow {
             utilization: 95.0,
             resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 86_400)),
         }),
         ..UsageInfo::default()
-    });
+    };
     let mut app = app_with_unlinked_profiles(vec![overridden]);
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), overridden_usage);
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
@@ -10798,15 +11405,19 @@ fn all_spent_banner_fires_at_the_weekly_hard_cap() {
     let _home = crate::testutil::HomeSandbox::new();
     use super::update_banner;
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
-    let mut dead = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
-    dead.usage = Some(UsageInfo {
+    let dead = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let dead_usage = UsageInfo {
         seven_day: Some(UsageWindow {
             utilization: 100.0,
             resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 86_400)),
         }),
         ..UsageInfo::default()
-    });
+    };
     let mut app = app_with_unlinked_profiles(vec![dead]);
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("a".to_string(), dead_usage);
     update_banner(&mut app);
     assert_eq!(
         app.banner.as_ref().expect("banner").message,
@@ -13205,7 +13816,7 @@ fn wire_wallet_stats(amount: f64) -> crate::providers::ThirdPartyStats {
     }
 }
 
-/// #74 degraded cue, FEED half: `apply_usage` derives `usage_stale` off the
+/// #74 degraded cue, FEED half: `apply_usage` derives `stale_cues` off the
 /// DISK body's `fetched_at` vs `stale_after_ms`, with the spent-account
 /// exemption reading the disk cache too (never the live store — a spent
 /// account the scheduler dropped from its due set keeps its store entry, so
@@ -13255,14 +13866,7 @@ fn apply_usage_feeds_usage_stale_off_the_disk_cache_age() {
             &disk,
         );
         app.apply_usage();
-        {
-            let cfg = app.config();
-            cfg.profiles
-                .iter()
-                .find(|p| p.name.as_str() == GATE_PROFILE)
-                .expect("profile present")
-                .usage_stale
-        }
+        app.stale_cues.get(GATE_PROFILE).copied().unwrap_or(false)
     };
     let interval = crate::profile::AppState::default().refresh_interval_ms;
     let body = |util: f64, resets_at: &str, fetched_at: Option<u64>| UsageInfo {
@@ -13949,11 +14553,7 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         disabled: false,
         console: None,
         credentials: None,
-        usage: None,
-        fetch_status: None,
         provider: None,
-        third_party_usage: None,
-        usage_stale: false,
     }
 }
 
@@ -31569,9 +32169,8 @@ mod usage_picker {
     }
 
     fn shown_5h(app: &App, name: &ProfileName) -> Option<f64> {
-        app.config()
-            .find(name)
-            .and_then(|p| p.usage.as_ref())
+        app.readings_snapshot()
+            .usage_of(name.as_str())
             .and_then(|u| u.five_hour.as_ref())
             .map(|w| w.utilization)
     }
@@ -31634,10 +32233,12 @@ mod usage_picker {
         );
         let entries = crate::usage::collect_third_party_entries(&app.config().profiles);
         assert_eq!(entries.len(), 1, "fixture has a third-party entry");
+        let names: Vec<String> = entries.iter().map(|e| e.name.to_string()).collect();
         crate::usage::bootstrap_third_party(
             &app.third_party_usage_store,
             &app.third_party_status,
             &app.last_fetched,
+            &names,
             &entries,
             300_000,
         );
@@ -31691,6 +32292,7 @@ mod usage_picker {
                 crate::usage::collect_third_party_entries(&cfg.profiles),
             )
         };
+        let third_party_names: Vec<String> = entries.iter().map(|e| e.name.to_string()).collect();
         crate::usage::bootstrap_fetch(
             &app.usage_store,
             &app.usage_status,
@@ -31702,6 +32304,7 @@ mod usage_picker {
             &app.third_party_usage_store,
             &app.third_party_status,
             &app.last_fetched,
+            &third_party_names,
             &entries,
             300_000,
         );
@@ -31724,113 +32327,9 @@ mod usage_picker {
         );
     }
 
-    /// `apply_usage`'s own contract: a poisoned store lock keeps the prior
-    /// reading rather than blanking it.
-    #[test]
-    fn a_poisoned_usage_store_keeps_the_prior_reading() {
-        let _home = crate::testutil::HomeSandbox::new();
-        let name = ProfileName::from("o");
-        let mut p = crate::testutil::blank_profile(&name);
-        p.usage = Some(crate::usage::UsageInfo {
-            five_hour: Some(crate::usage::UsageWindow {
-                utilization: 50.0,
-                resets_at: None,
-            }),
-            ..crate::usage::UsageInfo::default()
-        });
-        assert!(!p.usage_cache_is_third_party(), "fixture classifies OAuth");
-        let mut app = app_with(vec![p]);
-        let poisoner = Arc::clone(&app.usage_store);
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _held = poisoner.lock().expect("lock the store");
-            panic!("deliberate: poison the usage store");
-        }));
-        assert!(poisoned.is_err(), "HARNESS: poisoned");
-        app.apply_usage();
-        let got = app
-            .config()
-            .find(&name)
-            .and_then(|p| p.usage.as_ref())
-            .and_then(|u| u.five_hour.as_ref())
-            .map(|w| w.utilization);
-        assert_eq!(
-            got,
-            Some(50.0),
-            "a poisoned usage store keeps the prior reading"
-        );
-    }
-
-    fn hybrid_with_prior_reading(name: &ProfileName) -> crate::profile::Profile {
-        let mut p = crate::testutil::blank_profile(name);
-        p.credentials = Some(creds());
-        p.base_url = Some("https://example.com".into());
-        p.api_key = Some("key".into());
-        p.usage = Some(crate::usage::UsageInfo {
-            five_hour: Some(crate::usage::UsageWindow {
-                utilization: 40.0,
-                resets_at: None,
-            }),
-            ..crate::usage::UsageInfo::default()
-        });
-        p.fetch_status = Some(crate::usage::FetchStatus::Cached);
-        assert!(
-            p.usage_cache_is_third_party(),
-            "the fixture's hybrid classifies third-party"
-        );
-        p
-    }
-
-    /// A poisoned provider store keeps a third-party account's prior reading,
-    /// the same contract the OAuth side keeps.
-    #[test]
-    fn a_poisoned_provider_store_keeps_a_hybrids_prior_reading() {
-        let _home = crate::testutil::HomeSandbox::new();
-        let name = ProfileName::from("h");
-        let mut app = app_with(vec![hybrid_with_prior_reading(&name)]);
-        let poisoner = Arc::clone(&app.third_party_usage_store);
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _held = poisoner.lock().expect("lock the provider store");
-            panic!("deliberate: poison the provider store");
-        }));
-        assert!(poisoned.is_err(), "the provider store is poisoned");
-        app.apply_usage();
-        let got = app
-            .config()
-            .find(&name)
-            .and_then(|p| p.usage.as_ref())
-            .and_then(|u| u.five_hour.as_ref())
-            .map(|w| w.utilization);
-        assert_eq!(
-            got,
-            Some(40.0),
-            "a poisoned provider store keeps the prior reading"
-        );
-    }
-
-    /// A poisoned provider status store keeps a third-party account's prior
-    /// fetch status rather than clearing it.
-    #[test]
-    fn a_poisoned_provider_status_keeps_a_hybrids_prior_fetch_status() {
-        let _home = crate::testutil::HomeSandbox::new();
-        let name = ProfileName::from("h");
-        let mut app = app_with(vec![hybrid_with_prior_reading(&name)]);
-        let poisoner = Arc::clone(&app.third_party_status);
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _held = poisoner.lock().expect("lock the provider status");
-            panic!("deliberate: poison the provider status");
-        }));
-        assert!(poisoned.is_err(), "the provider status is poisoned");
-        app.apply_usage();
-        let got = app.config().find(&name).and_then(|p| p.fetch_status);
-        assert_eq!(
-            got,
-            Some(crate::usage::FetchStatus::Cached),
-            "a poisoned provider status keeps the prior fetch status"
-        );
-    }
-
-    /// `apply_usage`'s freshness follows the picker's side: a hybrid whose OAuth
-    /// leg is stale but whose provider leg is fresh shows the provider status.
+    /// The snapshot's fetch status follows the picker's side: a hybrid whose
+    /// OAuth leg is stale but whose provider leg is fresh shows the provider
+    /// status.
     #[test]
     fn a_hybrids_fetch_status_reads_the_provider_side() {
         let _home = crate::testutil::HomeSandbox::new();
@@ -31853,11 +32352,104 @@ mod usage_picker {
             .unwrap()
             .insert("h".into(), crate::usage::FetchStatus::Fresh);
         app.apply_usage();
-        let got = app.config().find(&name).and_then(|p| p.fetch_status);
+        let got = app.readings_snapshot().status_of("h");
         assert_eq!(
             got,
             Some(crate::usage::FetchStatus::Fresh),
             "a hybrid's fetch status reads the provider side"
+        );
+    }
+
+    /// A poisoned OAuth store still carries its last good reading into the
+    /// snapshot, never a blank one.
+    #[test]
+    fn a_poisoned_usage_store_keeps_the_prior_reading() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("o");
+        let p = crate::testutil::blank_profile(&name);
+        assert!(!p.usage_cache_is_third_party(), "fixture classifies OAuth");
+        let mut app = app_with(vec![p]);
+        app.usage_store
+            .lock()
+            .unwrap()
+            .insert("o".into(), oauth(50.0));
+        let poisoner = Arc::clone(&app.usage_store);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = poisoner.lock().unwrap();
+            panic!("deliberate: poison the usage store");
+        }));
+        assert!(poisoned.is_err(), "HARNESS: poisoned");
+        app.apply_usage();
+        assert_eq!(
+            shown_5h(&app, &name),
+            Some(50.0),
+            "a poisoned usage store keeps the prior reading"
+        );
+    }
+
+    /// A poisoned provider store still carries a hybrid's last good reading
+    /// into the snapshot, the same contract the OAuth side keeps.
+    #[test]
+    fn a_poisoned_provider_store_keeps_a_hybrids_prior_reading() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("h");
+        let mut p = crate::testutil::blank_profile(&name);
+        p.credentials = Some(creds());
+        p.base_url = Some("https://example.com".into());
+        p.api_key = Some("key".into());
+        assert!(
+            p.usage_cache_is_third_party(),
+            "fixture classifies third-party"
+        );
+        let mut app = app_with(vec![p]);
+        app.third_party_usage_store
+            .lock()
+            .unwrap()
+            .insert("h".into(), bar(40.0));
+        let poisoner = Arc::clone(&app.third_party_usage_store);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = poisoner.lock().unwrap();
+            panic!("deliberate: poison the provider store");
+        }));
+        assert!(poisoned.is_err(), "the provider store is poisoned");
+        app.apply_usage();
+        assert_eq!(
+            shown_5h(&app, &name),
+            Some(40.0),
+            "a poisoned provider store keeps the prior reading"
+        );
+    }
+
+    /// A poisoned provider status store still carries a hybrid's last good
+    /// fetch status rather than clearing it.
+    #[test]
+    fn a_poisoned_provider_status_keeps_a_hybrids_prior_fetch_status() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = ProfileName::from("h");
+        let mut p = crate::testutil::blank_profile(&name);
+        p.credentials = Some(creds());
+        p.base_url = Some("https://example.com".into());
+        p.api_key = Some("key".into());
+        assert!(
+            p.usage_cache_is_third_party(),
+            "fixture classifies third-party"
+        );
+        let mut app = app_with(vec![p]);
+        app.third_party_status
+            .lock()
+            .unwrap()
+            .insert("h".into(), crate::usage::FetchStatus::Cached);
+        let poisoner = Arc::clone(&app.third_party_status);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = poisoner.lock().unwrap();
+            panic!("deliberate: poison the provider status");
+        }));
+        assert!(poisoned.is_err(), "the provider status is poisoned");
+        app.apply_usage();
+        assert_eq!(
+            app.readings_snapshot().status_of("h"),
+            Some(crate::usage::FetchStatus::Cached),
+            "a poisoned provider status keeps the prior fetch status"
         );
     }
 
@@ -31872,7 +32464,6 @@ mod usage_picker {
         p.credentials = Some(creds());
         p.base_url = Some("https://example.com".into());
         p.api_key = Some("key".into());
-        p.usage = Some(oauth(60.0));
         assert!(
             p.usage_cache_is_third_party(),
             "fixture classifies third-party"

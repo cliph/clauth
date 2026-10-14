@@ -12,6 +12,7 @@ mod daemon;
 mod fallback;
 mod format;
 mod gateway;
+mod gateway_admin;
 mod gateway_edit;
 mod gateway_tokens;
 mod harness;

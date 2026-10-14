@@ -1200,31 +1200,3 @@ fn the_wide_glyph_active_names_desktop_rows_replace_the_pre_s9_clip() {
         );
     }
 }
-
-/// Desktop pin: the emoji active name renders whole before and after at 80
-/// and 160 — pre-S9 sized it by char count, only shifting the column.
-#[test]
-fn the_wide_glyph_active_names_desktop_rows_measure_by_cells() {
-    let _home = crate::testutil::HomeSandbox::new();
-    let want: &[(&str, &[(u16, &str)])] = &[(
-        "emoji-🧭⚠️-account",
-        &[
-            (
-                80,
-                "▝▜█████▛▘ [ 0 live ] · emoji-🧭 ⚠-acco… 49% [█████░░░░░]       ● status.claude.ai",
-            ),
-            (
-                160,
-                "▝▜█████▛▘ [ 0 live ] · emoji-🧭 ⚠-acco… 49% [█████░░░░░]                                                                                       ● status.claude.ai",
-            ),
-        ],
-    )];
-    for (name, cases) in want {
-        let mut app = app_with(vec![oauth_profile(name, 49.0)], Some(name));
-        app.tab = Tab::Usage;
-        for &(w, expected) in *cases {
-            let rows = render_header_rows(&app, w);
-            assert_eq!(rows[1].trim_end(), expected, "row 1 for {name} at {w} cols");
-        }
-    }
-}

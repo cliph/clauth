@@ -2130,6 +2130,8 @@ fn the_member_card_places_the_session_block_above_the_five_hour_gauge() {
 /// floor leaves no room, instead of clipping `% used` off the pane edge.
 #[test]
 fn the_five_hour_figure_drops_to_its_own_line_when_the_gauge_leaves_no_room() {
+    // The expected rows spell the full tier's toggle glyphs (`─●` / `○─`).
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let cfg = config_with(vec![profile("a", 95.0, 49.0, 3600)], None, vec!["a"]);
     let (lines, _, _) = member_detail(
         &cfg,
@@ -2160,6 +2162,32 @@ fn the_five_hour_figure_drops_to_its_own_line_when_the_gauge_leaves_no_room() {
             "  max spend       off",
             "  remove",
             "  remove from chain",
+        ]
+    );
+}
+
+/// The member card's toggle rows take the compatible tier's `[on]` / `[off]`
+/// on a terminal without truecolor, never the full tier's glyphs.
+#[test]
+fn the_member_card_toggle_rows_read_on_off_on_the_compatible_tier() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+    let cfg = config_with(vec![profile("a", 95.0, 49.0, 3600)], None, vec!["a"]);
+    let (lines, _, _) = member_detail(
+        &cfg,
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            width: 24,
+            ..Default::default()
+        },
+        &HashSet::new(),
+    );
+    assert_eq!(
+        &card_texts(&lines)[6..10],
+        [
+            "  weekly gate     [on]",
+            "  scoped gate     [on]",
+            "  last resort     [off]",
+            "  preferred       [off]",
         ]
     );
 }
@@ -2771,6 +2799,8 @@ fn chain_prose_styles_the_relogin_command_and_the_day_picker_keys() {
 /// gutter once the value column leaves no room, instead of clipping the tail.
 #[test]
 fn the_remove_value_drops_to_its_own_line_when_narrow() {
+    // The expected rows spell the full tier's toggle glyphs (`─●` / `○─`).
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let a = profile("a", 95.0, 20.0, 3600);
     let cfg = config_with(vec![a], None, vec!["a"]);
     let lines = member_detail(
@@ -2837,6 +2867,8 @@ fn the_add_blurb_wraps_on_a_narrow_pane() {
 /// clipping the reminder mid-word.
 #[test]
 fn the_rotate_reminder_drops_to_its_own_line_when_narrow() {
+    // The expected rows spell the full tier's toggle glyphs (`─●` / `○─`).
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let a = profile("a", 80.0, 20.0, 3600);
     let cfg = config_with(vec![a], None, vec!["a"]);
     let lines = member_detail(

@@ -7,6 +7,7 @@
 use crate::herdr::{ConfigStatus, HerdrProbe, RegistryEntry, SidebarState};
 use crate::mcp::jobs::{self, JobRecord, JobState, RecordKind, RunningSpec};
 use crate::profile::{AppConfig, AppState};
+use crate::testutil::{EYEBROW_ACTIVE, EYEBROW_AT_REST};
 use crate::tui::app::{App, Check, Health, Problem, ServiceFix, delegates_check, herdr_check};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -3301,6 +3302,44 @@ fn herdr_options_render_all_six_rows_on_both_tiers() {
     drop(compatible);
 }
 
+/// The herdr OPTIONS eyebrow takes `TEXT + bold` while the detail pane holds
+/// focus on one of its rows, and sits at `TEXT_DIM + bold` while the focus
+/// rests on the heal line above the section or the list holds it; it is never
+/// underlined.
+#[test]
+fn the_herdr_options_eyebrow_brightens_only_while_an_option_row_is_focused() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+
+    let mut app = herdr_options_app(config(true, None, SidebarState::Templated));
+    app.tab = crate::tui::app::Tab::Services;
+    let (_, buf) = render(&app);
+    assert_eq!(
+        app.services.focused_fix(),
+        None,
+        "an option row holds focus"
+    );
+    assert_eyebrow(&buf, "OPTIONS", EYEBROW_ACTIVE);
+
+    app.services.focus = ServicesFocus::List;
+    let (_, buf) = render(&app);
+    assert_eyebrow(&buf, "OPTIONS", EYEBROW_AT_REST);
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert_eq!(app.services.focus, ServicesFocus::Detail, "f descends");
+    assert!(
+        matches!(
+            app.services.focused_fix(),
+            Some(ServiceFix::HealHerdrConfig(_))
+        ),
+        "f lands on the heal line"
+    );
+    let (_, buf) = render(&app);
+    assert_eyebrow(&buf, "OPTIONS", EYEBROW_AT_REST);
+}
+
 /// A narrow detail pane breaks the `popup width` cycle between options onto a
 /// line indented to the value column, never inside `split-right`.
 #[test]
@@ -3573,6 +3612,64 @@ fn the_shunt_card_renders_the_action_section_verbatim() {
         !detail.iter().any(|l| l == "no home to find it"),
         "the NoHome reason is not split into a key: {detail:?}"
     );
+}
+
+/// The MOVE PLAN eyebrow takes `TEXT + bold` while the detail pane holds
+/// focus on its `f  move stores in` line, and sits at `TEXT_DIM + bold` while
+/// the detail focus rests on another fix line (`f  add admin key`) or the list
+/// takes focus back; it is never underlined.
+#[test]
+fn the_move_plan_eyebrow_brightens_only_while_its_fix_line_is_focused() {
+    use crate::tui::app::{ServicesFocus, ShuntFocus, ShuntFocusLine};
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let check = Check {
+        label: "shunt",
+        health: Health::Warn,
+        detail: vec![
+            "f  add admin key".to_string(),
+            "MOVE PLAN".to_string(),
+            "moves  /standalone/a.json".to_string(),
+            "f  move stores in".to_string(),
+        ],
+        fix: Some(ServiceFix::MoveStoresIn),
+        problems: Vec::new(),
+        shunt_focus: vec![
+            ShuntFocus::Fix {
+                line: 0,
+                fix: ServiceFix::AddAdminKey,
+            },
+            ShuntFocus::Fix {
+                line: 3,
+                fix: ServiceFix::MoveStoresIn,
+            },
+        ],
+        shunt_action_start: Some(0),
+    };
+    let mut app = app_with(check);
+    app.services.focus = ServicesFocus::Detail;
+    app.services.set_shunt_focus(Some(ShuntFocusLine::Move));
+    let (_, buf) = render(&app);
+    assert_eq!(
+        app.services.focused_shunt_focus().map(|s| s.kind()),
+        Some(ShuntFocusLine::Move),
+        "the render keeps the move fix line focused"
+    );
+    assert_eyebrow(&buf, "MOVE PLAN", EYEBROW_ACTIVE);
+
+    app.services.set_shunt_focus(Some(ShuntFocusLine::Admin));
+    let (_, buf) = render(&app);
+    assert_eq!(
+        app.services.focused_shunt_focus().map(|s| s.kind()),
+        Some(ShuntFocusLine::Admin),
+        "the render keeps the admin fix line focused"
+    );
+    assert_eyebrow(&buf, "MOVE PLAN", EYEBROW_AT_REST);
+
+    app.services.set_shunt_focus(Some(ShuntFocusLine::Move));
+    app.services.focus = ServicesFocus::List;
+    let (_, buf) = render(&app);
+    assert_eyebrow(&buf, "MOVE PLAN", EYEBROW_AT_REST);
 }
 
 /// The pending-require waiting line renders whole-dim (a read-only line, never
@@ -7367,12 +7464,15 @@ fn the_shunt_config_ellipsizes_the_bind_suffix_at_a_narrow_width() {
 
 /// Style pins: a collapsed-blurred entry renders its glyph and summary dim and
 /// its label dim (no bold); an expanded-focused entry renders its glyph accent
-/// and its label `TEXT + bold`; the focused group's eyebrow is dim bold
-/// underlined; field values accent and `—` faint.
+/// and its label `TEXT + bold`; the focused group's eyebrow is `TEXT + bold`
+/// while the detail pane holds focus, every other eyebrow (and that one once
+/// the list holds focus) `TEXT_DIM + bold`, none underlined; field values
+/// accent and `—` faint.
 #[test]
 fn the_shunt_config_entry_styles_follow_the_design_contract() {
     use crate::tui::app::{ServicesFocus, ShuntFocusLine};
     let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut view = base_view();
     view.upstreams = vec![
         shorthand_up("anthropic", "claude_oauth"),
@@ -7444,17 +7544,31 @@ fn the_shunt_config_entry_styles_follow_the_design_contract() {
         "— faint"
     );
 
-    // The focused group's eyebrow: dim + bold + underline.
-    let eyebrow = crate::testutil::needle_cells(&buf, "UPSTREAMS").expect("eyebrow");
-    for cell in &eyebrow {
-        assert_eq!(cell.fg, super::theme::text_dim_color(), "eyebrow dim");
+    // The focused group's eyebrow brightens; another group's stays at rest.
+    assert_eyebrow(&buf, "UPSTREAMS", EYEBROW_ACTIVE);
+    assert_eyebrow(&buf, "SERVER", EYEBROW_AT_REST);
+
+    // The list taking focus back returns the held group's eyebrow to rest.
+    app.services.focus = ServicesFocus::List;
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    assert_eyebrow(term.backend().buffer(), "UPSTREAMS", EYEBROW_AT_REST);
+}
+
+/// Assert every cell of the first `needle` run in `buf` renders `fg` + bold and
+/// never underlined: an eyebrow's focus cue is its tier alone. The caller holds
+/// a `Tier::Full` sandbox.
+fn assert_eyebrow(buf: &ratatui::buffer::Buffer, needle: &str, fg: ratatui::style::Color) {
+    let cells = crate::testutil::needle_cells(buf, needle)
+        .unwrap_or_else(|| panic!("no `{needle}` eyebrow"));
+    for cell in &cells {
+        assert_eq!(cell.fg, fg, "the `{needle}` eyebrow's tier");
         assert!(
             cell.modifier.contains(ratatui::style::Modifier::BOLD),
-            "eyebrow bold"
+            "the `{needle}` eyebrow is bold"
         );
         assert!(
-            cell.modifier.contains(ratatui::style::Modifier::UNDERLINED),
-            "eyebrow underlined"
+            !cell.modifier.contains(ratatui::style::Modifier::UNDERLINED),
+            "the `{needle}` eyebrow is never underlined"
         );
     }
 }
@@ -7762,16 +7876,17 @@ fn the_saving_save_row_label_shimmers_into_per_char_spans() {
     );
 }
 
-/// Ruling 9 (B-M-B2): the group eyebrow stays dim + bold + underlined while
-/// the focus rests on its `+ add`, `save` or `remove` row, the way it does on
-/// an entry or field. B's P2-B2 plant (dropping the `Add`/`SaveAdd`/`Remove`
-/// arms in `focused_group`) reds this.
+/// Ruling 9 (B-M-B2): the group eyebrow stays `TEXT + bold` while the focus
+/// rests on its `+ add`, `save` or `remove` row, the way it does on an entry
+/// or field. B's P2-B2 plant (dropping the `Add`/`SaveAdd`/`Remove` arms in
+/// `focused_group`) reds this.
 #[test]
-fn the_group_eyebrow_stays_underlined_on_the_add_save_and_remove_rows() {
+fn the_group_eyebrow_stays_active_on_the_add_save_and_remove_rows() {
     use crate::tui::app::{
         ServicesFocus, ShuntAddKind, ShuntDrafts, ShuntFocusLine, UpstreamDraft,
     };
     let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
 
     // `+ add upstream` focused (draft closed).
     let mut app = config_draft_app(
@@ -7782,7 +7897,7 @@ fn the_group_eyebrow_stays_underlined_on_the_add_save_and_remove_rows() {
     app.services.focus = ServicesFocus::Detail;
     app.services
         .set_shunt_focus(Some(ShuntFocusLine::Add(ShuntAddKind::Upstream)));
-    assert_upstreams_eyebrow_underlined(&app);
+    assert_upstreams_eyebrow_active(&app);
 
     // `save upstream` focused (draft open).
     let mut app = config_draft_app(
@@ -7796,7 +7911,7 @@ fn the_group_eyebrow_stays_underlined_on_the_add_save_and_remove_rows() {
     app.services.focus = ServicesFocus::Detail;
     app.services
         .set_shunt_focus(Some(ShuntFocusLine::SaveAdd(ShuntAddKind::Upstream)));
-    assert_upstreams_eyebrow_underlined(&app);
+    assert_upstreams_eyebrow_active(&app);
 
     // `remove upstream` focused (entry expanded).
     let mut view = base_view();
@@ -7809,31 +7924,15 @@ fn the_group_eyebrow_stays_underlined_on_the_add_save_and_remove_rows() {
     app.services.focus = ServicesFocus::Detail;
     app.services
         .set_shunt_focus(Some(ShuntFocusLine::Remove(entry)));
-    assert_upstreams_eyebrow_underlined(&app);
+    assert_upstreams_eyebrow_active(&app);
 }
 
-/// Render `app` and assert every `UPSTREAMS` eyebrow cell is dim + bold +
-/// underlined (the focused group's cue).
-fn assert_upstreams_eyebrow_underlined(app: &App) {
+/// Render `app` and assert the `UPSTREAMS` eyebrow takes the focused group's
+/// cue (`TEXT + bold`, never underlined).
+fn assert_upstreams_eyebrow_active(app: &App) {
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(W, 60)).unwrap();
     term.draw(|f| super::draw(f, f.area(), app)).unwrap();
-    let buf = term.backend().buffer().clone();
-    let eyebrow = crate::testutil::needle_cells(&buf, "UPSTREAMS").expect("UPSTREAMS eyebrow");
-    for cell in &eyebrow {
-        assert_eq!(
-            cell.fg,
-            super::theme::text_dim_color(),
-            "the focused group's eyebrow is dim"
-        );
-        assert!(
-            cell.modifier.contains(ratatui::style::Modifier::BOLD),
-            "the focused group's eyebrow is bold"
-        );
-        assert!(
-            cell.modifier.contains(ratatui::style::Modifier::UNDERLINED),
-            "the focused group's eyebrow is underlined"
-        );
-    }
+    assert_eyebrow(term.backend().buffer(), "UPSTREAMS", EYEBROW_ACTIVE);
 }
 
 /// Ruling 8 (B-M-B3): the `save <kind>` row takes the `create account`

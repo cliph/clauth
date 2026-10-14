@@ -203,12 +203,15 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-/// Eyebrow header opening a concern band: UPPERCASE, `TEXT_DIM + bold` at all
-/// times (a fixed label treatment, not a focus cue), gaining an underline while
-/// the cursor sits on one of its rows — the contract's section-header form.
+/// Eyebrow header opening a concern band: UPPERCASE, `TEXT_DIM + bold` at
+/// rest, `TEXT + bold` while the cursor sits on one of its rows — the
+/// contract's section-header form.
 fn band_header(label: &str, focused: bool) -> Line<'static> {
-    let style = theme::label();
-    let style = if focused { style.underlined() } else { style };
+    let style = if focused {
+        theme::label_active()
+    } else {
+        theme::label()
+    };
     Line::from(Span::styled(label.to_uppercase(), style))
 }
 

@@ -427,7 +427,7 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
     // SERVER / UPSTREAMS / MODELS / ROUTES / CLIENT TOKENS groups (or one
     // `config  not read` line). Entry rows join `stop_rendered` in
     // `check.shunt_focus` order; `eyebrows` records each group header's line
-    // for the underline pass.
+    // for the focused-group pass.
     let mut eyebrows: [Option<usize>; 5] = [None; 5];
     match &app.services.shunt_config {
         Some(ShuntConfigRead::Ok(view)) => {
@@ -484,11 +484,12 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
             })
         });
 
-    // The MOVE PLAN eyebrow underlines while the focus rests on its one
-    // actionable line (`f move stores in`) and the detail pane holds focus,
-    // the herdr OPTIONS section's rule; blurred, only the hover tint stays.
+    // The MOVE PLAN eyebrow brightens to `TEXT + bold` while the focus rests
+    // on its one actionable line (`f move stores in`) and the detail pane
+    // holds focus, the herdr OPTIONS section's rule; blurred, only the hover
+    // tint stays.
     if let Some(idx) = move_plan_line {
-        let underlined = detail_focused
+        let active = detail_focused
             && focus_stop.is_some_and(|i| {
                 matches!(
                     &check.shunt_focus[i],
@@ -498,17 +499,17 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
                     }
                 )
             });
-        let style = if underlined {
-            theme::label().underlined()
+        let style = if active {
+            theme::label_active()
         } else {
             theme::label()
         };
         lines[idx] = Line::from(Span::styled("MOVE PLAN", style));
     }
 
-    // A config group's eyebrow underlines while the focused entry or field sits
-    // in that group and the detail pane holds focus (the herdr OPTIONS
-    // section's rule).
+    // A config group's eyebrow brightens to `TEXT + bold` while the focused
+    // entry or field sits in that group and the detail pane holds focus (the
+    // herdr OPTIONS section's rule).
     let focused_group = focus_stop.and_then(|i| match &check.shunt_focus[i] {
         ShuntFocus::Entry { key } => Some(entry_group(key)),
         ShuntFocus::Field { key } => Some(field_group(key)),
@@ -521,10 +522,7 @@ fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Chec
         && let Some(group) = focused_group
         && let Some(line) = eyebrows[group]
     {
-        lines[line] = Line::from(Span::styled(
-            eyebrow_name(group),
-            theme::label().underlined(),
-        ));
+        lines[line] = Line::from(Span::styled(eyebrow_name(group), theme::label_active()));
     }
 
     // The field whose typed editor is open, for the native cursor (published
@@ -1972,8 +1970,8 @@ fn draw_delegates_empty(frame: &mut Frame<'_>, body: Rect) {
 /// detail pane is descended, ↑↓ walks the rows and the whole form scrolls so
 /// the focused row (plus its tooltip) stays on screen — the form-pane
 /// `draw_scrolled_lines` shape, so the prose scrolls to follow the cursor
-/// rather than holding a manual offset. The section header underlines while
-/// focus rests on one of its rows.
+/// rather than holding a manual offset. The section header brightens to
+/// `TEXT + bold` while focus rests on one of its rows.
 /// `fix_focus` is the detail line of the heal fix while focus sits on it;
 /// the option rows then hold no selection.
 fn draw_herdr_detail(
@@ -1986,12 +1984,13 @@ fn draw_herdr_detail(
     let focused = app.services.focus == ServicesFocus::Detail;
 
     lines.push(Line::from(""));
-    let mut section_style = theme::label();
-    // The eyebrow underlines while focus rests on one of its rows, never while
+    // The eyebrow brightens while focus rests on one of its rows, never while
     // it sits on the heal line above the section.
-    if focused && fix_focus.is_none() {
-        section_style = section_style.underlined();
-    }
+    let section_style = if focused && fix_focus.is_none() {
+        theme::label_active()
+    } else {
+        theme::label()
+    };
     lines.push(Line::from(Span::styled("OPTIONS", section_style)));
 
     let settings = app.config().state.herdr.clone();

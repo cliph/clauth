@@ -434,7 +434,7 @@ fn demo_config() -> AppConfig {
             percent: Some(32.0),
             currency: Some("USD".to_string()),
         }),
-        Some(FetchStatus::Cached), // cached → warning underline
+        Some(FetchStatus::Cached), // cached → warning refresh countdown
     );
 
     let pro = oauth_profile(

@@ -1062,40 +1062,31 @@ fn config_bands_stay_contiguous() {
     );
 }
 
-/// The header is a fixed `TEXT_DIM + bold` eyebrow whatever the cursor does; the
-/// underline is the only thing focus moves. Rendering the focused band brighter,
-/// or underlining a band with no row focused, is the bug this pins.
+/// The header is a bold eyebrow whatever the cursor does; focus moves only its
+/// tier, `TEXT_DIM` at rest to `TEXT` while the cursor sits in the band, and
+/// never underlines it. Brightening a band with no row focused, or underlining
+/// either state, is the bug this pins.
 #[test]
-fn band_header_underlines_only_the_focused_band() {
+fn band_header_brightens_only_the_focused_band() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let blurred = band_header("auto-switch", false);
     let focused = band_header("auto-switch", true);
-    for line in [&blurred, &focused] {
+    for (line, fg, state) in [
+        (&blurred, crate::testutil::EYEBROW_AT_REST, "at rest"),
+        (&focused, crate::testutil::EYEBROW_ACTIVE, "focused"),
+    ] {
         assert_eq!(line_text(line), "AUTO-SWITCH", "eyebrows render uppercase");
-        assert_eq!(
-            line.spans[0].style.fg,
-            theme::label().fg,
-            "the tier never changes with focus"
+        let style = line.spans[0].style;
+        assert_eq!(style.fg, Some(fg), "the {state} eyebrow's tier");
+        assert!(
+            style.add_modifier.contains(Modifier::BOLD),
+            "the {state} eyebrow is bold"
         );
         assert!(
-            line.spans[0].style.add_modifier.contains(Modifier::BOLD),
-            "the eyebrow bold is a fixed label treatment, not a focus cue"
+            !style.add_modifier.contains(Modifier::UNDERLINED),
+            "the {state} eyebrow is never underlined"
         );
     }
-    assert!(
-        !blurred.spans[0]
-            .style
-            .add_modifier
-            .contains(Modifier::UNDERLINED),
-        "no underline while focus is elsewhere"
-    );
-    assert!(
-        focused.spans[0]
-            .style
-            .add_modifier
-            .contains(Modifier::UNDERLINED),
-        "the underline is the active-section cue"
-    );
 }
 
 // ── reset display + clock notation (issue #39) ───────────────────────────────

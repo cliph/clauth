@@ -1091,6 +1091,14 @@ impl Drop for TierSandbox {
     }
 }
 
+/// A section header's foreground on `Tier::Full` while focus rests in its
+/// section: `TEXT` (Catppuccin Mocha `text`, `#cdd6f4`). Literal, so a theme
+/// edit cannot move the expectation with it.
+pub(crate) const EYEBROW_ACTIVE: ratatui::style::Color = ratatui::style::Color::Rgb(205, 214, 244);
+/// A section header's foreground on `Tier::Full` at rest: `TEXT_DIM` (Mocha
+/// `subtext0`, `#a6adc8`).
+pub(crate) const EYEBROW_AT_REST: ratatui::style::Color = ratatui::style::Color::Rgb(166, 173, 200);
+
 /// A minimal `Profile` with every optional field unset — tests fill in what
 /// they assert on.
 pub(crate) fn blank_profile(name: &crate::profile::ProfileName) -> crate::profile::Profile {

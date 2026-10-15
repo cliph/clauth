@@ -99,8 +99,9 @@ pub(crate) fn pin_auto_memory_dir<S: AsRef<OsStr>>(
 /// runtime's user-tier `settings.json` (built from `~/.claude/settings.json`)
 /// or the project and local tiers. Claude Code reads the project tier from the
 /// launch dir but the local tier from the git root (a linked worktree's main
-/// checkout), falling back to the launch dir, so both local files are checked. Unreadable or unparsable counts as
-/// unset; Claude Code would not read a value out of it either.
+/// checkout), falling back to the launch dir, so both local files are
+/// checked. Unreadable or unparsable counts as unset; Claude Code would not
+/// read a value out of it either.
 fn user_sets_memory_dir(cwd: &Path, config_dir: &Path) -> bool {
     let project = cwd.join(".claude");
     let mut files = vec![
@@ -204,9 +205,9 @@ fn git_root(dir: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// For a linked worktree at `root`, the main working copy (or the bare repo dir)
-/// it belongs to. `None` for an ordinary checkout or anything that does not
-/// check out the way git writes it, which Claude Code also keys on `root`.
+/// For a linked worktree at `root`, the main working copy (or the bare repo
+/// dir) it belongs to. `None` for an ordinary checkout or anything that does
+/// not check out the way git writes it, which Claude Code also keys on `root`.
 fn main_worktree(root: &Path) -> Option<PathBuf> {
     let dot_git = fs::read_to_string(root.join(".git")).ok()?;
     let gitdir = root.join(dot_git.trim().strip_prefix("gitdir:")?.trim());

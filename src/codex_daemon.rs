@@ -3,11 +3,12 @@
 //!
 //! Since codex 0.157 a `codex` TUI is a client of one long-lived app-server
 //! daemon (`codex app-server --managed-daemon`); every task runs inside it and
-//! `codex resume` reconnects to the same process. The daemon reads
-//! `~/.codex/auth.json` once, when it starts. A clauth codex switch repoints
-//! that file, so it reaches only a daemon started after the switch: until the
-//! daemon restarts, every task keeps spending the previous account (observed
-//! 2026-09-27: a resumed task stayed on a week-spent account after a switch).
+//! `codex resume` reconnects to the same process. The daemon reads the codex
+//! home's `auth.json` (the one `CODEX_HOME` names, else `~/.codex`) once, when
+//! it starts. A clauth codex switch repoints that file, so it reaches only a
+//! daemon started after the switch: until the daemon restarts, every task
+//! keeps spending the previous account (observed 2026-09-27: a resumed task
+//! stayed on a week-spent account after a switch).
 //! It does NOT write the old login into the new account's store: codex saves
 //! `auth.json` through the link, but every refresh path first re-reads it and
 //! refuses on an account-id mismatch (0.157.1 `refresh_token` /
@@ -35,9 +36,14 @@ const CONTROL_SOCKET: &str = "app-server-control/app-server-control.sock";
 #[cfg(unix)]
 const MANAGED_BIN: &str = "packages/app-server-daemon/current/bin/codex";
 /// How long a restart may run before its child is killed and the attempt is
-/// logged as hung.
-#[cfg(all(unix, not(test)))]
-const RESTART_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+/// logged as hung. It must outlast codex's own restart budget twice over: the
+/// CLI may first wait up to codex's `OPERATION_LOCK_TIMEOUT` (its longest
+/// shutdown grace, 300s, plus 75s) behind another lifecycle command, then run
+/// a restart of its own about as long. clauth's clock counts both, so a
+/// shorter deadline kills a healthy restart mid-drain, before its start step.
+/// It is a backstop: codex bounds each phase itself.
+#[cfg(unix)]
+const RESTART_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2 * (300 + 75));
 
 /// A daemon runs under codex home `home` and started before `home`'s login
 /// last moved. File stats only, until the answer would be "stale": only then
@@ -165,9 +171,12 @@ pub(crate) fn wait_with_deadline(
     }
 }
 
-/// One restart at a time: two switches inside one restart's window, or a
-/// restart queued behind another, would otherwise run two
-/// `codex app-server daemon restart`s at once.
+/// One restart at a time on clauth's side. Codex's own operation lock already
+/// serializes concurrent lifecycle commands, but a waiter gives up after
+/// `OPERATION_LOCK_TIMEOUT`; this mutex keeps a second clauth child from
+/// spending its own restart deadline waiting behind the first in codex's lock.
+/// It also puts the re-check under it, so a restart queued behind another
+/// finds the daemon the first already reloaded and skips.
 #[cfg(unix)]
 static RESTARTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -208,6 +217,12 @@ pub(crate) fn restart_log_line(
     }
 }
 
+/// The daemon-log line for a skipped restart. Pure, so the wording is tested.
+#[cfg(unix)]
+pub(crate) fn restart_skipped_log_line(why: &str) -> String {
+    format!("clauth: codex app-server restart ({why}) skipped: no stale daemon found")
+}
+
 #[cfg(all(unix, not(test)))]
 fn restart_now(home: std::path::PathBuf, why: &'static str) {
     use crate::logline::logline;
@@ -231,9 +246,7 @@ fn restart_now(home: std::path::PathBuf, why: &'static str) {
                 }
             });
             if ran.is_none() {
-                logline!(
-                    "clauth: codex app-server restart ({why}) skipped: the daemon already runs the active login"
-                );
+                logline!("{}", restart_skipped_log_line(why));
             }
         });
     if let Err(e) = spawned {

@@ -11,7 +11,9 @@
 //! The key must match Claude Code's own, or the session silently writes to an
 //! empty memory dir. So this is all-or-nothing: any input the port below does
 //! not cover (a non-ASCII path, a caller-supplied `--settings`, a project dir
-//! that does not exist yet) leaves the launch exactly as it was.
+//! that does not exist yet) leaves the launch exactly as it was. So does any
+//! memory location the user chose themselves: `--settings` is Claude Code's
+//! `flagSettings` tier, which would outrank their own `autoMemoryDirectory`.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -23,6 +25,15 @@ const MAX_KEY_LEN: usize = 200;
 /// Claude Code's project-dir override: honoured whenever `CLAUDE_CONFIG_DIR` is
 /// set, which it always is under clauth.
 const PROJECT_DIR_NAME_ENV: &str = "CLAUDE_CODE_PROJECT_DIR_NAME";
+
+/// Env vars that move auto-memory off `$CLAUDE_CONFIG_DIR/projects` entirely:
+/// a pin would drag it back.
+const MEMORY_LOCATION_ENVS: [&str; 2] = [
+    "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE",
+    "CLAUDE_CODE_REMOTE_MEMORY_DIR",
+];
+
+const MEMORY_DIR_KEY: &str = "autoMemoryDirectory";
 
 /// The auto-memory dir to pin for a session launched in `cwd` against
 /// `config_dir`, or `None` when the default is already right or cannot be
@@ -65,7 +76,12 @@ pub(crate) fn pin_auto_memory_dir<S: AsRef<OsStr>>(
         let a = a.as_ref().to_string_lossy();
         a == "--settings" || a.starts_with("--settings=")
     });
-    if caller_settings {
+    if caller_settings
+        || MEMORY_LOCATION_ENVS
+            .iter()
+            .any(|key| child_env(command, key).is_some_and(|v| !v.is_empty()))
+        || user_sets_memory_dir(cwd, config_dir)
+    {
         return;
     }
     let dir_name_override = child_env(command, PROJECT_DIR_NAME_ENV);
@@ -75,8 +91,28 @@ pub(crate) fn pin_auto_memory_dir<S: AsRef<OsStr>>(
     let Some(dir) = dir.to_str() else {
         return;
     };
-    let settings = serde_json::json!({ "autoMemoryDirectory": dir }).to_string();
+    let settings = serde_json::json!({ MEMORY_DIR_KEY: dir }).to_string();
     command.arg("--settings").arg(settings);
+}
+
+/// True when a settings file the session reads already names a memory dir: the
+/// runtime's user-tier `settings.json` (built from `~/.claude/settings.json`)
+/// or the launch dir's project tier. Unreadable or unparsable counts as unset;
+/// Claude Code would not read a value out of it either.
+fn user_sets_memory_dir(cwd: &Path, config_dir: &Path) -> bool {
+    let project = cwd.join(".claude");
+    [
+        config_dir.join("settings.json"),
+        project.join("settings.json"),
+        project.join("settings.local.json"),
+    ]
+    .iter()
+    .any(|path| {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .is_some_and(|doc| doc.get(MEMORY_DIR_KEY).is_some_and(|v| !v.is_null()))
+    })
 }
 
 /// The value `key` will have in the child: an explicit set or removal on
@@ -155,13 +191,11 @@ fn canonical_root(cwd: &Path) -> PathBuf {
     }
 }
 
-/// The nearest ancestor (or `dir` itself) holding a `.git` dir or file.
+/// The nearest ancestor (or `dir` itself) holding a `.git` dir or file, a
+/// symlink to either counting too, as it does for Claude Code.
 fn git_root(dir: &Path) -> Option<PathBuf> {
     dir.ancestors()
-        .find(|d| {
-            fs::symlink_metadata(d.join(".git"))
-                .is_ok_and(|m| m.file_type().is_dir() || m.file_type().is_file())
-        })
+        .find(|d| fs::metadata(d.join(".git")).is_ok_and(|m| m.is_dir() || m.is_file()))
         .map(Path::to_path_buf)
 }
 
@@ -180,6 +214,9 @@ fn main_worktree(root: &Path) -> Option<PathBuf> {
     if fs::canonicalize(back).ok()? != root.join(".git") {
         return None;
     }
+    // `common` is canonical where Claude Code keeps the path git wrote. They
+    // agree because git writes real paths here; if not, the key misses and the
+    // dir-exists check falls back.
     if common.file_name()? == ".git" {
         return common.parent().map(Path::to_path_buf);
     }

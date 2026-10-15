@@ -213,3 +213,103 @@ fn pin_auto_memory_dir_appends_settings_or_nothing() {
         );
     }
 }
+
+/// A shared runtime with `repo` already keyed in the store, ready to pin.
+#[cfg(unix)]
+fn pinnable(root: &Path) -> (PathBuf, PathBuf) {
+    let (store, runtime) = shared_runtime(root);
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    let key = project_key(repo.to_str().expect("utf-8")).expect("ascii");
+    fs::create_dir_all(store.join(key)).expect("create project dir");
+    (runtime, repo)
+}
+
+/// A `claude` command with none of the env vars that change the outcome.
+fn bare_claude() -> std::process::Command {
+    let mut command = std::process::Command::new("claude");
+    command.env_remove(PROJECT_DIR_NAME_ENV);
+    for key in MEMORY_LOCATION_ENVS {
+        command.env_remove(key);
+    }
+    command
+}
+
+#[cfg(unix)]
+#[test]
+fn pin_auto_memory_dir_leaves_a_users_own_memory_dir_alone() {
+    let settings = [
+        ("runtime", "settings.json"),
+        ("project", "settings.json"),
+        ("project", "settings.local.json"),
+    ];
+    for (tier, file) in settings {
+        let (_guard, root) = tmp();
+        let (runtime, repo) = pinnable(&root);
+        let dir = match tier {
+            "runtime" => runtime.clone(),
+            _ => repo.join(".claude"),
+        };
+        fs::create_dir_all(&dir).expect("create settings dir");
+        fs::write(
+            dir.join(file),
+            r#"{"autoMemoryDirectory": "~/my-memory", "model": "opus"}"#,
+        )
+        .expect("write settings");
+
+        let mut command = bare_claude();
+        pin_auto_memory_dir(&mut command, &repo, &runtime, &[] as &[&str]);
+        assert!(
+            command.get_args().next().is_none(),
+            "{tier} {file} names its own memory dir, which --settings would outrank"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pin_auto_memory_dir_still_pins_beside_unrelated_settings() {
+    let (_guard, root) = tmp();
+    let (runtime, repo) = pinnable(&root);
+    fs::write(runtime.join("settings.json"), r#"{"model": "opus"}"#).expect("write settings");
+    fs::create_dir_all(repo.join(".claude")).expect("create .claude");
+    fs::write(repo.join(".claude/settings.json"), "not json").expect("write broken settings");
+
+    let mut command = bare_claude();
+    pin_auto_memory_dir(&mut command, &repo, &runtime, &[] as &[&str]);
+    assert_eq!(
+        command
+            .get_args()
+            .next()
+            .map(|a| a.to_string_lossy().into_owned()),
+        Some("--settings".to_string()),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pin_auto_memory_dir_steps_aside_for_a_relocated_memory_store() {
+    for key in MEMORY_LOCATION_ENVS {
+        let (_guard, root) = tmp();
+        let (runtime, repo) = pinnable(&root);
+        let mut command = bare_claude();
+        command.env(key, root.join("elsewhere"));
+        pin_auto_memory_dir(&mut command, &repo, &runtime, &[] as &[&str]);
+        assert!(
+            command.get_args().next().is_none(),
+            "{key} moves memory off the projects store; a pin would drag it back"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn canonical_root_follows_a_symlinked_dot_git() {
+    let (_guard, root) = tmp();
+    let repo = root.join("repo");
+    let real_git = root.join("git-dir");
+    fs::create_dir_all(&real_git).expect("create git dir");
+    fs::create_dir_all(repo.join("src")).expect("create repo");
+    std::os::unix::fs::symlink(&real_git, repo.join(".git")).expect("link .git");
+    assert_eq!(canonical_root(&repo.join("src")), repo);
+}

@@ -340,3 +340,31 @@ fn pin_auto_memory_dir_reads_the_local_tier_at_the_git_root() {
         "the git root's settings.local.json is the local tier for a launch in a subdir"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn pin_auto_memory_dir_reads_a_worktrees_local_tier_at_the_main_checkout() {
+    let (_guard, root) = tmp();
+    let (store, runtime) = shared_runtime(&root);
+    let main = root.join("main");
+    fs::create_dir_all(main.join(".git")).expect("create .git");
+    fs::create_dir_all(main.join(".claude")).expect("create .claude");
+    let linked = root.join("feature");
+    link_worktree(&main, &linked, "feature");
+    let sub = linked.join("src");
+    fs::create_dir_all(&sub).expect("create subdir");
+    let key = project_key(main.to_str().expect("utf-8")).expect("ascii");
+    fs::create_dir_all(store.join(key)).expect("create project dir");
+    fs::write(
+        main.join(".claude/settings.local.json"),
+        r#"{"autoMemoryDirectory": "~/my-memory"}"#,
+    )
+    .expect("write local settings");
+
+    let mut command = bare_claude();
+    pin_auto_memory_dir(&mut command, &sub, &runtime, &[] as &[&str]);
+    assert!(
+        command.get_args().next().is_none(),
+        "a linked worktree's local tier is the main checkout's settings.local.json"
+    );
+}

@@ -97,17 +97,21 @@ pub(crate) fn pin_auto_memory_dir<S: AsRef<OsStr>>(
 
 /// True when a settings file the session reads already names a memory dir: the
 /// runtime's user-tier `settings.json` (built from `~/.claude/settings.json`)
-/// or the launch dir's project tier. Unreadable or unparsable counts as unset;
-/// Claude Code would not read a value out of it either.
+/// or the project and local tiers. Claude Code reads the project tier from the
+/// launch dir but the local tier from the git root, falling back to the launch
+/// dir, so both local files are checked. Unreadable or unparsable counts as
+/// unset; Claude Code would not read a value out of it either.
 fn user_sets_memory_dir(cwd: &Path, config_dir: &Path) -> bool {
     let project = cwd.join(".claude");
-    [
+    let mut files = vec![
         config_dir.join("settings.json"),
         project.join("settings.json"),
         project.join("settings.local.json"),
-    ]
-    .iter()
-    .any(|path| {
+    ];
+    if let Some(root) = fs::canonicalize(cwd).ok().and_then(|cwd| git_root(&cwd)) {
+        files.push(root.join(".claude").join("settings.local.json"));
+    }
+    files.iter().any(|path| {
         fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())

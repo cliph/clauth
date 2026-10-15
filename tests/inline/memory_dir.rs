@@ -226,6 +226,7 @@ fn pinnable(root: &Path) -> (PathBuf, PathBuf) {
 }
 
 /// A `claude` command with none of the env vars that change the outcome.
+#[cfg(unix)]
 fn bare_claude() -> std::process::Command {
     let mut command = std::process::Command::new("claude");
     command.env_remove(PROJECT_DIR_NAME_ENV);
@@ -312,4 +313,30 @@ fn canonical_root_follows_a_symlinked_dot_git() {
     fs::create_dir_all(repo.join("src")).expect("create repo");
     std::os::unix::fs::symlink(&real_git, repo.join(".git")).expect("link .git");
     assert_eq!(canonical_root(&repo.join("src")), repo);
+}
+
+#[cfg(unix)]
+#[test]
+fn pin_auto_memory_dir_reads_the_local_tier_at_the_git_root() {
+    let (_guard, root) = tmp();
+    let (store, runtime) = shared_runtime(&root);
+    let repo = root.join("repo");
+    let sub = repo.join("src");
+    fs::create_dir_all(repo.join(".git")).expect("create .git");
+    fs::create_dir_all(repo.join(".claude")).expect("create .claude");
+    fs::create_dir_all(&sub).expect("create subdir");
+    let key = project_key(repo.to_str().expect("utf-8")).expect("ascii");
+    fs::create_dir_all(store.join(key)).expect("create project dir");
+    fs::write(
+        repo.join(".claude/settings.local.json"),
+        r#"{"autoMemoryDirectory": "~/my-memory"}"#,
+    )
+    .expect("write local settings");
+
+    let mut command = bare_claude();
+    pin_auto_memory_dir(&mut command, &sub, &runtime, &[] as &[&str]);
+    assert!(
+        command.get_args().next().is_none(),
+        "the git root's settings.local.json is the local tier for a launch in a subdir"
+    );
 }
